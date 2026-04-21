@@ -3,11 +3,11 @@
 MissionManager::MissionManager(ros::NodeHandle &nh) : nh_(nh), current_state_(INIT_TAKEOFF) {
     loadParameters();
     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask = 0b100111000111;
-    current_setpoint_.velocity.x = 0.0f;
-    current_setpoint_.velocity.y = 0.0f;
-    current_setpoint_.velocity.z = 0.0f;
-    current_setpoint_.yaw = 0.0f;
+    current_setpoint_.type_mask        = 0b100111000111;
+    current_setpoint_.velocity.x       = 0.0f;
+    current_setpoint_.velocity.y       = 0.0f;
+    current_setpoint_.velocity.z       = 0.0f;
+    current_setpoint_.yaw              = 0.0f;
 }
 
 void MissionManager::loadParameters() {
@@ -29,7 +29,7 @@ void MissionManager::loadParameters() {
     nh_.param<float>("PIX_VEL_D", cfg_.PIX_VEL_D, 0.001f);
     nh_.param<float>("PIX_VEL_MAX", cfg_.PIX_VEL_MAX, 0.4f);
     nh_.param<float>("PIX_FAR_NORM_DIST", cfg_.PIX_FAR_NORM_DIST, 150.0f);
-    nh_.param<float>("PIX_INTEGRAL_MAX", cfg_.PIX_INTEGRAL_MAX, 100.0f); // 补充缺失参数
+    nh_.param<float>("PIX_INTEGRAL_MAX", cfg_.PIX_INTEGRAL_MAX, 100.0f);  // 补充缺失参数
 
     nh_.param<float>("wp_target_area_x", wp_target_area_.x, 6.0f);
     nh_.param<float>("wp_target_area_y", wp_target_area_.y, 0.0f);
@@ -60,23 +60,27 @@ void MissionManager::loadParameters() {
 }
 
 void MissionManager::initROSCommunication() {
-    setpoint_pub_      = nh_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
-    ego_goal_pub_      = nh_.advertise<geometry_msgs::PoseStamped>("/fsm/ego_goal", 1);
+    setpoint_pub_ = nh_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
+    ego_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/fsm/ego_goal", 1);
     drop_trigger_pub_  = nh_.advertise<std_msgs::Bool>("/uav/drop_trigger", 1);
     laser_trigger_pub_ = nh_.advertise<std_msgs::Bool>("/uav/laser_trigger", 1);
 
     state_sub_         = nh_.subscribe("/mavros/state", 10, &MissionManager::stateCallback, this);
-    odom_sub_          = nh_.subscribe("/mavros/local_position/odom", 10, &MissionManager::odomCallback, this);
-    nav_status_sub_    = nh_.subscribe("/ego_controller/status", 10, &MissionManager::navStatusCallback, this);
-    detected_target_sub_ = nh_.subscribe("/detected_target", 10, &MissionManager::detectedTargetCallback, this);
-    yolo_detect_sub_   = nh_.subscribe("/ocr_detect", 10, &MissionManager::yoloDetectCallback, this);
-    hit_confirm_sub_   = nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
+    odom_sub_ =
+        nh_.subscribe("/mavros/local_position/odom", 10, &MissionManager::odomCallback, this);
+    nav_status_sub_ =
+        nh_.subscribe("/ego_controller/status", 10, &MissionManager::navStatusCallback, this);
+    detected_target_sub_ =
+        nh_.subscribe("/detected_target", 10, &MissionManager::detectedTargetCallback, this);
+    yolo_detect_sub_ = nh_.subscribe("/ocr_detect", 10, &MissionManager::yoloDetectCallback, this);
+    hit_confirm_sub_ =
+        nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
 
     switch_camera_client_ = nh_.serviceClient<std_srvs::Empty>("/switch_camera");
     reset_target_client_  = nh_.serviceClient<std_srvs::Empty>("/reset_target");
     get_status_client_    = nh_.serviceClient<std_srvs::Empty>("/get_system_status");
-    set_mode_client_ = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
-    arming_client_   = nh_.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
+    set_mode_client_      = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
+    arming_client_        = nh_.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
 }
 
 void MissionManager::waitForConnection() {
@@ -107,18 +111,19 @@ void MissionManager::sendSetpoint(const mavros_msgs::PositionTarget &sp) {
 
 void MissionManager::sendEgoGoal(float x, float y, float z, float yaw) {
     geometry_msgs::PoseStamped goal;
-    goal.header.stamp = ros::Time::now();
+    goal.header.stamp    = ros::Time::now();
     goal.header.frame_id = "world";
     goal.pose.position.x = x;
     goal.pose.position.y = y;
     goal.pose.position.z = z;
     if (!std::isnan(yaw)) {
-        tf::Quaternion q = tf::createQuaternionFromYaw(yaw);
+        tf::Quaternion q        = tf::createQuaternionFromYaw(yaw);
         goal.pose.orientation.x = q.x();
         goal.pose.orientation.y = q.y();
         goal.pose.orientation.z = q.z();
         goal.pose.orientation.w = q.w();
-    } else {
+    }
+    else {
         goal.pose.orientation.w = 1.0;
     }
     ego_goal_pub_.publish(goal);
@@ -135,30 +140,31 @@ bool MissionManager::waitForNavArrival() {
     return (nav_status_ == 2);
 }
 
-void MissionManager::positionControl(const Eigen::Vector3f &target_pos, mavros_msgs::PositionTarget &sp) {
+void MissionManager::positionControl(const Eigen::Vector3f &target_pos,
+                                     mavros_msgs::PositionTarget &sp) {
     Eigen::Vector3f err = target_pos - Eigen::Vector3f(local_odom_.pose.pose.position.x,
-                                                        local_odom_.pose.pose.position.y,
-                                                        local_odom_.pose.pose.position.z);
-    float vx = err.x() * cfg_.p_xy;
-    float vy = err.y() * cfg_.p_xy;
-    float vz = err.z() * cfg_.p_z;
-    vx = std::clamp(vx, -cfg_.max_speed, cfg_.max_speed);
-    vy = std::clamp(vy, -cfg_.max_speed, cfg_.max_speed);
-    vz = std::clamp(vz, -cfg_.max_speed, cfg_.max_speed);
+                                                       local_odom_.pose.pose.position.y,
+                                                       local_odom_.pose.pose.position.z);
+    float vx            = err.x() * cfg_.p_xy;
+    float vy            = err.y() * cfg_.p_xy;
+    float vz            = err.z() * cfg_.p_z;
+    vx                  = std::clamp(vx, -cfg_.max_speed, cfg_.max_speed);
+    vy                  = std::clamp(vy, -cfg_.max_speed, cfg_.max_speed);
+    vz                  = std::clamp(vz, -cfg_.max_speed, cfg_.max_speed);
 
     sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    sp.type_mask = 0b100111000011; 
-    sp.velocity.x = vx;
-    sp.velocity.y = vy;
-    sp.velocity.z = vz;
-    sp.yaw = current_yaw_;
+    sp.type_mask        = 0b100111000011;
+    sp.velocity.x       = vx;
+    sp.velocity.y       = vy;
+    sp.velocity.z       = vz;
+    sp.yaw              = current_yaw_;
 }
 
 bool MissionManager::reachedTarget(const Eigen::Vector3f &target, float dist_thresh) {
     float dx = target.x() - local_odom_.pose.pose.position.x;
     float dy = target.y() - local_odom_.pose.pose.position.y;
     float dz = target.z() - local_odom_.pose.pose.position.z;
-    return (dx*dx + dy*dy + dz*dz) < (dist_thresh * dist_thresh);
+    return (dx * dx + dy * dy + dz * dz) < (dist_thresh * dist_thresh);
 }
 
 bool MissionManager::isHoveringStable(float vert_tolerance) {
@@ -184,10 +190,10 @@ float MissionManager::satfunc(float value, float limit) {
 }
 
 void MissionManager::getPixPidVel(float err_x, float err_y, float dt, float &vel_x, float &vel_y) {
-    dt = std::clamp(dt, 0.02f, 1.0f);
+    dt                = std::clamp(dt, 0.02f, 1.0f);
 
     float norm_factor = 1.0f;
-    float pixel_err = std::sqrt(err_x * err_x + err_y * err_y);
+    float pixel_err   = std::sqrt(err_x * err_x + err_y * err_y);
     if (pixel_err > cfg_.PIX_FAR_NORM_DIST) {
         norm_factor = cfg_.PIX_FAR_NORM_DIST / pixel_err;
     }
@@ -202,7 +208,8 @@ void MissionManager::getPixPidVel(float err_x, float err_y, float dt, float &vel
     if (pixel_err < 80.0f) {
         pix_integral_x_ += norm_err_x * dt;
         pix_integral_y_ += norm_err_y * dt;
-    } else {
+    }
+    else {
         pix_integral_x_ = 0.0f;
         pix_integral_y_ = 0.0f;
     }
@@ -210,14 +217,16 @@ void MissionManager::getPixPidVel(float err_x, float err_y, float dt, float &vel
     pix_integral_x_ = std::clamp(pix_integral_x_, -cfg_.PIX_INTEGRAL_MAX, cfg_.PIX_INTEGRAL_MAX);
     pix_integral_y_ = std::clamp(pix_integral_y_, -cfg_.PIX_INTEGRAL_MAX, cfg_.PIX_INTEGRAL_MAX);
 
-    float deriv_x = (norm_err_x - last_pix_err_x_) / dt;
-    float deriv_y = (norm_err_y - last_pix_err_y_) / dt;
+    float deriv_x   = (norm_err_x - last_pix_err_x_) / dt;
+    float deriv_y   = (norm_err_y - last_pix_err_y_) / dt;
 
-    float pid_x = cfg_.PIX_VEL_P * norm_err_x + cfg_.PIX_VEL_I * pix_integral_x_ + cfg_.PIX_VEL_D * deriv_x;
-    float pid_y = cfg_.PIX_VEL_P * norm_err_y + cfg_.PIX_VEL_I * pix_integral_y_ + cfg_.PIX_VEL_D * deriv_y;
+    float pid_x =
+        cfg_.PIX_VEL_P * norm_err_x + cfg_.PIX_VEL_I * pix_integral_x_ + cfg_.PIX_VEL_D * deriv_x;
+    float pid_y =
+        cfg_.PIX_VEL_P * norm_err_y + cfg_.PIX_VEL_I * pix_integral_y_ + cfg_.PIX_VEL_D * deriv_y;
 
-    vel_x = satfunc(pid_x, cfg_.PIX_VEL_MAX);
-    vel_y = satfunc(pid_y, cfg_.PIX_VEL_MAX);
+    vel_x           = satfunc(pid_x, cfg_.PIX_VEL_MAX);
+    vel_y           = satfunc(pid_y, cfg_.PIX_VEL_MAX);
 
     last_pix_err_x_ = norm_err_x;
     last_pix_err_y_ = norm_err_y;
@@ -254,29 +263,30 @@ void MissionManager::run() {
     while (ros::ok() && !mission_finished_) {
         // 1. 默认安全设定点
         current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-        current_setpoint_.type_mask = 0b100111000111;
-        current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z = 0.0f;
+        current_setpoint_.type_mask        = 0b100111000111;
+        current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
+            0.0f;
         current_setpoint_.yaw = current_yaw_;
 
         // 2. 执行状态逻辑
         switch (current_state_) {
-            case INIT_TAKEOFF:            handleInitTakeoff();            break;
-            case NAV_TO_RING_FRONT:       handleNavToRingFront();         break;
-            case SETOUT_CROSS_RING:       handleSetoutCrossRing();              break;
-            case NAV_TO_DROP_AREA:       handleNavToRecogArea();         break;
-            case HOVER_RECOG_DROP:        handleHoverRecognizeDrop();     break;
-            case DROP_SUPPLY:             handleDropSupply();             break;
-            case MOVE_TO_ATTACK_AREA:     handleMoveToAttackArea();       break;
-            case RECOG_ATTACK_TARGET:     handleRecognizeAttackTarget();  break;
-            case MOVE_TO_FRONT_OF_TARGET: handleMoveToFrontOfTarget();    break;
-            case ALIGN_ATTACK_TARGET:     handleAlignAttackTarget();      break;
-            case SIMULATE_ATTACK:         handleSimulateAttack();         break;
-            case WAIT_HIT_CONFIRMATION:   handleWaitHitConfirmation();    break;
-            case NAV_TO_RING_BACK:        handleNavToRingBack();         break;
-            case RETURN_CROSS_RING:       handleReturnCrossRing();              break;
-            case RETURN_LAND:             handleReturnLand();             break;
-            case TASK_END:                handleTaskEnd();                break;
-            default: break;
+        case INIT_TAKEOFF           : handleInitTakeoff(); break;
+        case NAV_TO_RING_FRONT      : handleNavToRingFront(); break;
+        case SETOUT_CROSS_RING      : handleSetoutCrossRing(); break;
+        case NAV_TO_DROP_AREA       : handleNavToRecogArea(); break;
+        case HOVER_RECOG_DROP       : handleHoverRecognizeDrop(); break;
+        case DROP_SUPPLY            : handleDropSupply(); break;
+        case MOVE_TO_ATTACK_AREA    : handleMoveToAttackArea(); break;
+        case RECOG_ATTACK_TARGET    : handleRecognizeAttackTarget(); break;
+        case MOVE_TO_FRONT_OF_TARGET: handleMoveToFrontOfTarget(); break;
+        case ALIGN_ATTACK_TARGET    : handleAlignAttackTarget(); break;
+        case SIMULATE_ATTACK        : handleSimulateAttack(); break;
+        case WAIT_HIT_CONFIRMATION  : handleWaitHitConfirmation(); break;
+        case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
+        case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
+        case RETURN_LAND            : handleReturnLand(); break;
+        case TASK_END               : handleTaskEnd(); break;
+        default                     : break;
         }
 
         // 3. 发布设定点

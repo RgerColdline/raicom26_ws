@@ -104,9 +104,9 @@ ColumnLimit: 100
 
 QualifierAlignment: Left
 
-SortIncludes:
-  Enabled: true
-  IgnoreCase: false
+# SortIncludes:
+#   Enabled: true
+  # IgnoreCase: false
 IncludeBlocks: Regroup
 IncludeCategories:
   - Regex: '^".*"'
