@@ -4,3 +4,6 @@
 [submodule "src/uav_navigation"]
 	path = src/uav_navigation
 	url = https://github.com/RgerColdline/uav_navigation_rc26.git
+[submodule "src/raicom_vision_laser"]
+	path = src/raicom_vision_laser
+	url = https://gitee.com/dunantedage1/raicom.git
