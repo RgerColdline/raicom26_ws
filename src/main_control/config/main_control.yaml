@@ -22,10 +22,13 @@ PIX_INTEGRAL_MAX : 1000             # 积分限制
 PIX_FAR_NORM_DIST: 150.0            # 远距离归一化阈值（像素）
 
 # ==================== 航点坐标（相对起飞点） ====================
-# 目标识别区
-wp_target_area_x: 3.5
-wp_target_area_y: 0.0
-wp_target_area_z: 1.2               # 通常与 takeoff_height 一致
+# 环区
+wp_ring_front_x: 0.65
+wp_ring_front_y: 0.0
+wp_ring_front_z: 1.2               # 通常与 takeoff_height 一致
+wp_ring_back_x: 2.05
+wp_ring_back_y: 0.0
+wp_ring_back_z: 1.2            
 
 # 物资投放区
 wp_drop_area_x: 3.0
@@ -57,3 +60,15 @@ drop:
   fine_pixel_radius: 35.0
   fine_vel_scale: 0.45
   descend_distance: 0.6
+
+land:
+  kp: 0.005                   // 水平对准 P 增益
+  ki: 0.0005                    // 水平对准 I 增益
+  kd: 0.0001                    // 水平对准 D 增益
+  max_align_speed: 0.5                    // 最大对准速度 (m/s)
+  descend_speed: 0.2                    // 基础下降速度 (m/s)
+  align_pixel_threshold: 15.0                   // 对准像素阈值
+  fine_pixel_radius: 30.0                   // 精细调整半径
+  fine_vel_scale: 0.4                   // 精细速度缩放
+  final_height: 0.2                   // 最终判定高度 (m)
+  final_hold_time: 1.5                    // 最终稳定保持时间 (s)

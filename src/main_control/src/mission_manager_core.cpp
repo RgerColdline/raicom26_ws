@@ -31,18 +31,21 @@ void MissionManager::loadParameters() {
     nh_.param<float>("PIX_FAR_NORM_DIST", cfg_.PIX_FAR_NORM_DIST, 150.0f);
     nh_.param<float>("PIX_INTEGRAL_MAX", cfg_.PIX_INTEGRAL_MAX, 100.0f);  // 补充缺失参数
 
-    nh_.param<float>("wp_target_area_x", wp_target_area_.x, 6.0f);
-    nh_.param<float>("wp_target_area_y", wp_target_area_.y, 0.0f);
-    nh_.param<float>("wp_target_area_z", wp_target_area_.z, cfg_.takeoff_height);
-    nh_.param<float>("wp_drop_area_x", wp_drop_area_.x, 10.0f);
-    nh_.param<float>("wp_drop_area_y", wp_drop_area_.y, 0.0f);
+    nh_.param<float>("wp_ring_front_x", wp_ring_front_.x, 0.65f);
+    nh_.param<float>("wp_ring_front_y", wp_ring_front_.y, 0.0f);
+    nh_.param<float>("wp_ring_front_z", wp_ring_front_.z, cfg_.takeoff_height);
+    nh_.param<float>("wp_ring_back_x", wp_ring_back_.x, 2.05f);
+    nh_.param<float>("wp_ring_back_y", wp_ring_back_.y, 0.0f);
+    nh_.param<float>("wp_ring_back_z", wp_ring_back_.z, cfg_.takeoff_height);
+    nh_.param<float>("wp_drop_area_x", wp_drop_area_.x, 0.45f);
+    nh_.param<float>("wp_drop_area_y", wp_drop_area_.y, 2.0f);
     nh_.param<float>("wp_drop_area_z", wp_drop_area_.z, cfg_.takeoff_height);
-    nh_.param<float>("wp_attack_area_x", wp_attack_area_.x, 12.0f);
-    nh_.param<float>("wp_attack_area_y", wp_attack_area_.y, 0.0f);
+    nh_.param<float>("wp_attack_area_x", wp_attack_area_.x, 0.45f);
+    nh_.param<float>("wp_attack_area_y", wp_attack_area_.y, 2.0f);
     nh_.param<float>("wp_attack_area_z", wp_attack_area_.z, cfg_.takeoff_height);
-    
+
     nh_.param<float>("detection_min_confidence", cfg_.detection_min_confidence, 0.5f);
-    
+
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
     nh_.param<float>("drop_detect_timeout", cfg_.drop_detect_timeout, 0.30f);
     nh_.param<float>("drop_align_hold_time", cfg_.drop_align_hold_time, 0.35f);
@@ -56,6 +59,19 @@ void MissionManager::loadParameters() {
     nh_.param<float>("drop_fine_pixel_radius", cfg_.drop_fine_pixel_radius, 35.0f);
     nh_.param<float>("drop_fine_vel_scale", cfg_.drop_fine_vel_scale, 0.45f);
     nh_.param<float>("drop_descend_distance", cfg_.drop_descend_distance, 0.0f);
+
+
+    nh_.param<float>("land/kp", cfg_.land_kp, 0.005f);
+    nh_.param<float>("land/ki", cfg_.land_ki, 0.0005f);
+    nh_.param<float>("land/kd", cfg_.land_kd, 0.0001f);
+    nh_.param<float>("land/max_align_speed", cfg_.land_max_align_speed, 0.5f);
+    nh_.param<float>("land/descend_speed", cfg_.land_descend_speed, 0.3f);
+    nh_.param<float>("land/align_pixel_threshold", cfg_.land_align_pixel_threshold, 15.0f);
+    nh_.param<float>("land/fine_pixel_radius", cfg_.land_fine_pixel_radius, 30.0f);
+    nh_.param<float>("land/fine_vel_scale", cfg_.land_fine_vel_scale, 0.4f);
+    nh_.param<float>("land/final_height", cfg_.land_final_height, 0.2f);
+    nh_.param<float>("land/final_hold_time", cfg_.land_final_hold_time, 1.5f);
+
     nh_.param<bool>("use_ego_planner_for_drop_area", cfg_.use_ego_planner_for_drop_area, true);
 
     ROS_INFO("参数加载完成。");
@@ -175,7 +191,7 @@ bool MissionManager::isHoveringStable(float vert_tolerance) {
     return true;
 }
 
-bool MissionManager::navTo(const float x, const float y, const float z, const float yaw) {
+bool MissionManager::navTo(const float x, const float y, const float z) {
     if (!nav_goal_sent_) {
         float target_x = init_pos_x_ + x;
         float target_y = init_pos_y_ + y;
@@ -187,18 +203,18 @@ bool MissionManager::navTo(const float x, const float y, const float z, const fl
     current_setpoint_.type_mask        = 0b100111000111;
     current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
         0.0f;
-    current_setpoint_.yaw = yaw;
+    current_setpoint_.yaw = init_yaw_;
 
     return waitForNavArrival();
 }
 
-bool MissionManager::moveTo(const float x, const float y, const float z, const float yaw) {
+bool MissionManager::moveTo(const float x, const float y, const float z) {
     float target_x = init_pos_x_ + x;
     float target_y = init_pos_y_ + y;
     float target_z = init_pos_z_ + z;
 
     positionControl(Eigen::Vector3f(target_x, target_y, target_z), current_setpoint_);
-    current_setpoint_.yaw = yaw;
+    current_setpoint_.yaw = init_yaw_;
 
     return reachedTarget(Eigen::Vector3f(target_x, target_y, target_z), cfg_.err_max);
 }
@@ -286,10 +302,15 @@ bool MissionManager::callResetTarget() {
     return false;
 }
 
+bool MissionManager::timeout(const float timeout_limit) const noexcept {
+    return ros::Time::now() - state_start_time_ > ros::Duration(timeout_limit);
+}
+
 // --- 主循环 ---
 
 void MissionManager::run() {
     ros::Rate rate(20);
+    state_start_time_ = ros::Time::now();
     while (ros::ok() && !mission_finished_) {
         // 1. 默认安全设定点
         current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
@@ -301,9 +322,9 @@ void MissionManager::run() {
         // 2. 执行状态逻辑
         switch (current_state_) {
         case INIT_TAKEOFF           : handleInitTakeoff(); break;
-        case NAV_TO_RING_FRONT      : handleMoveToRingFront(); break;
+        case MOVE_TO_RING_FRONT     : handleMoveToRingFront(); break;
         case SETOUT_CROSS_RING      : handleSetoutCrossRing(); break;
-        case NAV_TO_DROP_AREA       : handleNavToRecogArea(); break;
+        case NAV_TO_DROP_AREA       : handleNavToDropArea(); break;
         case HOVER_RECOG_DROP       : handleHoverRecognizeDrop(); break;
         case DROP_SUPPLY            : handleDropSupply(); break;
         case MOVE_TO_ATTACK_AREA    : handleMoveToAttackArea(); break;

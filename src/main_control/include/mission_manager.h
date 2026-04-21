@@ -28,24 +28,23 @@
 // ============================================================================
 enum MissionState {
     INIT_TAKEOFF,  // 起飞
+
     MOVE_TO_RING_FRONT,
     SETOUT_CROSS_RING,
-    // NAV_TO_RECOG_AREA,       // 导航至目标识别区
-    // HOVER_RECOG_TARGET,      // 悬停识别目标指示牌
+
     NAV_TO_DROP_AREA,         // 导航至物资投放区
     HOVER_RECOG_DROP,         // 悬停识别投放区标识
-
     DROP_SUPPLY,              // 投放物资箱
-
     MOVE_TO_ATTACK_AREA,      // 移动至攻击目标识别区
-
     RECOG_ATTACK_TARGET,      // 识别正确攻击目标
     MOVE_TO_FRONT_OF_TARGET,  // 移动到目标正前方
     ALIGN_ATTACK_TARGET,      // 前视像素对准目标
     SIMULATE_ATTACK,          // 激光指示攻击
     WAIT_HIT_CONFIRMATION,    // 等待裁判确认
+
     NAV_TO_RING_BACK,
     RETURN_CROSS_RING,
+
     RETURN,
     LAND,
     TASK_END
@@ -58,6 +57,12 @@ class MissionManager
     void run();
     void initROSCommunication();
     void waitForConnection();
+
+    struct Waypoint
+    {
+        float x, y, z;
+        Waypoint(float x = 0.0f, float y = 0.0f, float z = 0.0f) : x(x), y(y), z(z) {}
+    };
 
   private:
     // ---------- ROS 通信 ----------
@@ -81,7 +86,6 @@ class MissionManager
     // ---------- 状态机数据 ----------
     MissionState current_state_;
     ros::Time state_start_time_;
-    ros::Time last_request_time_;
     bool init_pos_received_ = false;
     bool mission_finished_  = false;
 
@@ -97,6 +101,7 @@ class MissionManager
     // ---------- 导航状态 ----------
     int8_t nav_status_  = 0;
     bool nav_goal_sent_ = false;
+
 
     // ---------- 视觉识别数据 ----------
     std::string confirmed_target_;
@@ -115,6 +120,10 @@ class MissionManager
 
     Eigen::Vector3f attack_target_world_;
     bool hit_confirmed_ = false;
+
+    // -----pcl识别环
+    bool ensure_ring_   = false;
+    DetectionData ring_detection;
 
     // PID控制相关
     ros::Time last_pid_control_time_;
@@ -163,15 +172,22 @@ class MissionManager
         float drop_fine_vel_scale;
         float drop_descend_distance;
 
+        float land_kp                    = 0.005f;   // 水平对准 P 增益
+        float land_ki                    = 0.0005f;  // 水平对准 I 增益
+        float land_kd                    = 0.0001f;  // 水平对准 D 增益
+        float land_max_align_speed       = 0.5f;     // 最大对准速度 (m/s)
+        float land_descend_speed         = 0.3f;     // 基础下降速度 (m/s)
+        float land_align_pixel_threshold = 15.0f;    // 对准像素阈值
+        float land_fine_pixel_radius     = 30.0f;    // 精细调整半径
+        float land_fine_vel_scale        = 0.4f;     // 精细速度缩放
+        float land_final_height          = 0.2f;     // 最终判定高度 (m)
+        float land_final_hold_time       = 1.5f;     // 最终稳定保持时间 (s)
+
         bool use_ego_planner_for_drop_area;
     } cfg_;
 
-    struct Waypoint
-    {
-        float x, y, z;
-    };
-    Waypoint wp_ring_front_area_;
-    Waypoint wp_ring_back_area_;
+    Waypoint wp_ring_front_;  // 出发穿环前悬停点
+    Waypoint wp_ring_back_;   // 返回穿环前悬停点
     Waypoint wp_drop_area_;
     Waypoint wp_attack_area_;
 
@@ -188,6 +204,7 @@ class MissionManager
     void detectedTargetCallback(const std_msgs::String::ConstPtr &msg);
     void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
     void hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg);
+    // void ringDetectCallback(const pcl_detection2::RingDetectionInfo::ConstPtr &msg);
 
     // ---------- 控制辅助函数 ----------
     void sendSetpoint(const mavros_msgs::PositionTarget &sp);
@@ -196,8 +213,10 @@ class MissionManager
     void positionControl(const Eigen::Vector3f &target_pos, mavros_msgs::PositionTarget &sp);
     bool reachedTarget(const Eigen::Vector3f &target, float dist_thresh);
     bool isHoveringStable(float vert_tolerance);
-    bool navTo(const float x, const float y, const float z, const float yaw);
-    bool moveTo(const float x, const float y, const float z, const float yaw);
+    bool navTo(const float x, const float y, const float z);
+    inline bool navTo(const Waypoint wp) { return navTo(wp.x, wp.y, wp.z); }
+    bool moveTo(const float x, const float y, const float z);
+    inline bool moveTo(const Waypoint wp) { return moveTo(wp.x, wp.y, wp.z); }
     float getHorizontalSpeed() const;
     bool isDropWindowStable(float target_z) const;
 
@@ -206,6 +225,8 @@ class MissionManager
 
     bool callSwitchCamera();
     bool callResetTarget();
+
+    bool timeout(const float timeout_limit) const noexcept;
 
     // ---------- 状态处理函数 ----------
     void handleInitTakeoff();

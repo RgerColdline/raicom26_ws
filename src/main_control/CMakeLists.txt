@@ -18,13 +18,14 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 catkin_package(
+    CATKIN_DEPENDS 
     roscpp 
     std_msgs 
     sensor_msgs 
     geometry_msgs 
     raicom_vision_laser
     mavros_msgs
-    nav_msgsCATKIN_DEPENDS 
+    nav_msgs
 )
 
 # 包含头文件目录
@@ -37,6 +38,6 @@ include_directories(
 file(GLOB SOURCES "src/*.cpp")
 
 # cpp compile part
-add_executable(main_control src/main_control.cpp)
+add_executable(main_control ${SOURCES})
 target_link_libraries(main_control ${catkin_LIBRARIES})
 add_dependencies(main_control ${catkin_EXPORTED_TARGETS}) 

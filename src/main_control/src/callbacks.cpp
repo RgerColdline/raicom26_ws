@@ -57,3 +57,9 @@ void MissionManager::hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg) {
         ROS_INFO("裁判确认击中目标！");
     }
 }
+
+// void MissionManager::ringDetectCallback(const pcl_detection2::RingDetectionInfo::ConstPtr &msg){
+//     if(msg->data){
+//         //todo
+//     }
+// }

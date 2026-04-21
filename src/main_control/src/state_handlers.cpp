@@ -2,11 +2,9 @@
 
 // 8.1 起飞
 void MissionManager::handleInitTakeoff() {
-    static int sub_state = 0;
-    static ros::Time last_request;
+    static int sub_state               = 0;
     static int setpoint_count          = 0;
 
-    ros::Time now                      = ros::Time::now();
     float target_z                     = init_pos_z_ + cfg_.takeoff_height;
     float current_z                    = local_odom_.pose.pose.position.z;
 
@@ -23,65 +21,65 @@ void MissionManager::handleInitTakeoff() {
             setpoint_count++;
             if (setpoint_count == 100) {
                 ROS_INFO("已发送100个设定点，准备切换OFFBOARD模式");
-                sub_state    = 1;
-                last_request = now;
+                sub_state         = 1;
+                state_start_time_ = ros::Time::now();
             }
         }
         break;
 
     case 1:
-        if (current_mav_state_.mode != "OFFBOARD" && (now - last_request) > ros::Duration(3.0)) {
+        if (current_mav_state_.mode != "OFFBOARD" && timeout(3.0)) {
             mavros_msgs::SetMode srv;
             srv.request.custom_mode = "OFFBOARD";
             if (set_mode_client_.call(srv) && srv.response.mode_sent) {
                 ROS_INFO("OFFBOARD模式请求成功");
-                sub_state    = 2;
-                last_request = now;
+                sub_state         = 2;
+                state_start_time_ = ros::Time::now();
             }
             else {
                 ROS_WARN("切换OFFBOARD失败，重试中...");
-                last_request = now;
+                state_start_time_ = ros::Time::now();
             }
         }
         else if (current_mav_state_.mode == "OFFBOARD") {
-            sub_state    = 2;
-            last_request = now;
+            sub_state         = 2;
+            state_start_time_ = ros::Time::now();
         }
         break;
 
     case 2:
-        if (!current_mav_state_.armed && (now - last_request) > ros::Duration(3.0)) {
+        if (!current_mav_state_.armed && timeout(3.0f)) {
             mavros_msgs::CommandBool srv;
             srv.request.value = true;
             if (arming_client_.call(srv) && srv.response.success) {
                 ROS_INFO("无人机解锁成功");
-                sub_state    = 3;
-                last_request = now;
+                sub_state         = 3;
+                state_start_time_ = ros::Time::now();
             }
             else {
                 ROS_WARN("解锁失败，重试中...");
-                last_request = now;
+                state_start_time_ = ros::Time::now();
             }
         }
         else if (current_mav_state_.armed) {
-            sub_state    = 3;
-            last_request = now;
+            sub_state         = 3;
+            state_start_time_ = ros::Time::now();
         }
         break;
 
     case 3:
         if (fabs(current_z - target_z) < 0.2) {
-            if ((now - last_request).toSec() > 3.0) {
+            if (timeout(1.0f)) {
                 ROS_INFO("起飞完成，稳定悬停，进入导航至目标识别区阶段");
                 current_state_    = MOVE_TO_RING_FRONT;
                 nav_goal_sent_    = false;
-                state_start_time_ = now;
+                state_start_time_ = ros::Time::now();
                 sub_state         = 0;
                 setpoint_count    = 0;
             }
         }
         else {
-            last_request = now;
+            state_start_time_ = ros::Time::now();
         }
         break;
     }
@@ -91,62 +89,44 @@ void MissionManager::handleInitTakeoff() {
     }
 }
 
-void MissionManager::handleMoveToRingFront() {}
-void MissionManager::handleSetoutCrossRing() {}
-// 8.2 导航至目标识别区
-void MissionManager::handleNavToDropArea() {
-    if (navTo(wp_target_area_.x, wp_target_area_.y, wp_target_area_.z, current_yaw_)) {
-        current_state_     = next_state;
-        nav_goal_sent_     = false;
-        state_start_time_  = ros::Time::now();
-        last_request_time_ = ros::Time::now();
-        ROS_INFO_STREAM(ros_info);
+void MissionManager::handleMoveToRingFront() {
+    Waypoint target_wp;
+    static bool should_move = false;
+    if (!should_move || !timeout(10.0f)) {
+        if (!ring_detection.detected) {
+            ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
+            return;
+        }
+        else {
+            ROS_INFO_STREAM("pcl确认成功");
+            should_move = true;
+            target_wp   = wp_ring_front_;
+        }
+    }
+    if (!should_move) {
+        ROS_WARN_STREAM("pcl确认环超时，改换定点");
+        should_move = true;
+        target_wp   = wp_ring_front_;
+    }
+    if (moveTo(target_wp)) {
+        current_state_    = SETOUT_CROSS_RING;
+        state_start_time_ = ros::Time::now();
+        ROS_INFO_STREAM("准备穿环");
+    }
+}
+void MissionManager::handleSetoutCrossRing() {
+    if (moveTo(wp_ring_back_)) {
+        current_state_    = NAV_TO_DROP_AREA;
+        state_start_time_ = ros::Time::now();
+        ROS_INFO_STREAM("准备穿随机障碍物");
     }
 }
 
 // 8.4 导航至物资投放区
 void MissionManager::handleNavToDropArea() {
-    Eigen::Vector3f drop_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
-                                init_pos_z_ + wp_drop_area_.z);
-
-    if (cfg_.use_ego_planner_for_drop_area) {
-        if (!nav_goal_sent_) {
-            sendEgoGoal(drop_target.x(), drop_target.y(), drop_target.z());
-        }
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-        current_setpoint_.type_mask        = 0b100111000111;
-        current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-            0.0f;
-        current_setpoint_.yaw = current_yaw_;
-
-        if (waitForNavArrival() && isDropWindowStable(drop_target.z())) {
-            current_state_    = HOVER_RECOG_DROP;
-            nav_goal_sent_    = false;
-            state_start_time_ = ros::Time::now();
-            if (front_camera_active_) callSwitchCamera();
-            callResetTarget();
-            last_pid_control_time_     = ros::Time(0);
-            drop_alignment_hold_start_ = ros::Time(0);
-            pix_integral_x_ = pix_integral_y_ = 0.0f;
-            last_pix_err_x_ = last_pix_err_y_ = 0.0f;
-            ROS_INFO("到达投放区 (ego_planner)，开始下视识别投放标识");
-        }
-        return;
-    }
-
-    mavros_msgs::PositionTarget sp;
-    positionControl(drop_target, sp);
-    sp.yaw            = init_yaw_;
-    current_setpoint_ = sp;
-
-    const float dx    = drop_target.x() - local_odom_.pose.pose.position.x;
-    const float dy    = drop_target.y() - local_odom_.pose.pose.position.y;
-    const float dz    = drop_target.z() - local_odom_.pose.pose.position.z;
-    ROS_INFO_THROTTLE(0.5, "[投放区直飞] 位置误差: xy=%.2f m, z=%.2f m", std::hypot(dx, dy), dz);
-
-    if (reachedTarget(drop_target, cfg_.drop_arrive_threshold) &&
-        isDropWindowStable(drop_target.z()))
-    {
+    Waypoint drop_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
+                         init_pos_z_ + wp_drop_area_.z);
+    if (navTo(drop_target) && isDropWindowStable(drop_target.z)) {
         current_state_    = HOVER_RECOG_DROP;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
@@ -156,7 +136,7 @@ void MissionManager::handleNavToDropArea() {
         drop_alignment_hold_start_ = ros::Time(0);
         pix_integral_x_ = pix_integral_y_ = 0.0f;
         last_pix_err_x_ = last_pix_err_y_ = 0.0f;
-        ROS_INFO("到达投放区 (直飞模式)，开始下视识别投放标识");
+        ROS_INFO("到达投放区 (ego_planner)，开始下视识别投放标识");
     }
 }
 
@@ -346,30 +326,18 @@ void MissionManager::handleDropSupply() {
         dropped                  = false;
         drop_profile_initialized = false;
         drop_phase               = 0;
-        current_state_           = RETURN_LAND;  // 注意：原代码此处跳转至 RETURN_LAND
-        nav_goal_sent_           = false;
-        state_start_time_        = now;
+        current_state_    = MOVE_TO_ATTACK_AREA;  // 注意：原代码此处跳转至 RETURN_LAND
+        nav_goal_sent_    = false;
+        state_start_time_ = now;
     }
 }
 
 // 8.7 移动至攻击目标识别区
 void MissionManager::handleMoveToAttackArea() {
-    if (!nav_goal_sent_) {
-        sendEgoGoal(init_pos_x_ + wp_attack_area_.x, init_pos_y_ + wp_attack_area_.y,
-                    init_pos_z_ + wp_attack_area_.z);
-    }
-
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-        0.0f;
-    current_setpoint_.yaw = current_yaw_;
-
-    if (waitForNavArrival()) {
-        current_state_     = RECOG_ATTACK_TARGET;
-        nav_goal_sent_     = false;
-        state_start_time_  = ros::Time::now();
-        last_request_time_ = ros::Time::now();
+    if (moveTo(wp_attack_area_)) {
+        current_state_    = RECOG_ATTACK_TARGET;
+        nav_goal_sent_    = false;
+        state_start_time_ = ros::Time::now();
         if (!front_camera_active_) callSwitchCamera();
         callResetTarget();
         ROS_INFO("到达攻击目标识别区，开始前视识别正确目标");
@@ -411,21 +379,10 @@ void MissionManager::handleRecognizeAttackTarget() {
 
 // 8.9 移动到目标正前方
 void MissionManager::handleMoveToFrontOfTarget() {
-    if (!nav_goal_sent_) {
-        Eigen::Vector3f front_pos =
-            attack_target_world_ + Eigen::Vector3f(cfg_.target_front_offset * cos(init_yaw_),
-                                                   cfg_.target_front_offset * sin(init_yaw_), 0.0f);
-        front_pos.z() = init_pos_z_ + cfg_.takeoff_height;
-        sendEgoGoal(front_pos.x(), front_pos.y(), front_pos.z());
-    }
-
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-        0.0f;
-    current_setpoint_.yaw = current_yaw_;
-
-    if (waitForNavArrival()) {
+    Eigen::Vector3f front_pos =
+        attack_target_world_ + Eigen::Vector3f(cfg_.target_front_offset * cos(init_yaw_),
+                                               cfg_.target_front_offset * sin(init_yaw_), 0.0f);
+    if (moveTo(front_pos.x(), front_pos.y(), front_pos.z())) {
         current_state_         = ALIGN_ATTACK_TARGET;
         nav_goal_sent_         = false;
         state_start_time_      = ros::Time::now();
@@ -495,7 +452,7 @@ void MissionManager::handleSimulateAttack() {
     }
 
     if (hit_confirmed_) {
-        current_state_    = RETURN_LAND;
+        current_state_    = WAIT_HIT_CONFIRMATION;
         state_start_time_ = ros::Time::now();
         ROS_INFO("击中确认，返回起飞点");
     }
@@ -515,53 +472,247 @@ void MissionManager::handleWaitHitConfirmation() {
     current_setpoint_.yaw = current_yaw_;
 
     if (hit_confirmed_) {
-        current_state_    = RETURN_LAND;
+        current_state_    = NAV_TO_RING_BACK;
         state_start_time_ = ros::Time::now();
         ROS_INFO("裁判确认击中，返回");
     }
 }
 
-// 8.13 返回起飞点并降落
-void MissionManager::handleReturnLand() {
-    if (!nav_goal_sent_) {
-        float target_x = init_pos_x_;
-        float target_y = init_pos_y_;
-        float target_z = init_pos_z_ + cfg_.takeoff_height;
-        sendEgoGoal(target_x, target_y, target_z);
-    }
-
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-        0.0f;
-    current_setpoint_.yaw = current_yaw_;
-
-    if (waitForNavArrival()) {
+void MissionManager::handleNavToRingBack() {
+    if (navTo(wp_ring_back_) ||
+        (local_odom_.pose.pose.position.y <= wp_ring_back_.y + 0.3 && ring_detection.detected))
+    {
+        current_state_    = RETURN_CROSS_RING;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
-        ROS_INFO("已通过ego_planner返回起飞点上方，开始降落");
+        ROS_INFO_STREAM("已通过ego_planner穿过随机障碍物，准备返回穿环");
+    }
+}
+
+void MissionManager::handleReturnCrossRing() {
+    enum class SubState { MOVE_TO_RING_FRONT, CROSS_RING };
+    static SubState sub_state = SubState::MOVE_TO_RING_FRONT;
+    switch (sub_state) {
+    case SubState::MOVE_TO_RING_FRONT: {
+
+        Waypoint target_wp;
+        static bool should_move = false;
+        if (!should_move || !timeout(10.0f)) {
+            if (!ring_detection.detected) {
+                ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
+                return;
+            }
+            else {
+                ROS_INFO_STREAM("pcl确认成功");
+                should_move = true;
+                target_wp   = wp_ring_back_;
+            }
+        }
+        if (!should_move) {
+            ROS_WARN_STREAM("pcl确认环超时，改换定点");
+            should_move = true;
+            target_wp   = wp_ring_back_;
+        }
+        if (moveTo(target_wp)) {
+            current_state_    = RETURN;
+            state_start_time_ = ros::Time::now();
+            ROS_INFO_STREAM("准备穿环");
+        }
+        break;
+    }
+    case SubState::CROSS_RING:
+    default:
+        if (moveTo(wp_ring_front_)) {
+            current_state_    = RETURN;
+            state_start_time_ = ros::Time::now();
+            ROS_INFO_STREAM("准备穿环");
+        }
+        break;
+    }
+}
+
+
+// 8.13 返回起飞点并降落
+void MissionManager::handleReturn() {
+    if (moveTo(init_pos_x_, init_pos_y_, init_pos_z_ + cfg_.takeoff_height)) {
+        nav_goal_sent_    = false;
+        state_start_time_ = ros::Time::now();
+        ROS_INFO("已返回起飞点上方，开始降落");
     }
 }
 
 void MissionManager::handleLand() {
-    static float landing_target_z = init_pos_z_ + cfg_.takeoff_height;
-    landing_target_z -= 0.05f;
-    if (landing_target_z < init_pos_z_ + 0.1f) landing_target_z = init_pos_z_ + 0.1f;
+    static bool land_profile_initialized = false;
+    static int land_phase                = 0;  // 0:下降对准, 1:触地判定, 2:完成
+    static float hold_x                  = 0.0f;
+    static float hold_y                  = 0.0f;
+    static float start_z                 = 0.0f;
+    static ros::Time align_hold_start    = ros::Time(0);
+    static ros::Time last_pid_time       = ros::Time(0);
+    static float pix_integral_x          = 0.0f;
+    static float pix_integral_y          = 0.0f;
+    static float last_pix_err_x          = 0.0f;
+    static float last_pix_err_y          = 0.0f;
 
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b101111111000;
-    current_setpoint_.position.x       = init_pos_x_;
-    current_setpoint_.position.y       = init_pos_y_;
-    current_setpoint_.position.z       = landing_target_z;
-    current_setpoint_.yaw              = init_yaw_;
+    const ros::Time now                  = ros::Time::now();
+    const float current_z                = local_odom_.pose.pose.position.z;
+    const float ground_z                 = init_pos_z_;
+    const float target_hover_z           = ground_z + cfg_.takeoff_height;
 
-    if (landing_target_z <= init_pos_z_ + 0.15f &&
-        std::abs(local_odom_.pose.pose.position.z - (init_pos_z_ + 0.15f)) < 0.1f)
-    {
-        current_state_ = TASK_END;
-        ROS_INFO("降落完成，任务结束");
+    // === 初始化 ===
+    if (!land_profile_initialized) {
+        hold_x           = local_odom_.pose.pose.position.x;
+        hold_y           = local_odom_.pose.pose.position.y;
+        start_z          = current_z;
+        land_phase       = 0;
+        align_hold_start = ros::Time(0);
+        last_pid_time    = ros::Time(0);
+        pix_integral_x = pix_integral_y = 0.0f;
+        last_pix_err_x = last_pix_err_y = 0.0f;
+        land_profile_initialized        = true;
+        ROS_INFO("精准降落初始化: 起始高度 %.2f m, 地面高度 %.2f m", start_z, ground_z);
+    }
+
+    // === 阶段0: 下降 + 视觉对准 ===
+    if (land_phase == 0) {
+        // 检查下视检测有效性
+        const double detect_age = current_detection_.last_update.isZero()
+                                      ? std::numeric_limits<double>::infinity()
+                                      : (now - current_detection_.last_update).toSec();
+
+        if (!current_detection_.detected || detect_age > cfg_.drop_detect_timeout) {
+            // 检测丢失：保持当前位置缓慢下降
+            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+            current_setpoint_.type_mask        = 0b100111000111;
+            current_setpoint_.velocity.x       = 0.0f;
+            current_setpoint_.velocity.y       = 0.0f;
+            current_setpoint_.velocity.z       = -cfg_.land_descend_speed;
+            current_setpoint_.yaw              = init_yaw_;
+
+            align_hold_start                   = ros::Time(0);
+            pix_integral_x = pix_integral_y = 0.0f;
+            ROS_WARN_THROTTLE(1.0, "[精准降落] 下视检测丢失，盲降模式，高度: %.2f m", current_z);
+
+            // 高度足够低则进入触地判定
+            if (current_z <= ground_z + cfg_.land_final_height) {
+                ROS_INFO("[精准降落] 到达最终高度，进入触地判定");
+                land_phase       = 1;
+                align_hold_start = now;
+            }
+            return;
+        }
+
+        // 计算像素误差
+        const float aim_center_x = IMG_CENTER_X + cfg_.drop_camera_bias_x_px;
+        const float aim_center_y = IMG_CENTER_Y + cfg_.drop_camera_bias_y_px;
+        float err_x              = aim_center_x - current_detection_.center_x;
+        float err_y              = aim_center_y - current_detection_.center_y;
+        float pixel_dist         = std::sqrt(err_x * err_x + err_y * err_y);
+
+        // PID 计算
+        float dt                 = last_pid_time.isZero() ? 0.05f : (now - last_pid_time).toSec();
+        last_pid_time            = now;
+
+        // 抗饱和限幅
+        const float max_integral = 50.0f;
+        pix_integral_x += err_x * dt;
+        pix_integral_y += err_y * dt;
+        pix_integral_x = std::clamp(pix_integral_x, -max_integral, max_integral);
+        pix_integral_y = std::clamp(pix_integral_y, -max_integral, max_integral);
+
+        float diff_x   = (err_x - last_pix_err_x) / dt;
+        float diff_y   = (err_y - last_pix_err_y) / dt;
+        last_pix_err_x = err_x;
+        last_pix_err_y = err_y;
+
+        float vel_x = cfg_.land_kp * err_x + cfg_.land_ki * pix_integral_x + cfg_.land_kd * diff_x;
+        float vel_y = cfg_.land_kp * err_y + cfg_.land_ki * pix_integral_y + cfg_.land_kd * diff_y;
+
+        // 速度限幅
+        const float max_vel = cfg_.land_max_align_speed;
+        float vel_norm      = std::sqrt(vel_x * vel_x + vel_y * vel_y);
+        if (vel_norm > max_vel) {
+            vel_x = vel_x * max_vel / vel_norm;
+            vel_y = vel_y * max_vel / vel_norm;
+        }
+
+        // 近距离精细调整
+        if (pixel_dist < cfg_.land_fine_pixel_radius) {
+            vel_x *= cfg_.land_fine_vel_scale;
+            vel_y *= cfg_.land_fine_vel_scale;
+        }
+
+        // 计算下降速度（随高度降低而减小）
+        float height_ratio                 = (current_z - ground_z) / (start_z - ground_z);
+        height_ratio                       = std::clamp(height_ratio, 0.0f, 1.0f);
+        float descend_speed                = cfg_.land_descend_speed * (0.3f + 0.7f * height_ratio);
+
+        // 对准良好时允许下降，否则悬停调整
+        const bool aligned                 = pixel_dist < cfg_.land_align_pixel_threshold;
+        float vel_z                        = aligned ? -descend_speed : 0.0f;
+
+        // 发布控制指令
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+        current_setpoint_.type_mask        = 0b100111000111;
+        current_setpoint_.velocity.x       = vel_y;  // BODY_NED: x=前, y=右
+        current_setpoint_.velocity.y       = vel_x;  // 图像x对应机体y
+        current_setpoint_.velocity.z       = vel_z;
+        current_setpoint_.yaw              = init_yaw_;
+
+        // 对准计时
+        if (aligned) {
+            if (align_hold_start.isZero()) {
+                align_hold_start = now;
+            }
+        }
+        else {
+            align_hold_start = ros::Time(0);
+        }
+
+        ROS_INFO_THROTTLE(
+            0.5, "[精准降落] 像素误差: %.1f px, 高度: %.2f m, 速度: (%.2f, %.2f, %.2f) m/s",
+            pixel_dist, current_z, vel_x, vel_y, vel_z);
+
+        // 阶段切换条件
+        if (current_z <= ground_z + cfg_.land_final_height) {
+            ROS_INFO("[精准降落] 到达最终高度，进入触地判定");
+            land_phase       = 1;
+            align_hold_start = now;
+        }
+        return;
+    }
+
+    // === 阶段1: 触地判定 ===
+    if (land_phase == 1) {
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+        current_setpoint_.type_mask        = 0b101111111000;
+        current_setpoint_.position.x       = hold_x;
+        current_setpoint_.position.y       = hold_y;
+        current_setpoint_.position.z       = ground_z + 0.1f;
+        current_setpoint_.yaw              = init_yaw_;
+
+        // 稳定判定
+        const bool stable =
+            getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
+            std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
+            std::abs(current_roll_) < cfg_.drop_max_tilt &&
+            std::abs(current_pitch_) < cfg_.drop_max_tilt;
+
+        if (stable && (now - align_hold_start).toSec() >= cfg_.land_final_hold_time) {
+            ROS_INFO("精准降落完成，任务结束");
+            land_phase               = 2;
+            current_state_           = TASK_END;
+            state_start_time_        = now;
+
+            // 重置静态变量
+            land_profile_initialized = false;
+            align_hold_start         = ros::Time(0);
+            pix_integral_x = pix_integral_y = 0.0f;
+        }
+        return;
     }
 }
+
 // 8.14 任务结束
 void MissionManager::handleTaskEnd() {
     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
