@@ -1,0 +1,58 @@
+# ==================== 控制参数 ====================
+takeoff_height: 1.2                 # 起飞高度（相对初始点，单位：米）
+max_speed: 0.8                      # 最大水平速度（m/s）
+max_yaw_rate: 0.8                   # 最大偏航角速度（rad/s）
+err_max: 0.25                       # 位置误差容限（暂未使用）
+hover_vert_tolerance: 0.03          # 悬停垂直稳定容差（m）
+p_xy: 0.4                           # 水平位置控制 P 增益
+p_z: 0.3                            # 垂直位置控制 P 增益
+hover_time_needed: 3.0              # 悬停稳定所需时间（秒）
+target_front_offset: 1.0            # 攻击前目标正前方距离（m）
+nav_goal_timeout: 60.0              # 导航到达超时时间（秒）
+align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
+shoot_delay: 2.0                    # 射击后等待确认时间（秒）
+use_ego_planner_for_drop_area : true #导航至投放区模式选择：true=使用ego_planner路径规划，false=直接位置控制直飞
+
+# ==================== 像素PID参数 ====================
+PIX_VEL_P: 0.003                    # 像素误差比例系数
+PIX_VEL_I: 0.0001                   # 像素误差积分系数
+PIX_VEL_D: 0.001                    # 像素误差微分系数
+PIX_VEL_MAX: 0.4                    # 像素导出的最大速度指令（m/s）
+PIX_INTEGRAL_MAX : 1000             # 积分限制
+PIX_FAR_NORM_DIST: 150.0            # 远距离归一化阈值（像素）
+
+# ==================== 航点坐标（相对起飞点） ====================
+# 目标识别区
+wp_target_area_x: 3.5
+wp_target_area_y: 0.0
+wp_target_area_z: 1.2               # 通常与 takeoff_height 一致
+
+# 物资投放区
+wp_drop_area_x: 3.0
+wp_drop_area_y: 3.0
+wp_drop_area_z: 1.2
+
+# 攻击目标识别区
+wp_attack_area_x: 1.5
+wp_attack_area_y: 2.5
+wp_attack_area_z: 1.2
+
+
+drop:
+  # 投放阶段调参
+  arrive_threshold: 0.35
+  detect_timeout: 0.30
+  align_hold_time: 0.35
+  release_max_horiz_speed: 0.12
+  release_max_vert_speed: 0.06
+  max_tilt: 0.08
+
+  # 经验像素偏置：先从 0 开始，实飞后慢慢调
+  camera_bias_x_px: 0.0
+  camera_bias_y_px: 0.0
+  release_bias_x_px: 0.0
+  release_bias_y_px: 0.0
+
+  fine_pixel_radius: 35.0
+  fine_vel_scale: 0.45
+  descend_distance: 0.6
