@@ -173,6 +173,34 @@ bool MissionManager::isHoveringStable(float vert_tolerance) {
     return true;
 }
 
+bool MissionManager::navTo(const float x, const float y, const float z, const float yaw) {
+    if (!nav_goal_sent_) {
+        float target_x = init_pos_x_ + x;
+        float target_y = init_pos_y_ + y;
+        float target_z = init_pos_z_ + z;
+        sendEgoGoal(target_x, target_y, target_z);
+    }
+
+    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+    current_setpoint_.type_mask        = 0b100111000111;
+    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
+        0.0f;
+    current_setpoint_.yaw = yaw;
+
+    return waitForNavArrival();
+}
+
+bool MissionManager::moveTo(const float x, const float y, const float z, const float yaw) {
+    float target_x = init_pos_x_ + x;
+    float target_y = init_pos_y_ + y;
+    float target_z = init_pos_z_ + z;
+
+    positionControl(Eigen::Vector3f(target_x, target_y, target_z), current_setpoint_);
+    current_setpoint_.yaw = yaw;
+
+    return reachedTarget(Eigen::Vector3f(target_x, target_y, target_z), cfg_.err_max);
+}
+
 float MissionManager::getHorizontalSpeed() const {
     return std::hypot(local_odom_.twist.twist.linear.x, local_odom_.twist.twist.linear.y);
 }
@@ -271,7 +299,7 @@ void MissionManager::run() {
         // 2. 执行状态逻辑
         switch (current_state_) {
         case INIT_TAKEOFF           : handleInitTakeoff(); break;
-        case NAV_TO_RING_FRONT      : handleNavToRingFront(); break;
+        case NAV_TO_RING_FRONT      : handleMoveToRingFront(); break;
         case SETOUT_CROSS_RING      : handleSetoutCrossRing(); break;
         case NAV_TO_DROP_AREA       : handleNavToRecogArea(); break;
         case HOVER_RECOG_DROP       : handleHoverRecognizeDrop(); break;
@@ -284,7 +312,8 @@ void MissionManager::run() {
         case WAIT_HIT_CONFIRMATION  : handleWaitHitConfirmation(); break;
         case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
         case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
-        case RETURN_LAND            : handleReturnLand(); break;
+        case RETURN                 : handleReturn(); break;
+        case LAND                   : handleLand(); break;
         case TASK_END               : handleTaskEnd(); break;
         default                     : break;
         }

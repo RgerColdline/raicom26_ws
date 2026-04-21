@@ -28,7 +28,7 @@
 // ============================================================================
 enum MissionState {
     INIT_TAKEOFF,  // 起飞
-    NAV_TO_RING_FRONT,
+    MOVE_TO_RING_FRONT,
     SETOUT_CROSS_RING,
     // NAV_TO_RECOG_AREA,       // 导航至目标识别区
     // HOVER_RECOG_TARGET,      // 悬停识别目标指示牌
@@ -46,7 +46,8 @@ enum MissionState {
     WAIT_HIT_CONFIRMATION,    // 等待裁判确认
     NAV_TO_RING_BACK,
     RETURN_CROSS_RING,
-    RETURN_LAND,              // 返回起飞点并降落
+    RETURN,
+    LAND,
     TASK_END
 };
 
@@ -167,7 +168,8 @@ class MissionManager
     {
         float x, y, z;
     };
-    Waypoint wp_target_area_;
+    Waypoint wp_ring_front_area_;
+    Waypoint wp_ring_back_area_;
     Waypoint wp_drop_area_;
     Waypoint wp_attack_area_;
 
@@ -192,7 +194,8 @@ class MissionManager
     void positionControl(const Eigen::Vector3f &target_pos, mavros_msgs::PositionTarget &sp);
     bool reachedTarget(const Eigen::Vector3f &target, float dist_thresh);
     bool isHoveringStable(float vert_tolerance);
-
+    bool navTo(const float x, const float y, const float z, const float yaw);
+    bool moveTo(const float x, const float y, const float z, const float yaw);
     float getHorizontalSpeed() const;
     bool isDropWindowStable(float target_z) const;
 
@@ -204,9 +207,9 @@ class MissionManager
 
     // ---------- 状态处理函数 ----------
     void handleInitTakeoff();
-    void handleNavToRingFront();
+    void handleMoveToRingFront();
     void handleSetoutCrossRing();
-    void handleNavToRecogArea();
+    void handleNavToDropArea();
     void handleHoverRecognizeDrop();
     void handleDropSupply();
     void handleMoveToAttackArea();
@@ -217,6 +220,7 @@ class MissionManager
     void handleWaitHitConfirmation();
     void handleNavToRingBack();
     void handleReturnCrossRing();
-    void handleReturnLand();
+    void handleReturn();
+    void handleLand();
     void handleTaskEnd();
 };
