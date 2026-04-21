@@ -7,3 +7,6 @@
 [submodule "src/raicom_vision_laser"]
 	path = src/raicom_vision_laser
 	url = https://gitee.com/dunantedage1/raicom.git
+[submodule "src/ring_yolo"]
+	path = src/ring_yolo
+	url = https://github.com/RgerColdline/ring_yolo.git
