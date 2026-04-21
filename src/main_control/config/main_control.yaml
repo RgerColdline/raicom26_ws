@@ -37,6 +37,7 @@ wp_attack_area_x: 1.5
 wp_attack_area_y: 2.5
 wp_attack_area_z: 1.2
 
+detection_min_confidence: 0.9           # 目标检测最小置信度阈值
 
 drop:
   # 投放阶段调参

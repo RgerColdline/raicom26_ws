@@ -40,7 +40,9 @@ void MissionManager::loadParameters() {
     nh_.param<float>("wp_attack_area_x", wp_attack_area_.x, 12.0f);
     nh_.param<float>("wp_attack_area_y", wp_attack_area_.y, 0.0f);
     nh_.param<float>("wp_attack_area_z", wp_attack_area_.z, cfg_.takeoff_height);
-
+    
+    nh_.param<float>("detection_min_confidence", cfg_.detection_min_confidence, 0.5f);
+    
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
     nh_.param<float>("drop_detect_timeout", cfg_.drop_detect_timeout, 0.30f);
     nh_.param<float>("drop_align_hold_time", cfg_.drop_align_hold_time, 0.35f);

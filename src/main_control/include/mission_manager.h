@@ -147,6 +147,8 @@ class MissionManager
         float PIX_INTEGRAL_MAX;
         float PIX_FAR_NORM_DIST;
 
+        float detection_min_confidence;
+
         float drop_arrive_threshold;
         float drop_detect_timeout;
         float drop_align_hold_time;
