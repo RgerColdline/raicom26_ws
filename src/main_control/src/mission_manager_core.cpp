@@ -245,11 +245,19 @@ float MissionManager::getHorizontalSpeed() const {
 }
 
 bool MissionManager::isDropWindowStable(float target_z) const {
-    return getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
-           std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
-           std::abs(local_odom_.pose.pose.position.z - target_z) < cfg_.hover_vert_tolerance &&
-           std::abs(current_roll_) < cfg_.drop_max_tilt &&
-           std::abs(current_pitch_) < cfg_.drop_max_tilt;
+    bool window_stable =
+        getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
+        std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
+        std::abs(local_odom_.pose.pose.position.z - target_z) < cfg_.hover_vert_tolerance &&
+        std::abs(current_roll_) < cfg_.drop_max_tilt &&
+        std::abs(current_pitch_) < cfg_.drop_max_tilt;
+    ROS_INFO_STREAM_THROTTLE(
+        0.5, "水平速度: " << getHorizontalSpeed()
+                          << " m/s, 垂直速度: " << local_odom_.twist.twist.linear.z
+                          << " m/s, 离地高度: " << local_odom_.pose.pose.position.z
+                          << " m, roll: " << current_roll_ << " rad, pitch: " << current_pitch_
+                          << " rad, 窗口稳定: " << (window_stable ? "是" : "否"));
+    return window_stable;
 }
 
 float MissionManager::satfunc(float value, float limit) {
