@@ -94,6 +94,7 @@ void MissionManager::handleMoveToRingFront() {
     static bool should_move = false;
     if (!should_move && !timeout(10.0f)) {
         if (!ring_detection.detected) {
+            hover();
             ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
             return;
         }
@@ -128,7 +129,7 @@ void MissionManager::handleNavToDropArea() {
     Waypoint drop_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
                          init_pos_z_ + wp_drop_area_.z);
     if (navTo(drop_target) && isDropWindowStable(drop_target.z)) {
-        current_state_    = HOVER_RECOG_DROP;
+        current_state_    = NAV_TO_RING_BACK;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
         if (front_camera_active_) callSwitchCamera();
@@ -143,17 +144,18 @@ void MissionManager::handleNavToDropArea() {
 
 // 8.5 悬停识别投放区标识
 void MissionManager::handleHoverRecognizeDrop() {
-    auto holdDropHover = [this]() {
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-        current_setpoint_.type_mask        = 0b100111000111;
-        current_setpoint_.velocity.x = current_setpoint_.velocity.y = 0.0f;
-        current_setpoint_.velocity.z =
-            (init_pos_z_ + cfg_.takeoff_height - local_odom_.pose.pose.position.z) * cfg_.p_z;
-        current_setpoint_.yaw = init_yaw_;
-    };
+    // auto holdDropHover = [this]() {
+    //     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+    //     current_setpoint_.type_mask        = 0b100111000111;
+    //     current_setpoint_.velocity.x = current_setpoint_.velocity.y = 0.0f;
+    //     current_setpoint_.velocity.z =
+    //         (init_pos_z_ + cfg_.takeoff_height - local_odom_.pose.pose.position.z) * cfg_.p_z;
+    //     current_setpoint_.yaw = init_yaw_;
+    // };
 
     if (!target_confirmed_) {
-        holdDropHover();
+        // holdDropHover();
+        hover();
         drop_alignment_hold_start_ = ros::Time(0);
         last_pid_control_time_     = ros::Time(0);
         pix_integral_x_ = pix_integral_y_ = 0.0f;
@@ -166,7 +168,8 @@ void MissionManager::handleHoverRecognizeDrop() {
                                   ? std::numeric_limits<double>::infinity()
                                   : (ros::Time::now() - current_detection_.last_update).toSec();
     if (!current_detection_.detected || detect_age > cfg_.drop_detect_timeout) {
-        holdDropHover();
+        // holdDropHover();
+        hover();
         drop_alignment_hold_start_ = ros::Time(0);
         last_pid_control_time_     = ros::Time(0);
         pix_integral_x_ = pix_integral_y_ = 0.0f;
@@ -312,17 +315,7 @@ void MissionManager::handleDropSupply() {
         return;
     }
 
-    current_setpoint_.position.z = cruise_z;
-
-    const bool reached_cruise_height =
-        std::abs(local_odom_.pose.pose.position.z - cruise_z) < cfg_.hover_vert_tolerance;
-    const bool stable_after_ascend =
-        getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
-        std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
-        std::abs(current_roll_) < cfg_.drop_max_tilt &&
-        std::abs(current_pitch_) < cfg_.drop_max_tilt;
-
-    if (reached_cruise_height && stable_after_ascend) {
+    if (drop_phase == 2) {
         ROS_INFO("已回升至巡航高度并稳定，投放任务完成，前往攻击目标识别区");
         dropped                  = false;
         drop_profile_initialized = false;
@@ -335,12 +328,15 @@ void MissionManager::handleDropSupply() {
 
 // 8.7 移动至攻击目标识别区
 void MissionManager::handleMoveToAttackArea() {
-    if (moveTo(wp_attack_area_)) {
+    static bool reset_target_called = false;
+    if (!reset_target_called) {
+        callResetTarget();
+        if (!front_camera_active_) callSwitchCamera();
+    }
+    if (target_confirmed_ || moveTo(wp_attack_area_)) {
         current_state_    = RECOG_ATTACK_TARGET;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
-        if (!front_camera_active_) callSwitchCamera();
-        callResetTarget();
         ROS_INFO("到达攻击目标识别区，开始前视识别正确目标");
     }
 }
@@ -354,6 +350,7 @@ void MissionManager::handleRecognizeAttackTarget() {
     current_setpoint_.yaw = current_yaw_;
 
     if (!target_confirmed_) {
+        hover();
         ROS_INFO_THROTTLE(1.0, "等待前视目标确认...");
         return;
     }
@@ -381,8 +378,8 @@ void MissionManager::handleRecognizeAttackTarget() {
 // 8.9 移动到目标正前方
 void MissionManager::handleMoveToFrontOfTarget() {
     Eigen::Vector3f front_pos =
-        attack_target_world_ + Eigen::Vector3f(cfg_.target_front_offset * cos(init_yaw_),
-                                               cfg_.target_front_offset * sin(init_yaw_), 0.0f);
+        attack_target_world_ +
+        Eigen::Vector3f(cfg_.target_front_offset_x, cfg_.target_front_offset_y, 0.0f);
     if (moveTo(front_pos.x(), front_pos.y(), front_pos.z())) {
         current_state_         = ALIGN_ATTACK_TARGET;
         nav_goal_sent_         = false;
@@ -435,14 +432,8 @@ void MissionManager::handleAlignAttackTarget() {
 
 // 8.11 模拟攻击
 void MissionManager::handleSimulateAttack() {
-    static bool laser_fired            = false;
-
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-        0.0f;
-    current_setpoint_.yaw = current_yaw_;
-
+    static bool laser_fired = false;
+    hover();
     if (!laser_fired) {
         std_msgs::Bool trigger;
         trigger.data = true;
@@ -451,31 +442,21 @@ void MissionManager::handleSimulateAttack() {
         laser_fired       = true;
         state_start_time_ = ros::Time::now();
     }
-
-    if (hit_confirmed_) {
-        current_state_    = WAIT_HIT_CONFIRMATION;
-        state_start_time_ = ros::Time::now();
-        ROS_INFO("击中确认，返回起飞点");
-    }
-    else if ((ros::Time::now() - state_start_time_).toSec() > 5.0) {
-        current_state_    = WAIT_HIT_CONFIRMATION;
-        state_start_time_ = ros::Time::now();
-        ROS_WARN("未收到确认，进入等待状态");
-    }
+    current_state_    = WAIT_HIT_CONFIRMATION;
+    state_start_time_ = ros::Time::now();
+    ROS_WARN("进入等待状态");
 }
 
 // 8.12 等待裁判确认
 void MissionManager::handleWaitHitConfirmation() {
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-        0.0f;
-    current_setpoint_.yaw = current_yaw_;
-
-    if (hit_confirmed_) {
+    hover();
+    if (timeout(5) || hit_confirmed_) {
         current_state_    = NAV_TO_RING_BACK;
         state_start_time_ = ros::Time::now();
-        ROS_INFO("裁判确认击中，返回");
+        if (hit_confirmed_)
+            ROS_INFO("裁判确认击中，返回");
+        else
+            ROS_WARN("等待击中确认超时，返回");
     }
 }
 

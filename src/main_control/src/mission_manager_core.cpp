@@ -19,7 +19,8 @@ void MissionManager::loadParameters() {
     nh_.param<float>("p_xy", cfg_.p_xy, 0.4f);
     nh_.param<float>("p_z", cfg_.p_z, 0.3f);
     nh_.param<float>("hover_time_needed", cfg_.hover_time_needed, 3.0f);
-    nh_.param<float>("target_front_offset", cfg_.target_front_offset, 1.0f);
+    nh_.param<float>("target_front_offset_x", cfg_.target_front_offset_x, -1.0f);
+    nh_.param<float>("target_front_offset_y", cfg_.target_front_offset_y, 0.0f);
     nh_.param<float>("nav_goal_timeout", cfg_.nav_goal_timeout, 60.0f);
     nh_.param<float>("align_pixel_threshold", cfg_.align_pixel_threshold, 15.0f);
     nh_.param<float>("shoot_delay", cfg_.shoot_delay, 2.0f);
@@ -44,7 +45,13 @@ void MissionManager::loadParameters() {
     nh_.param<float>("wp_attack_area_y", wp_attack_area_.y, 2.0f);
     nh_.param<float>("wp_attack_area_z", wp_attack_area_.z, cfg_.takeoff_height);
 
-    nh_.param<float>("detection_min_confidence", cfg_.detection_min_confidence, 0.5f);
+    nh_.param<float>("detection/min_confidence", cfg_.detection_min_confidence, 0.5f);
+    nh_.param<std::string>("detection/drop_target_class", cfg_.detection_drop_target_class,
+                           "drop_target");
+    nh_.param<std::string>("detection/attack_target_class", cfg_.detection_attack_target_class,
+                           "attack_target");
+    nh_.param<std::string>("detection/land_target_class", cfg_.detection_land_target_class,
+                           "land_target");
 
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
     nh_.param<float>("drop_detect_timeout", cfg_.drop_detect_timeout, 0.30f);
@@ -217,6 +224,20 @@ bool MissionManager::moveTo(const float x, const float y, const float z) {
     current_setpoint_.yaw = init_yaw_;
 
     return reachedTarget(Eigen::Vector3f(target_x, target_y, target_z), cfg_.err_max);
+}
+
+void MissionManager::hover() {
+    static float local_x             = local_odom_.pose.pose.position.x,
+                 local_y             = local_odom_.pose.pose.position.y,
+                 local_z             = local_odom_.pose.pose.position.z;
+    static ros::Time last_hover_time = ros::Time::now();
+    if (ros::Time::now() - last_hover_time > ros::Duration(3.0)) {
+        local_x = local_odom_.pose.pose.position.x;
+        local_y = local_odom_.pose.pose.position.y;
+        local_z = local_odom_.pose.pose.position.z;
+    }
+    moveTo(local_x, local_y, local_z);
+    last_hover_time = ros::Time::now();
 }
 
 float MissionManager::getHorizontalSpeed() const {

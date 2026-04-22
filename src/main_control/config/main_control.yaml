@@ -7,7 +7,8 @@ hover_vert_tolerance: 0.03          # 悬停垂直稳定容差（m）
 p_xy: 0.4                           # 水平位置控制 P 增益
 p_z: 0.3                            # 垂直位置控制 P 增益
 hover_time_needed: 3.0              # 悬停稳定所需时间（秒）
-target_front_offset: 1.0            # 攻击前目标正前方距离（m）
+target_front_offset_x: -1.0          # 无人机要去的相对于目标靶子x方向偏移量
+target_front_offset_y: 0.0          # 无人机要去的相对于目标靶子y方向偏移量
 nav_goal_timeout: 60.0              # 导航到达超时时间（秒）
 align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
 shoot_delay: 2.0                    # 射击后等待确认时间（秒）
@@ -40,12 +41,17 @@ wp_attack_area_x: -0.45
 wp_attack_area_y: -2.0
 wp_attack_area_z: 1.2
 
-detection_min_confidence: 0.9           # 目标检测最小置信度阈值
+# 识别参数
+detection:
+  min_confidence: 0.9           # 目标检测最小置信度阈值
+  drop_target_class: "drop_target"
+  attack_target_class: "attack_target"
+  land_target_class: "land_target"
 
 drop:
   # 投放阶段调参
   arrive_threshold: 0.35
-  detect_timeout: 0.30
+  detect_timeout: 1.0
   align_hold_time: 0.35
   release_max_horiz_speed: 0.12
   release_max_vert_speed: 0.06

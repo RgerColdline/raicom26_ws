@@ -99,11 +99,12 @@ class MissionManager
     double init_yaw_;
 
     // ---------- 导航状态 ----------
-    int8_t nav_status_  = 0;
-    bool nav_goal_sent_ = false;
+    int8_t nav_status_            = 0;
+    bool nav_goal_sent_           = false;
 
 
     // ---------- 视觉识别数据 ----------
+    std::string target_class_name = "";
     std::string confirmed_target_;
     bool target_confirmed_    = false;
     bool front_camera_active_ = false;
@@ -146,7 +147,8 @@ class MissionManager
         float hover_vert_tolerance;
         float p_xy, p_z;
         float hover_time_needed;
-        float target_front_offset;
+        float target_front_offset_x;
+        float target_front_offset_y;
         float nav_goal_timeout;
         float align_pixel_threshold;
         float shoot_delay;
@@ -157,6 +159,9 @@ class MissionManager
         float PIX_FAR_NORM_DIST;
 
         float detection_min_confidence;
+        std::string detection_drop_target_class;
+        std::string detection_attack_target_class;
+        std::string detection_land_target_class;
 
         float drop_arrive_threshold;
         float drop_detect_timeout;
@@ -217,6 +222,7 @@ class MissionManager
     inline bool navTo(const Waypoint wp) { return navTo(wp.x, wp.y, wp.z); }
     bool moveTo(const float x, const float y, const float z);
     inline bool moveTo(const Waypoint wp) { return moveTo(wp.x, wp.y, wp.z); }
+    void hover();
     float getHorizontalSpeed() const;
     bool isDropWindowStable(float target_z) const;
 
