@@ -90,9 +90,9 @@ void MissionManager::handleInitTakeoff() {
 }
 
 void MissionManager::handleMoveToRingFront() {
-    Waypoint target_wp;
+    static Waypoint target_wp;
     static bool should_move = false;
-    if (!should_move || !timeout(10.0f)) {
+    if (!should_move && !timeout(10.0f)) {
         if (!ring_detection.detected) {
             ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
             return;
@@ -108,6 +108,7 @@ void MissionManager::handleMoveToRingFront() {
         should_move = true;
         target_wp   = wp_ring_front_;
     }
+    ROS_INFO_STREAM_THROTTLE(1, target_wp.x << target_wp.y << target_wp.z);
     if (moveTo(target_wp)) {
         current_state_    = SETOUT_CROSS_RING;
         state_start_time_ = ros::Time::now();
@@ -495,9 +496,9 @@ void MissionManager::handleReturnCrossRing() {
     switch (sub_state) {
     case SubState::MOVE_TO_RING_FRONT: {
 
-        Waypoint target_wp;
+        static Waypoint target_wp;
         static bool should_move = false;
-        if (!should_move || !timeout(10.0f)) {
+        if (!should_move && !timeout(10.0f)) {
             if (!ring_detection.detected) {
                 ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
                 return;

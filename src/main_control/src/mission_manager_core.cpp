@@ -303,7 +303,9 @@ bool MissionManager::callResetTarget() {
 }
 
 bool MissionManager::timeout(const float timeout_limit) const noexcept {
-    return ros::Time::now() - state_start_time_ > ros::Duration(timeout_limit);
+    ros::Duration delta = ros::Time::now() - state_start_time_;
+    // ROS_INFO_STREAM_THROTTLE(0.3, delta);
+    return delta > ros::Duration(timeout_limit);
 }
 
 // --- 主循环 ---

@@ -23,21 +23,21 @@ PIX_FAR_NORM_DIST: 150.0            # 远距离归一化阈值（像素）
 
 # ==================== 航点坐标（相对起飞点） ====================
 # 环区
-wp_ring_front_x: 0.65
+wp_ring_front_x: -0.65
 wp_ring_front_y: 0.0
 wp_ring_front_z: 1.2               # 通常与 takeoff_height 一致
-wp_ring_back_x: 2.05
+wp_ring_back_x: -2.05
 wp_ring_back_y: 0.0
 wp_ring_back_z: 1.2            
 
 # 物资投放区
-wp_drop_area_x: 3.0
-wp_drop_area_y: 3.0
+wp_drop_area_x: -0.45
+wp_drop_area_y: -2.0
 wp_drop_area_z: 1.2
 
 # 攻击目标识别区
-wp_attack_area_x: 1.5
-wp_attack_area_y: 2.5
+wp_attack_area_x: -0.45
+wp_attack_area_y: -2.0
 wp_attack_area_z: 1.2
 
 detection_min_confidence: 0.9           # 目标检测最小置信度阈值
