@@ -356,22 +356,26 @@ void MissionManager::handleRecognizeAttackTarget() {
     }
 
     if (current_detection_.detected) {
-        float fx      = 500.0f;
-        float fy      = 500.0f;
-        float z       = cfg_.takeoff_height;
-        float world_x = local_odom_.pose.pose.position.x +
-                        (current_detection_.center_x - IMG_CENTER_X) * z / fx;
-        float world_y = local_odom_.pose.pose.position.y +
-                        (current_detection_.center_y - IMG_CENTER_Y) * z / fy;
-        attack_target_world_ = Eigen::Vector3f(world_x, world_y, init_pos_z_);
-        ROS_INFO("攻击目标世界坐标估算: (%.2f, %.2f)", world_x, world_y);
-    }
+        // float fx      = 500.0f;
+        // float fy      = 500.0f;
+        // float z       = cfg_.takeoff_height;
+        // float world_x = local_odom_.pose.pose.position.x +
+        //                 (current_detection_.center_x - IMG_CENTER_X) * z / fx;
+        // float world_y = local_odom_.pose.pose.position.y +
+        //                 (current_detection_.center_y - IMG_CENTER_Y) * z / fy;
+        // attack_target_world_ = Eigen::Vector3f(world_x, world_y, init_pos_z_);
+        // ROS_INFO("攻击目标世界坐标估算: (%.2f, %.2f)", world_x, world_y);
+        // }
 
-    if ((ros::Time::now() - state_start_time_).toSec() > 1.0) {
-        ROS_INFO("正确攻击目标已确认，移动到目标正前方");
-        current_state_    = MOVE_TO_FRONT_OF_TARGET;
-        nav_goal_sent_    = false;
+        // if ((ros::Time::now() - state_start_time_).toSec() > 1.0) {
+        ROS_INFO("正确攻击目标已确认，正在移动到目标正前方");
+        current_state_    = ALIGN_ATTACK_TARGET;
+        // nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
+    }
+    else {
+        ROS_WARN_STREAM_THROTTLE(1.0, "目标已确认，但是当前视野未检测到目标，保持悬停");
+        hover();
     }
 }
 
@@ -391,13 +395,12 @@ void MissionManager::handleMoveToFrontOfTarget() {
 
 // 8.10 前视像素对准目标
 void MissionManager::handleAlignAttackTarget() {
+    static ros::Time align_hold_start = ros::Time(0);
     if (!current_detection_.detected) {
         ROS_WARN_THROTTLE(1.0, "前视未检测到目标，保持悬停");
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-        current_setpoint_.type_mask        = 0b100111000111;
-        current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-            0.0f;
-        current_setpoint_.yaw = current_yaw_;
+        hover();
+        align_hold_start = ros::Time(0);
+        pix_integral_x_ = pix_integral_y_ = 0.0f;
         return;
     }
 
@@ -406,27 +409,36 @@ void MissionManager::handleAlignAttackTarget() {
     float pixel_dist = sqrt(err_x * err_x + err_y * err_y);
 
     ros::Time now    = ros::Time::now();
-    float dt         = (now - last_pid_control_time_).toSec();
-    if (last_pid_control_time_.isZero()) dt = 0.05f;
+    float dt = last_pid_control_time_.isZero() ? 0.05f : (now - last_pid_control_time_).toSec();
     last_pid_control_time_ = now;
 
-    float vel_x, vel_y;
-    getPixPidVel(err_x, err_y, dt, vel_x, vel_y);
+    float vel_from_err_x, vel_from_err_y;
+    getPixPidVel(err_x, err_y, dt, vel_from_err_x, vel_from_err_y);
 
     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x       = vel_y;
-    current_setpoint_.velocity.y       = -vel_x;
-    current_setpoint_.velocity.z       = 0.0f;
-    current_setpoint_.yaw              = current_yaw_;
+    current_setpoint_.type_mask        = 0b110111001110;
+    current_setpoint_.position.x       = wp_attack_area_.x;
+    current_setpoint_.velocity.y       = -vel_from_err_x;
+    current_setpoint_.velocity.z       = -vel_from_err_y;
+    current_setpoint_.yaw              = init_yaw_;
 
-    ROS_INFO_THROTTLE(0.5, "[前视攻击对准] 像素误差: %.1f px", pixel_dist);
+    ROS_INFO_THROTTLE(0.5, "[前视攻击对准] 像素误差: %.1f px, 速度指令: y=%.2f, z=%.2f", pixel_dist,
+                      current_setpoint_.velocity.y, current_setpoint_.velocity.z);
 
     if (pixel_dist < cfg_.align_pixel_threshold) {
-        ROS_INFO("前视对准完成，准备攻击");
-        current_state_    = SIMULATE_ATTACK;
-        state_start_time_ = ros::Time::now();
-        pix_integral_x_ = pix_integral_y_ = 0.0f;
+        if (align_hold_start.isZero()) {
+            align_hold_start = now;
+        }
+        else if ((now - align_hold_start).toSec() >= cfg_.drop_align_hold_time) {
+            ROS_INFO("前视对准完成，准备攻击");
+            current_state_    = SIMULATE_ATTACK;
+            state_start_time_ = ros::Time::now();
+            align_hold_start  = ros::Time(0);
+            pix_integral_x_ = pix_integral_y_ = 0.0f;
+        }
+    }
+    else {
+        align_hold_start = ros::Time(0);
     }
 }
 
