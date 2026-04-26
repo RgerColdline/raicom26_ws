@@ -65,7 +65,7 @@ void MissionManager::yoloDetectCallback(const raicom_vision_laser::DetectionInfo
             ROS_INFO_STREAM_THROTTLE(1.0, "收到目标: " << class_name
                                                        << " 置信度: " << msg->confidences[i]);
             if (!found || msg->confidences[i] > best_confidence) {
-                if () best_center_x = msg->center_x[i];
+                best_center_x   = msg->center_x[i];
                 best_center_y   = msg->center_y[i];
                 best_confidence = msg->confidences[i];
                 found           = true;
