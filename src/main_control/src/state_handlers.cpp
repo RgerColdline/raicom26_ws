@@ -92,7 +92,7 @@ void MissionManager::handleInitTakeoff() {
 void MissionManager::handleMoveToRingFront() {
     static Waypoint target_wp;
     static bool should_move = false;
-    if (!should_move && !timeout(10.0f)) {
+    if (!should_move && !timeout(2.0f)) {
         if (!ring_detection.detected) {
             hover();
             ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
@@ -101,7 +101,17 @@ void MissionManager::handleMoveToRingFront() {
         else {
             ROS_INFO_STREAM("pcl确认成功");
             should_move = true;
-            target_wp   = wp_ring_front_;
+            // 优先用检测位姿动态计算，失败回退硬编码
+            Waypoint dyn_front, dyn_back;
+            if (computeRingApproachWP(dyn_front, dyn_back)) {
+                target_wp = dyn_front;
+                ROS_INFO("[Ring] 动态前方悬停点: (%.2f, %.2f, %.2f)", dyn_front.x, dyn_front.y,
+                         dyn_front.z);
+            }
+            else {
+                target_wp = wp_ring_front_;
+                ROS_WARN("[Ring] 动态位姿无效，使用硬编码前方点");
+            }
         }
     }
     if (!should_move) {
@@ -117,20 +127,67 @@ void MissionManager::handleMoveToRingFront() {
     }
 }
 void MissionManager::handleSetoutCrossRing() {
-    if (moveTo(wp_ring_back_)) {
-        current_state_    = NAV_TO_DROP_AREA;
+    // 进入状态时计算一次穿越点，冻结不再变动
+    static Waypoint cross_target = wp_ring_back_;
+    static bool cross_wp_frozen  = false;
+    if (!cross_wp_frozen) {
+        Waypoint dyn_front, dyn_back;
+        if (computeRingApproachWP(dyn_front, dyn_back)) {
+            cross_target = dyn_back;
+            ROS_INFO("[Ring] 去程穿越点已冻结: (%.2f, %.2f, %.2f)", dyn_back.x, dyn_back.y,
+                     dyn_back.z);
+        }
+        else {
+            ROS_WARN("[Ring] 动态穿越点无效，使用硬编码");
+        }
+        cross_wp_frozen = true;
+    }
+
+    if (moveTo(cross_target)) {
+        // 记住穿越后的位置（世界坐标），返程直接导航到此处
+        ring_back_memorized_.x()   = init_pos_x_ + cross_target.x;
+        ring_back_memorized_.y()   = init_pos_y_ + cross_target.y;
+        ring_back_memorized_.z()   = init_pos_z_ + cross_target.z;
+        ring_back_memorized_valid_ = true;
+        ROS_INFO("[Ring] 记住环后方位置: (%.2f, %.2f, %.2f)", ring_back_memorized_.x(),
+                 ring_back_memorized_.y(), ring_back_memorized_.z());
+
+        current_state_    = (pillar_nav_mode_ == "pcl") ? PILLAR_DETECT : NAV_TO_DROP_AREA;
+        // NAV_TO_DROP_AREA  // [注释] 原有EGO路径：直接去投放区
         state_start_time_ = ros::Time::now();
-        ROS_INFO_STREAM("准备穿随机障碍物");
+        cross_wp_frozen   = false;
+        ROS_INFO_STREAM((pillar_nav_mode_ == "pcl") ? "进入PCL柱子检测" : "准备穿随机障碍物");
     }
 }
 
 // 8.4 导航至物资投放区
 void MissionManager::handleNavToDropArea() {
+    Waypoint mid_target(init_pos_x_ + wp_come_mid_.x, init_pos_y_ + wp_come_mid_.y,
+                        init_pos_z_ + wp_come_mid_.z);
     Waypoint drop_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
                          init_pos_z_ + wp_drop_area_.z);
-    if (navTo(drop_target) && isDropWindowStable(drop_target.z)) {
-        current_state_    = NAV_TO_RING_BACK;
+    static bool come_mid_reached = false;
+
+    // PCL柱子导航模式：航点已定位，跳过中途点直接去投放区
+    if (pillar_nav_mode_ == "pcl") {
+        come_mid_reached = true;
+    }
+
+    if (!come_mid_reached) {
+        if (navTo(mid_target)) {
+            come_mid_reached = true;
+            ROS_INFO_STREAM("中途点到达，继续前往投放区");
+            nav_goal_sent_ = false;
+            nav_status_    = 0;
+        }
+        return;
+    }
+    if (navTo(drop_target) && moveTo(drop_target) && isDropWindowStable(drop_target.z)) {
+        // PCL模式下先去柱子航点，EGO模式直接去环后方
+        current_state_    = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : NAV_TO_RING_BACK;
+        // NAV_TO_RING_BACK  // [注释] 原有EGO路径
         nav_goal_sent_    = false;
+        nav_status_       = 0;
         state_start_time_ = ros::Time::now();
         if (front_camera_active_) callSwitchCamera();
         callResetTarget();
@@ -463,7 +520,9 @@ void MissionManager::handleSimulateAttack() {
 void MissionManager::handleWaitHitConfirmation() {
     hover();
     if (timeout(5) || hit_confirmed_) {
-        current_state_    = NAV_TO_RING_BACK;
+        // PCL模式下去反向柱子航点，EGO模式去环后方
+        current_state_    = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : NAV_TO_RING_BACK;
+        // NAV_TO_RING_BACK  // [注释] 原有EGO路径
         state_start_time_ = ros::Time::now();
         if (hit_confirmed_)
             ROS_INFO("裁判确认击中，返回");
@@ -473,8 +532,49 @@ void MissionManager::handleWaitHitConfirmation() {
 }
 
 void MissionManager::handleNavToRingBack() {
-    if (navTo(wp_ring_back_) ||
-        (local_odom_.pose.pose.position.y <= wp_ring_back_.y + 0.3 && ring_detection.detected))
+    Waypoint mid_target(init_pos_x_ + wp_come_mid_.x, init_pos_y_ + wp_come_mid_.y,
+                        init_pos_z_ + wp_come_mid_.z);
+
+    // 优先用记住的第一次穿环位置（绝对坐标），其次动态计算
+    Waypoint ring_back(init_pos_x_ + wp_ring_back_.x, init_pos_y_ + wp_ring_back_.y,
+                       init_pos_z_ + wp_ring_back_.z);
+    if (ring_back_memorized_valid_) {
+        ring_back.x = ring_back_memorized_.x();
+        ring_back.y = ring_back_memorized_.y();
+        ring_back.z = ring_back_memorized_.z();
+        ROS_INFO_THROTTLE(5.0, "[Ring] 返程导航到记住的位置: (%.2f, %.2f, %.2f)", ring_back.x,
+                          ring_back.y, ring_back.z);
+    }
+    else {
+        Waypoint dyn_front, dyn_back;
+        if (computeRingApproachWP(dyn_front, dyn_back)) {
+            ring_back.x = init_pos_x_ + dyn_back.x;
+            ring_back.y = init_pos_y_ + dyn_back.y;
+            ring_back.z = init_pos_z_ + dyn_back.z;
+        }
+    }
+
+    static bool back_mid_reached = false;
+    if (!back_mid_reached) {
+        if (navTo(mid_target)) {
+            back_mid_reached  = true;
+            nav_goal_sent_    = false;
+            state_start_time_ = ros::Time::now();
+            nav_status_       = 0;
+            ROS_INFO_STREAM("中途点到达，继续前往投放区");
+        }
+        return;
+    }
+    static bool back_mid_hovered = false;
+    if (!back_mid_hovered) {
+        hover();
+        if (timeout(3)) {
+            back_mid_hovered = true;
+        }
+        return;
+    }
+    if (navTo(ring_back) || (local_odom_.pose.pose.position.y <= ring_back_memorized_.y() + 0.2 &&
+                             ring_detection.detected))
     {
         current_state_    = RETURN_CROSS_RING;
         nav_goal_sent_    = false;
@@ -487,11 +587,11 @@ void MissionManager::handleReturnCrossRing() {
     enum class SubState { MOVE_TO_RING_FRONT, CROSS_RING };
     static SubState sub_state = SubState::MOVE_TO_RING_FRONT;
     switch (sub_state) {
+        static bool should_move = false;
     case SubState::MOVE_TO_RING_FRONT: {
 
         static Waypoint target_wp;
-        static bool should_move = false;
-        if (!should_move && !timeout(10.0f)) {
+        if (!should_move && !timeout(2.0f)) {
             if (!ring_detection.detected) {
                 ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
                 return;
@@ -499,7 +599,16 @@ void MissionManager::handleReturnCrossRing() {
             else {
                 ROS_INFO_STREAM("pcl确认成功");
                 should_move = true;
-                target_wp   = wp_ring_back_;
+                // 此时 UAV 在环后方，front_wp = 指向UAV = 环后方悬停
+                Waypoint dyn_front, dyn_back;
+                if (computeRingApproachWP(dyn_front, dyn_back)) {
+                    target_wp = dyn_front;
+                    ROS_INFO("[Ring] 动态返回悬停点: (%.2f, %.2f, %.2f)", dyn_front.x, dyn_front.y,
+                             dyn_front.z);
+                }
+                else {
+                    target_wp = wp_ring_back_;
+                }
             }
         }
         if (!should_move) {
@@ -508,20 +617,37 @@ void MissionManager::handleReturnCrossRing() {
             target_wp   = wp_ring_back_;
         }
         if (moveTo(target_wp)) {
-            current_state_    = RETURN;
+            sub_state         = SubState::CROSS_RING;
             state_start_time_ = ros::Time::now();
             ROS_INFO_STREAM("准备穿环");
         }
         break;
     }
     case SubState::CROSS_RING:
-    default:
-        if (moveTo(wp_ring_front_)) {
-            current_state_    = RETURN;
-            state_start_time_ = ros::Time::now();
-            ROS_INFO_STREAM("准备穿环");
+    default                  : {
+        // 穿越回前方 → back_wp = 远离UAV = 环前方目标点
+        static Waypoint return_cross_target = wp_ring_front_;
+        static bool return_cross_frozen     = false;
+        if (!return_cross_frozen) {
+            Waypoint dyn_front, dyn_back;
+            if (computeRingApproachWP(dyn_front, dyn_back)) {
+                return_cross_target = dyn_back;
+                ROS_INFO("[Ring] 返程穿越点已冻结: (%.2f, %.2f, %.2f)", dyn_back.x, dyn_back.y,
+                         dyn_back.z);
+            }
+            else {
+                ROS_WARN("[Ring] 动态返程穿越点无效，使用硬编码");
+            }
+            return_cross_frozen = true;
+        }
+        if (moveTo(return_cross_target)) {
+            current_state_      = RETURN;
+            state_start_time_   = ros::Time::now();
+            return_cross_frozen = false;  // 重置供下次使用
+            ROS_INFO_STREAM("已穿环，正在返回起飞点上方");
         }
         break;
+    }
     }
 }
 
@@ -531,6 +657,7 @@ void MissionManager::handleReturn() {
     if (moveTo(init_pos_x_, init_pos_y_, init_pos_z_ + cfg_.takeoff_height)) {
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
+        current_state_    = LAND;
         ROS_INFO("已返回起飞点上方，开始降落");
     }
 }
@@ -574,24 +701,34 @@ void MissionManager::handleLand() {
                                       ? std::numeric_limits<double>::infinity()
                                       : (now - current_detection_.last_update).toSec();
 
-        if (!current_detection_.detected || detect_age > cfg_.drop_detect_timeout) {
-            // 检测丢失：保持当前位置缓慢下降
-            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-            current_setpoint_.type_mask        = 0b100111000111;
-            current_setpoint_.velocity.x       = 0.0f;
-            current_setpoint_.velocity.y       = 0.0f;
-            current_setpoint_.velocity.z       = -cfg_.land_descend_speed;
-            current_setpoint_.yaw              = init_yaw_;
+        if (!current_detection_.detected) {
+            if (detect_age > cfg_.drop_detect_timeout) {
+                ROS_WARN_THROTTLE(1.0, "[精准降落] 下视检测超时，直接采用自动降落模式");
+                land_phase = -1;
+                hover();
+                state_start_time_ = now;
+            }
+            else {
 
-            align_hold_start                   = ros::Time(0);
-            pix_integral_x = pix_integral_y = 0.0f;
-            ROS_WARN_THROTTLE(1.0, "[精准降落] 下视检测丢失，盲降模式，高度: %.2f m", current_z);
+                // 检测丢失：保持当前位置缓慢下降
+                current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+                current_setpoint_.type_mask        = 0b100111000111;
+                current_setpoint_.velocity.x       = 0.0f;
+                current_setpoint_.velocity.y       = 0.0f;
+                current_setpoint_.velocity.z       = -cfg_.land_descend_speed;
+                current_setpoint_.yaw              = init_yaw_;
 
-            // 高度足够低则进入触地判定
-            if (current_z <= ground_z + cfg_.land_final_height) {
-                ROS_INFO("[精准降落] 到达最终高度，进入触地判定");
-                land_phase       = 1;
-                align_hold_start = now;
+                align_hold_start                   = ros::Time(0);
+                pix_integral_x = pix_integral_y = 0.0f;
+                ROS_WARN_THROTTLE(1.0, "[精准降落] 下视检测丢失，盲降模式，高度: %.2f m",
+                                  current_z);
+
+                // 高度足够低则进入触地判定
+                if (current_z <= ground_z + cfg_.land_final_height) {
+                    ROS_INFO("[精准降落] 到达最终高度，进入触地判定");
+                    land_phase       = 1;
+                    align_hold_start = now;
+                }
             }
             return;
         }
@@ -705,6 +842,26 @@ void MissionManager::handleLand() {
         }
         return;
     }
+
+    if (land_phase == -1) {
+        mavros_msgs::SetMode srv;
+        srv.request.custom_mode       = "AUTO.LAND";
+        static bool auto_land_success = false;
+        if (!auto_land_success) {
+            if (set_mode_client_.call(srv) && srv.response.mode_sent) {
+                ROS_INFO("AUTOLAND模式请求成功");
+                auto_land_success = true;
+                state_start_time_ = ros::Time::now();
+            }
+            else {
+                ROS_WARN("切换AUTOLAND失败，重试中...");
+                state_start_time_ = ros::Time::now();
+            }
+            return;
+        }
+        current_state_ = TASK_END;
+        return;
+    }
 }
 
 // 8.14 任务结束
@@ -717,4 +874,126 @@ void MissionManager::handleTaskEnd() {
     current_setpoint_.yaw              = init_yaw_;
     mission_finished_                  = true;
     ROS_INFO("任务完成，节点退出");
+}
+
+// ============================================================
+//  PCL 柱子检测导航状态
+// ============================================================
+
+void MissionManager::handlePillarDetect() {
+    // 进入状态时向PCL发送启动信号
+    static bool start_sent = false;
+    if (!start_sent) {
+        pillar_case_id_ = -1;  // 重置，等待新结果
+        pillar_start_pub_.publish(std_msgs::Empty());
+        start_sent = true;
+        ROS_INFO("[Pillar] 已发送启动信号给PCL，等待检测结果...");
+    }
+
+    hover();
+
+    if (pillar_case_id_ >= 0) {
+        ROS_INFO("[Pillar] 收到PCL检测结果: case #%d", pillar_case_id_);
+
+        // 设置航点序列
+        pillar_wp_index_ = 0;
+        if (pillar_case_id_ < static_cast<int>(pillar_waypoints_.size())) {
+            pillar_wp_total_ = pillar_waypoints_[pillar_case_id_].size();
+        } else {
+            pillar_wp_total_ = 0;
+        }
+
+        if (pillar_wp_total_ > 0) {
+            current_state_    = NAV_PILLAR_WAYPOINTS;
+            state_start_time_ = ros::Time::now();
+            start_sent        = false;
+            ROS_INFO("[Pillar] 开始导航，共 %zu 个航点", pillar_wp_total_);
+        } else {
+            ROS_WARN("[Pillar] 无有效航点，回退EGO");
+            current_state_    = NAV_TO_DROP_AREA;
+            state_start_time_ = ros::Time::now();
+        }
+        return;
+    }
+
+    // 超时回退 (20s)
+    if (timeout(20.0f)) {
+        ROS_WARN("[Pillar] 检测超时(20s)，使用默认配置0");
+        pillar_case_id_ = 0;  // 触发上面逻辑
+    }
+}
+
+void MissionManager::handleNavPillarWaypoints() {
+    if (pillar_case_id_ < 0 || pillar_case_id_ >= static_cast<int>(pillar_waypoints_.size())) {
+        ROS_WARN("[Pillar] 无效配置ID，回退EGO");
+        current_state_    = NAV_TO_DROP_AREA;
+        state_start_time_ = ros::Time::now();
+        return;
+    }
+
+    const auto &waypoints = pillar_waypoints_[pillar_case_id_];
+
+    if (pillar_wp_index_ >= waypoints.size()) {
+        // 所有正向航点完成 → 去投放区
+        ROS_INFO("[Pillar] 正向航点全部完成，进入投放区");
+        current_state_    = NAV_TO_DROP_AREA;
+        state_start_time_ = ros::Time::now();
+        return;
+    }
+
+    Waypoint wp = waypoints[pillar_wp_index_];
+    Waypoint abs_wp(init_pos_x_ + wp.x, init_pos_y_ + wp.y, init_pos_z_ + wp.z);
+
+    if (moveTo(abs_wp)) {
+        ROS_INFO("[Pillar] 航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)",
+                 pillar_wp_index_ + 1, waypoints.size(),
+                 abs_wp.x, abs_wp.y, abs_wp.z);
+        ++pillar_wp_index_;
+    } else {
+        ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向航点 #%zu/%zu: (%.2f,%.2f,%.2f)",
+                          pillar_wp_index_ + 1, waypoints.size(),
+                          abs_wp.x, abs_wp.y, abs_wp.z);
+    }
+}
+
+void MissionManager::handleReturnPillarWaypoints() {
+    if (pillar_case_id_ < 0 || pillar_case_id_ >= static_cast<int>(pillar_waypoints_.size())) {
+        ROS_WARN("[Pillar] 无效配置ID，回退EGO");
+        current_state_    = NAV_TO_RING_BACK;
+        state_start_time_ = ros::Time::now();
+        return;
+    }
+
+    const auto &waypoints = pillar_waypoints_[pillar_case_id_];
+    static bool init_reverse = true;
+
+    if (init_reverse) {
+        pillar_wp_index_ = waypoints.size();
+        init_reverse     = false;
+        ROS_INFO("[Pillar] 开始反向导航，共 %zu 个航点", waypoints.size());
+    }
+
+    if (pillar_wp_index_ == 0) {
+        // 反向航点全部完成 → 去穿环返回
+        init_reverse       = true;
+        current_state_     = RETURN_CROSS_RING;
+        state_start_time_  = ros::Time::now();
+        ROS_INFO("[Pillar] 反向航点全部完成，准备穿环返回");
+        return;
+    }
+
+    size_t cur_idx = pillar_wp_index_ - 1;
+    Waypoint wp    = waypoints[cur_idx];
+    Waypoint abs_wp(init_pos_x_ + wp.x, init_pos_y_ + wp.y, init_pos_z_ + wp.z);
+
+    if (moveTo(abs_wp)) {
+        ROS_INFO("[Pillar] 反向航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)",
+                 waypoints.size() - cur_idx, waypoints.size(),
+                 abs_wp.x, abs_wp.y, abs_wp.z);
+        --pillar_wp_index_;  // 到达后才递减
+    } else {
+        ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向反向航点 #%zu/%zu: (%.2f,%.2f,%.2f)",
+                          waypoints.size() - cur_idx, waypoints.size(),
+                          abs_wp.x, abs_wp.y, abs_wp.z);
+    }
 }

@@ -10,6 +10,8 @@
 #include <ros/ros.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Int8.h>
+#include <std_msgs/Int32.h>
+#include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
 #include <std_srvs/Empty.h>
 #include <tf/tf.h>
@@ -21,6 +23,7 @@
 #include <limits>
 
 // 自定义消息（需根据实际包名调整）
+#include <pcl_detection2/SquareRing.h>
 #include <raicom_vision_laser/DetectionInfo.h>
 
 // ============================================================================
@@ -44,6 +47,11 @@ enum MissionState {
 
     NAV_TO_RING_BACK,
     RETURN_CROSS_RING,
+
+    // === 柱子检测导航（PCL模式） ===
+    PILLAR_DETECT,              // 悬停等待PCL检测柱子配置
+    NAV_PILLAR_WAYPOINTS,       // 按顺序飞航点（正向）
+    RETURN_PILLAR_WAYPOINTS,    // 反向飞航点（返程）
 
     RETURN,
     LAND,
@@ -76,6 +84,9 @@ class MissionManager
     ros::Subscriber detected_target_sub_;
     ros::Subscriber yolo_detect_sub_;
     ros::Subscriber hit_confirm_sub_;
+    ros::Subscriber ring_sub_;
+    ros::Subscriber pillar_sub_;
+    ros::Publisher pillar_start_pub_;
 
     ros::ServiceClient switch_camera_client_;
     ros::ServiceClient reset_target_client_;
@@ -101,6 +112,7 @@ class MissionManager
     // ---------- 导航状态 ----------
     int8_t nav_status_            = 0;
     bool nav_goal_sent_           = false;
+    bool nav_seen_executing_      = false;  // 防止残留status=2被误判
 
 
     // ---------- 视觉识别数据 ----------
@@ -125,6 +137,52 @@ class MissionManager
     // -----pcl识别环
     bool ensure_ring_   = false;
     DetectionData ring_detection;
+
+    // 记住第一次穿环后的位置（世界坐标），返程导航直接用
+    Eigen::Vector3f ring_back_memorized_ = Eigen::Vector3f::Zero();
+    bool ring_back_memorized_valid_ = false;
+
+    // === 多假设环追踪（类 PCL 点强度机制） ===
+    struct RingCandidate
+    {
+        Eigen::Vector3f center   = Eigen::Vector3f::Zero();
+        Eigen::Vector3f front_pt = Eigen::Vector3f::Zero();
+        Eigen::Vector3f back_pt  = Eigen::Vector3f::Zero();
+        float confidence         = 0.0f;
+        ros::Time last_update;
+        bool locked = false;
+    };
+    std::vector<RingCandidate> ring_candidates_;
+
+    // 当前激活的环位姿（最高置信度候选，世界坐标系）
+    Eigen::Vector3f ring_center_       = Eigen::Vector3f::Zero();
+    Eigen::Vector3f ring_front_pt_     = Eigen::Vector3f::Zero();
+    Eigen::Vector3f ring_back_pt_      = Eigen::Vector3f::Zero();
+    bool ring_pose_valid_              = false;
+
+    // 全局环置信度累加器（只增不减，不随候选清除而重置）
+    float ring_accumulated_confidence_ = 0.0f;
+
+    // 环追踪更新（回调触发匹配/置信度提升 + 主循环触发衰减/清理）
+    void updateRingTracking(const pcl_detection2::SquareRing::ConstPtr &msg);
+    void decayRingCandidates();
+
+    // 根据检测位姿动态计算穿越点，失败返回 false（用硬编码回退）
+    bool computeRingApproachWP(Waypoint &front_wp, Waypoint &back_wp) const;
+
+    // === 柱子检测导航 ===
+    std::string pillar_nav_mode_;                               // "ego" 或 "pcl"
+    int pillar_case_id_                  = -1;                  // 检测到的配置ID (0-3), -1=未检测
+    std::vector<std::vector<Waypoint>> pillar_waypoints_;      // 4种配置的航点序列
+    size_t pillar_wp_index_              = 0;                   // 当前航点索引
+    size_t pillar_wp_total_              = 0;                   // 当前配置总航点数
+    float pillar_detect_timeout_         = 5.0f;                // 检测超时
+    float pillar_waypoint_tolerance_     = 0.3f;                // 航点到达判定距离
+
+    void loadPillarConfig();                                    // 加载柱子导航YAML
+    void handlePillarDetect();                                  // PILLAR_DETECT 状态
+    void handleNavPillarWaypoints();                            // 正向飞航点
+    void handleReturnPillarWaypoints();                         // 反向飞航点
 
     // PID控制相关
     ros::Time last_pid_control_time_;
@@ -189,10 +247,25 @@ class MissionManager
         float land_final_hold_time       = 1.5f;     // 最终稳定保持时间 (s)
 
         bool use_ego_planner_for_drop_area;
+
+        // 环穿越动态参数
+        float ring_front_approach_offset = 0.8f;  // 环前方悬停距离 (m)
+        float ring_back_approach_offset  = 2.5f;  // 环后方穿越目标距离 (m)
+
+        // 环多假设追踪参数（类 PCL 强度）
+        float track_match_distance       = 0.3f;   // 匹配距离阈值 (m)
+        float track_confidence_boost     = 0.15f;  // 每次匹配成功增量
+        float track_confidence_decay     = 0.97f;  // 每帧衰减系数 (20Hz)
+        float track_confirm_threshold    = 0.7f;   // 锁定确认阈值
+        float track_min_confidence       = 0.08f;  // 最低保留置信度
+        int track_max_candidates         = 3;      // 最大候选数
+        float track_ema_alpha            = 0.3f;   // EMA 平滑系数
     } cfg_;
 
-    Waypoint wp_ring_front_;  // 出发穿环前悬停点
-    Waypoint wp_ring_back_;   // 返回穿环前悬停点
+    Waypoint wp_ring_front_;                       // 出发穿环前悬停点
+    Waypoint wp_ring_back_;                        // 返回穿环前悬停点
+    Waypoint wp_come_mid_;
+    Waypoint wp_back_mid_;
     Waypoint wp_drop_area_;
     Waypoint wp_attack_area_;
 
@@ -209,7 +282,8 @@ class MissionManager
     void detectedTargetCallback(const std_msgs::String::ConstPtr &msg);
     void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
     void hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg);
-    // void ringDetectCallback(const pcl_detection2::RingDetectionInfo::ConstPtr &msg);
+    void ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg);
+    void pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg);
 
     // ---------- 控制辅助函数 ----------
     void sendSetpoint(const mavros_msgs::PositionTarget &sp);
@@ -233,6 +307,9 @@ class MissionManager
     bool callResetTarget();
 
     bool timeout(const float timeout_limit) const noexcept;
+
+    // ring detection timeout - 超时未收到检测则清除
+    void checkRingTimeout();
 
     // ---------- 状态处理函数 ----------
     void handleInitTakeoff();

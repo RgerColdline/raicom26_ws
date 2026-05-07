@@ -23,6 +23,7 @@ void MissionManager::odomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
 
 void MissionManager::navStatusCallback(const std_msgs::Int8::ConstPtr &msg) {
     nav_status_ = msg->data;
+    if (msg->data == 1) nav_seen_executing_ = true;
 }
 
 void MissionManager::detectedTargetCallback(const std_msgs::String::ConstPtr &msg) {
@@ -99,8 +100,21 @@ void MissionManager::hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg) {
     }
 }
 
-// void MissionManager::ringDetectCallback(const pcl_detection2::RingDetectionInfo::ConstPtr &msg){
-//     if(msg->data){
-//         //todo
-//     }
-// }
+void MissionManager::ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg) {
+    if (msg->corners.size() >= 4) {
+        ring_detection.detected    = true;
+        ring_detection.last_update = ros::Time::now();
+
+        // 多假设追踪：匹配/创建/置信度叠加/锁定
+        updateRingTracking(msg);
+
+        ROS_DEBUG_THROTTLE(2.0, "[Ring] 检测到方环, 中心(%.2f,%.2f,%.2f), 宽%.2f 高%.2f",
+                         msg->center_point.x, msg->center_point.y, msg->center_point.z,
+                         msg->width, msg->height);
+    }
+}
+
+void MissionManager::pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg) {
+    pillar_case_id_ = msg->data;
+    ROS_INFO_THROTTLE(2.0, "[Pillar] 收到柱子配置 #%d", pillar_case_id_);
+}

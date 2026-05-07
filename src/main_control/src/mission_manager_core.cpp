@@ -2,6 +2,7 @@
 
 MissionManager::MissionManager(ros::NodeHandle &nh) : nh_(nh), current_state_(INIT_TAKEOFF) {
     loadParameters();
+    loadPillarConfig();
     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     current_setpoint_.type_mask        = 0b100111000111;
     current_setpoint_.velocity.x       = 0.0f;
@@ -38,6 +39,12 @@ void MissionManager::loadParameters() {
     nh_.param<float>("wp_ring_back_x", wp_ring_back_.x, 2.05f);
     nh_.param<float>("wp_ring_back_y", wp_ring_back_.y, 0.0f);
     nh_.param<float>("wp_ring_back_z", wp_ring_back_.z, cfg_.takeoff_height);
+    nh_.param<float>("wp_come_mid_x", wp_come_mid_.x, -2.35f);
+    nh_.param<float>("wp_come_mid_y", wp_come_mid_.y, -2.48f);
+    nh_.param<float>("wp_come_mid_z", wp_come_mid_.z, cfg_.takeoff_height);
+    nh_.param<float>("wp_back_mid_x", wp_back_mid_.x, -2.35f);
+    nh_.param<float>("wp_back_mid_y", wp_back_mid_.y, -2.48f);
+    nh_.param<float>("wp_back_mid_z", wp_back_mid_.z, cfg_.takeoff_height);
     nh_.param<float>("wp_drop_area_x", wp_drop_area_.x, 0.45f);
     nh_.param<float>("wp_drop_area_y", wp_drop_area_.y, 2.0f);
     nh_.param<float>("wp_drop_area_z", wp_drop_area_.z, cfg_.takeoff_height);
@@ -81,6 +88,19 @@ void MissionManager::loadParameters() {
 
     nh_.param<bool>("use_ego_planner_for_drop_area", cfg_.use_ego_planner_for_drop_area, true);
 
+    // 环穿越动态参数
+    nh_.param<float>("ring_front_approach_offset", cfg_.ring_front_approach_offset, 0.8f);
+    nh_.param<float>("ring_back_approach_offset", cfg_.ring_back_approach_offset, 2.5f);
+
+    // 环多假设追踪参数
+    nh_.param<float>("ring_track/match_distance", cfg_.track_match_distance, 0.3f);
+    nh_.param<float>("ring_track/confidence_boost", cfg_.track_confidence_boost, 0.15f);
+    nh_.param<float>("ring_track/confidence_decay", cfg_.track_confidence_decay, 0.97f);
+    nh_.param<float>("ring_track/confirm_threshold", cfg_.track_confirm_threshold, 0.7f);
+    nh_.param<float>("ring_track/min_confidence", cfg_.track_min_confidence, 0.08f);
+    nh_.param<int>("ring_track/max_candidates", cfg_.track_max_candidates, 3);
+    nh_.param<float>("ring_track/ema_alpha", cfg_.track_ema_alpha, 0.3f);
+
     ROS_INFO("参数加载完成。");
 }
 
@@ -100,6 +120,11 @@ void MissionManager::initROSCommunication() {
     yolo_detect_sub_ = nh_.subscribe("/ocr_detect", 10, &MissionManager::yoloDetectCallback, this);
     hit_confirm_sub_ =
         nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
+    ring_sub_ =
+        nh_.subscribe("/pcl_detection2/square_ring", 10, &MissionManager::ringDetectCallback, this);
+    pillar_sub_       = nh_.subscribe("/pcl_detection2/pillar_case_id", 10,
+                                      &MissionManager::pillarDetectCallback, this);
+    pillar_start_pub_ = nh_.advertise<std_msgs::Empty>("/pcl_detection2/start_pillar_detect", 1);
 
     switch_camera_client_ = nh_.serviceClient<std_srvs::Empty>("/switch_camera");
     reset_target_client_  = nh_.serviceClient<std_srvs::Empty>("/reset_target");
@@ -152,7 +177,8 @@ void MissionManager::sendEgoGoal(float x, float y, float z, float yaw) {
         goal.pose.orientation.w = 1.0;
     }
     ego_goal_pub_.publish(goal);
-    nav_goal_sent_ = true;
+    nav_goal_sent_      = true;
+    nav_seen_executing_ = false;
     ROS_INFO("导航目标点: (%.2f, %.2f, %.2f)", x, y, z);
 }
 
@@ -162,7 +188,7 @@ bool MissionManager::waitForNavArrival() {
         current_state_ = TASK_END;
         return false;
     }
-    return (nav_status_ == 2);
+    return nav_seen_executing_ && (nav_status_ == 2);
 }
 
 void MissionManager::positionControl(const Eigen::Vector3f &target_pos,
@@ -178,7 +204,7 @@ void MissionManager::positionControl(const Eigen::Vector3f &target_pos,
     vz                  = std::clamp(vz, -cfg_.max_speed, cfg_.max_speed);
 
     sp.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    sp.type_mask        = 0b100111000011;
+    sp.type_mask        = 0b100111000111;
     sp.velocity.x       = vx;
     sp.velocity.y       = vy;
     sp.velocity.z       = vz;
@@ -226,6 +252,160 @@ bool MissionManager::moveTo(const float x, const float y, const float z) {
     return reachedTarget(Eigen::Vector3f(target_x, target_y, target_z), cfg_.err_max);
 }
 
+// 根据检测到的环 3D 位姿 + 无人机当前位置，动态计算穿越点（相对 init_pos 的偏移）
+// front_wp = 无人机当前侧悬停点（靠近无人机这一侧）
+// back_wp  = 环另一侧穿越点（远离无人机那一侧）
+bool MissionManager::computeRingApproachWP(Waypoint &front_wp, Waypoint &back_wp) const {
+    if (!ring_pose_valid_) return false;
+
+    // 方向向量：环中心 → 当前无人机位置（动态，每次调用重新计算）
+    Eigen::Vector3f uav_pos(local_odom_.pose.pose.position.x, local_odom_.pose.pose.position.y,
+                            local_odom_.pose.pose.position.z);
+    Eigen::Vector3f to_uav = (uav_pos - ring_center_).normalized();
+
+    // 无人机当前侧悬停点：环中心 → 指向无人机
+    Eigen::Vector3f front  = ring_center_ + to_uav * cfg_.ring_front_approach_offset;
+    // 环另一侧穿越点：环中心 → 远离无人机
+    Eigen::Vector3f back   = ring_center_ - to_uav * cfg_.ring_back_approach_offset;
+
+    // 转为相对 init_pos 的偏移（与硬编码 WP 坐标系一致）
+    front_wp.x             = front.x() - init_pos_x_;
+    front_wp.y             = front.y() - init_pos_y_;
+    front_wp.z             = front.z() - init_pos_z_;
+
+    back_wp.x              = back.x() - init_pos_x_;
+    back_wp.y              = back.y() - init_pos_y_;
+    back_wp.z              = back.z() - init_pos_z_;
+
+    return true;
+}
+
+// 环多假设追踪：匹配/创建/置信度叠加/锁定
+void MissionManager::updateRingTracking(const pcl_detection2::SquareRing::ConstPtr &msg) {
+    const Eigen::Vector3f new_center(msg->center_point.x, msg->center_point.y, msg->center_point.z);
+    const Eigen::Vector3f new_front(msg->front_point.x, msg->front_point.y, msg->front_point.z);
+    const Eigen::Vector3f new_back(msg->back_point.x, msg->back_point.y, msg->back_point.z);
+    const ros::Time now = ros::Time::now();
+
+    // 1. 找最匹配的未锁定候选
+    int best_idx        = -1;
+    float best_dist     = cfg_.track_match_distance;
+    for (size_t i = 0; i < ring_candidates_.size(); ++i) {
+        if (ring_candidates_[i].locked) continue;
+        float dist = (ring_candidates_[i].center - new_center).norm();
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx  = static_cast<int>(i);
+        }
+    }
+
+    if (best_idx >= 0) {
+        // 2a. 命中：EMA 平滑位置 + 提升置信度
+        auto &cand       = ring_candidates_[best_idx];
+        float alpha      = cfg_.track_ema_alpha;
+        cand.center      = alpha * new_center + (1.0f - alpha) * cand.center;
+        cand.front_pt    = alpha * new_front + (1.0f - alpha) * cand.front_pt;
+        cand.back_pt     = alpha * new_back + (1.0f - alpha) * cand.back_pt;
+        cand.confidence  = std::min(1.0f, cand.confidence + cfg_.track_confidence_boost);
+        cand.last_update = now;
+
+        // 全局置信度累加（只增不减）
+        ring_accumulated_confidence_ =
+            std::min(1.0f, ring_accumulated_confidence_ + cfg_.track_confidence_boost);
+
+        // 达标则锁定
+        if (cand.confidence >= cfg_.track_confirm_threshold && !cand.locked) {
+            cand.locked      = true;
+            ring_center_     = cand.center;
+            ring_front_pt_   = cand.front_pt;
+            ring_back_pt_    = cand.back_pt;
+            ring_pose_valid_ = true;
+            ROS_INFO("[Ring] 环位姿已锁定确认! 置信度=%.2f 中心(%.2f,%.2f,%.2f)", cand.confidence,
+                     ring_center_.x(), ring_center_.y(), ring_center_.z());
+        }
+    }
+    else {
+        // 2b. 未命中：新建候选
+        // 初始置信度取全局累加值（不重置），确保多次检测后新建候选也有高置信度
+        if (static_cast<int>(ring_candidates_.size()) < cfg_.track_max_candidates) {
+            RingCandidate cand;
+            cand.center      = new_center;
+            cand.front_pt    = new_front;
+            cand.back_pt     = new_back;
+            cand.confidence  = std::max(cfg_.track_confidence_boost, ring_accumulated_confidence_);
+            cand.last_update = now;
+
+            // 全局置信度累加
+            ring_accumulated_confidence_ =
+                std::min(1.0f, ring_accumulated_confidence_ + cfg_.track_confidence_boost);
+
+            ring_candidates_.push_back(cand);
+            ROS_DEBUG("[Ring] 新候选 #%zu 初始置信度=%.2f (全局=%.2f)", ring_candidates_.size(),
+                      cand.confidence, ring_accumulated_confidence_);
+        }
+    }
+
+    // 3. 若没有锁定候选，选最高置信度的作为激活位姿
+    if (!ring_pose_valid_ && !ring_candidates_.empty()) {
+        size_t best = 0;
+        for (size_t i = 1; i < ring_candidates_.size(); ++i) {
+            if (ring_candidates_[i].confidence > ring_candidates_[best].confidence) best = i;
+        }
+        if (ring_candidates_[best].confidence > 0.1f) {
+            ring_center_     = ring_candidates_[best].center;
+            ring_front_pt_   = ring_candidates_[best].front_pt;
+            ring_back_pt_    = ring_candidates_[best].back_pt;
+            ring_pose_valid_ = true;
+        }
+    }
+}
+
+// 主循环衰减：每帧降低未命中候选的置信度 + 清理低置信度候选
+void MissionManager::decayRingCandidates() {
+    if (ring_candidates_.empty()) return;
+
+    for (auto it = ring_candidates_.begin(); it != ring_candidates_.end();) {
+        if (!it->locked) {
+            it->confidence *= cfg_.track_confidence_decay;
+        }
+        // 清理极低置信度（锁定或未锁定但够低）
+        if (it->confidence < cfg_.track_min_confidence && !it->locked) {
+            ROS_DEBUG("[Ring] 清除低置信度候选 (%.3f)", it->confidence);
+            it = ring_candidates_.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    // 所有候选都被清理后，重置激活位姿
+    if (ring_candidates_.empty()) {
+        ring_pose_valid_ = false;
+    }
+}
+
+void MissionManager::checkRingTimeout() {
+    // 先衰减候选
+    decayRingCandidates();
+
+    // 超时未收到检测 → 清除检测标记
+    // 但如果有锁定候选（已确认环位姿），不超时清除——穿越过程中
+    // LiDAR 可能暂时看不到环，但环位姿已锁定不应丢失
+    bool has_locked = false;
+    for (const auto &c : ring_candidates_) {
+        if (c.locked) {
+            has_locked = true;
+            break;
+        }
+    }
+    if (!has_locked && ring_detection.detected && !ring_detection.last_update.isZero() &&
+        (ros::Time::now() - ring_detection.last_update) > ros::Duration(3.0))
+    {
+        ring_detection.detected = false;
+        ROS_WARN_THROTTLE(2.0, "[Ring] 检测超时 (3s)，清除标记");
+    }
+}
+
 void MissionManager::hover() {
     static float local_x             = local_odom_.pose.pose.position.x,
                  local_y             = local_odom_.pose.pose.position.y,
@@ -245,6 +425,15 @@ float MissionManager::getHorizontalSpeed() const {
 }
 
 bool MissionManager::isDropWindowStable(float target_z) const {
+    int i1   = getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed;
+    int i2   = std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed;
+    int i3   = std::abs(local_odom_.pose.pose.position.z - target_z) < cfg_.hover_vert_tolerance;
+    int i4   = std::abs(current_roll_) < cfg_.drop_max_tilt;
+    int i5   = std::abs(current_pitch_) < cfg_.drop_max_tilt;
+    int full = i1 << 4 | i2 << 3 | i3 << 2 | i4 << 1 | i5;
+    ROS_INFO_STREAM_THROTTLE(0.5, "Drop窗口稳定性检查 - 二进制状态: "
+                                      << std::bitset<5>(full) << " (" << i1 << ", " << i2 << ", "
+                                      << i3 << ", " << i4 << ", " << i5 << ")");
     bool window_stable =
         getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
         std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
@@ -366,6 +555,10 @@ void MissionManager::run() {
         case WAIT_HIT_CONFIRMATION  : handleWaitHitConfirmation(); break;
         case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
         case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
+        // --- PCL柱子导航（pillar_nav_mode="pcl"时替换EGO路径） ---
+        case PILLAR_DETECT          : handlePillarDetect(); break;
+        case NAV_PILLAR_WAYPOINTS   : handleNavPillarWaypoints(); break;
+        case RETURN_PILLAR_WAYPOINTS: handleReturnPillarWaypoints(); break;
         case RETURN                 : handleReturn(); break;
         case LAND                   : handleLand(); break;
         case TASK_END               : handleTaskEnd(); break;
@@ -376,6 +569,49 @@ void MissionManager::run() {
         sendSetpoint(current_setpoint_);
 
         ros::spinOnce();
+
+        // 4. 环追踪衰减 & 超时检测（20Hz 每帧执行）
+        checkRingTimeout();
+
         rate.sleep();
     }
+}
+
+// === 柱子导航配置加载 ===
+void MissionManager::loadPillarConfig() {
+    // 导航模式
+    nh_.param<std::string>("pillar_nav_mode", pillar_nav_mode_, "ego");
+    nh_.param<float>("pillar_detect_timeout", pillar_detect_timeout_, 5.0f);
+    nh_.param<float>("pillar_waypoint_tolerance", pillar_waypoint_tolerance_, 0.3f);
+
+    // 读取4组航点 (嵌套YAML: pillar_waypoints/case_00, case_01, ...)
+    pillar_waypoints_.clear();
+    std::string case_keys[4] = {"case_00", "case_01", "case_02", "case_03"};
+
+    for (int c = 0; c < 4; ++c) {
+        std::string key = "pillar_waypoints/" + case_keys[c];
+        XmlRpc::XmlRpcValue wp_list;
+        if (!nh_.getParam(key, wp_list) || wp_list.getType() != XmlRpc::XmlRpcValue::TypeArray) {
+            ROS_WARN("[Pillar] 无法读取航点: %s", key.c_str());
+            continue;
+        }
+
+        std::vector<Waypoint> waypoints;
+        for (int i = 0; i < wp_list.size(); ++i) {
+            if (wp_list[i].getType() == XmlRpc::XmlRpcValue::TypeArray && wp_list[i].size() >= 2) {
+                float x = static_cast<float>(static_cast<double>(wp_list[i][0]));
+                float y = static_cast<float>(static_cast<double>(wp_list[i][1]));
+                float z = cfg_.takeoff_height;
+                if (wp_list[i].size() >= 3) {
+                    z = static_cast<float>(static_cast<double>(wp_list[i][2]));
+                }
+                waypoints.push_back(Waypoint(x, y, z));
+            }
+        }
+        pillar_waypoints_.push_back(waypoints);
+        ROS_INFO("[Pillar] case_%02d: %zu 个航点", c, waypoints.size());
+    }
+
+    ROS_INFO("[Pillar] 导航模式=%s, 加载 %zu 组航点", pillar_nav_mode_.c_str(),
+             pillar_waypoints_.size());
 }

@@ -17,7 +17,9 @@
   <build_depend>rospy</build_depend>
   <build_depend>livox_ros_driver2</build_depend>
   <build_depend>raicom_vision_laser</build_depend>
+  <build_depend>pcl_detection2</build_depend>
   <exec_depend>raicom_vision_laser</exec_depend>
+  <exec_depend>pcl_detection2</exec_depend>
   <exec_depend>livox_ros_driver2</exec_depend>
   <exec_depend>rospy</exec_depend>
   <exec_depend>roscpp</exec_depend>

@@ -1,11 +1,13 @@
 # ==================== 控制参数 ====================
+# 柱子导航模式: "ego"(原有EGO路径) 或 "pcl"(PCL检测+定点飞行)
+
 takeoff_height: 1.2                 # 起飞高度（相对初始点，单位：米）
 max_speed: 0.8                      # 最大水平速度（m/s）
 max_yaw_rate: 0.8                   # 最大偏航角速度（rad/s）
 err_max: 0.25                       # 位置误差容限（暂未使用）
 hover_vert_tolerance: 0.03          # 悬停垂直稳定容差（m）
 p_xy: 0.4                           # 水平位置控制 P 增益
-p_z: 0.3                            # 垂直位置控制 P 增益
+p_z: 0.4                            # 垂直位置控制 P 增益
 hover_time_needed: 3.0              # 悬停稳定所需时间（秒）
 target_front_offset_x: -1.0          # 无人机要去的相对于目标靶子x方向偏移量
 target_front_offset_y: 0.0          # 无人机要去的相对于目标靶子y方向偏移量
@@ -13,6 +15,22 @@ nav_goal_timeout: 60.0              # 导航到达超时时间（秒）
 align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
 shoot_delay: 2.0                    # 射击后等待确认时间（秒）
 use_ego_planner_for_drop_area : true #导航至投放区模式选择：true=使用ego_planner路径规划，false=直接位置控制直飞
+
+# ==================== 环穿越动态参数 ====================
+# 优先使用 pcl 实时检测到的环 3D 位姿计算穿越点。
+# 检测失败或超时(3s)时自动回退到硬编码航点 wp_ring_front/back_。
+ring_front_approach_offset: 0.8    # 环前方悬停距离 (m)
+ring_back_approach_offset: 0.8     # 环后方穿越目标距离 (m)
+
+# ==================== 环多假设追踪（类 PCL 强度机制） ====================
+ring_track:
+  match_distance: 0.3           # 匹配距离阈值 (m)，以内认为是同一个环
+  confidence_boost: 0.15        # 每次匹配成功置信度增量
+  confidence_decay: 0.97        # 每帧衰减系数 (20Hz 运行)
+  confirm_threshold: 0.7        # 锁定确认阈值，达标后位置不再更新
+  min_confidence: 0.08          # 最低保留置信度，低于此值删除
+  max_candidates: 3             # 最大候选数
+  ema_alpha: 0.3                # EMA 平滑系数 (0~1, 越小越平滑)
 
 # ==================== 像素PID参数 ====================
 PIX_VEL_P: 0.003                    # 像素误差比例系数
@@ -30,6 +48,14 @@ wp_ring_front_z: 1.2               # 通常与 takeoff_height 一致
 wp_ring_back_x: -2.05
 wp_ring_back_y: 0.0
 wp_ring_back_z: 1.2            
+
+# 中间点
+wp_come_mid_x: -1.70
+wp_come_mid_y: -2.80
+wp_come_mid_z: 1.2               # 通常与 takeoff_height 一致
+wp_back_mid_x: -1.70
+wp_back_mid_y: -2.80
+wp_back_mid_z: 1.2            
 
 # 物资投放区
 wp_drop_area_x: -0.45
