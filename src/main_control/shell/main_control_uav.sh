@@ -20,7 +20,7 @@ WS="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 EGO_WS="${EGO_WS:-$HOME/ego_ws}"
 
 # 固定路径: 按需求保留默认值，多设备位置一致
-PX4_PATH="$HOME/Libraries/PX4-Autopilot"
+# PX4_PATH="$HOME/Libraries/PX4-Autopilot"
 
 # 识别当前终端 Shell 类型，动态匹配 setup 脚本后缀
 CURRENT_SHELL="${SHELL##*/}"
@@ -36,12 +36,12 @@ echo "======================================"
 echo "  主控工作空间: $WS"
 # echo "  仿真工作空间: $SIM_WS"
 echo "  导航工作空间: $EGO_WS"
-echo "  PX4 路径:     $PX4_PATH"
+# echo "  PX4 路径:     $PX4_PATH"
 echo "======================================"
 
 # 关键目录存在性校验
 # for dir in "$WS" "$SIM_WS" "$EGO_WS" "$PX4_PATH"; do
-for dir in "$WS" "$EGO_WS" "$PX4_PATH"; do
+for dir in "$WS" "$EGO_WS"; do
     if [ ! -d "$dir" ]; then
         echo "[错误] 依赖目录缺失: $dir"
         exit 1
@@ -62,7 +62,7 @@ tmux split-window -h -t "$SESSION:0"
 # roslaunch tutorial_gazebo sim.launch"
 # tmux send-keys -t "$SESSION:0" "$CMD_SIM" C-m
 CMD_UAV="sleep 3; \
-roslaunch fly_demo utils.launch"
+roslaunch abot_bringup location.launch"
 tmux send-keys -t "$SESSION:0" "$CMD_UAV" C-m
 
 # ---------------------------------------------------------
