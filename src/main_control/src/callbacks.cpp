@@ -101,17 +101,17 @@ void MissionManager::hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg) {
 }
 
 void MissionManager::ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg) {
-    // if (msg->corners.size() >= 4) {
-    //     ring_detection.detected    = true;
-    //     ring_detection.last_update = ros::Time::now();
+    if (msg->corners.size() >= 4) {
+        ring_detection.detected    = true;
+        ring_detection.last_update = ros::Time::now();
 
-    //     // 多假设追踪：匹配/创建/置信度叠加/锁定
-    //     updateRingTracking(msg);
+        // 多假设追踪：匹配/创建/置信度叠加/锁定
+        updateRingTracking(msg);
 
-    //     ROS_DEBUG_THROTTLE(2.0, "[Ring] 检测到方环, 中心(%.2f,%.2f,%.2f), 宽%.2f 高%.2f",
-    //                      msg->center_point.x, msg->center_point.y, msg->center_point.z,
-    //                      msg->width, msg->height);
-    // }
+        ROS_DEBUG_THROTTLE(2.0, "[Ring] 检测到方环, 中心(%.2f,%.2f,%.2f), 宽%.2f 高%.2f",
+                         msg->center_point.x, msg->center_point.y, msg->center_point.z,
+                         msg->width, msg->height);
+    }
 }
 
 void MissionManager::pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg) {
