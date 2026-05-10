@@ -65,6 +65,9 @@ CMD_UAV="sleep 3; \
 roslaunch abot_bringup location.launch"
 tmux send-keys -t "$SESSION:0" "$CMD_UAV" C-m
 
+tmux split-window -v -t "$SESSION:0"
+tmux send-keys -t "$SESSION:0" "sleep 4; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch foxglove_bridge foxglove_bridge.launch" C-m
+
 # ---------------------------------------------------------
 # 窗口 1：主控、监控与视觉 (四等分 2x2)
 # ---------------------------------------------------------
@@ -103,3 +106,4 @@ tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
 # ============================================
 tmux select-window -t "$SESSION:1"
 tmux attach-session -t "$SESSION"
+
