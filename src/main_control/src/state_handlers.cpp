@@ -183,9 +183,8 @@ void MissionManager::handleNavToDropArea() {
         return;
     }
     if (navTo(drop_target) && moveTo(drop_target) && isDropWindowStable(drop_target.z)) {
-        // PCL模式下先去柱子航点，EGO模式直接去环后方
-        current_state_    = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : NAV_TO_RING_BACK;
-        // NAV_TO_RING_BACK  // [注释] 原有EGO路径
+        // 跳过投放，直入前视攻击
+        current_state_    = MOVE_TO_ATTACK_AREA;
         nav_goal_sent_    = false;
         nav_status_       = 0;
         state_start_time_ = ros::Time::now();
@@ -222,7 +221,7 @@ void MissionManager::handleHoverRecognizeDrop() {
     }
 
     const double detect_age = current_detection_.last_update.isZero()
-                                  ? std::numeric_limits<double>::infinity()
+                                  ? 0.0  // 从未检测到 → 不超时，等待 OCR
                                   : (ros::Time::now() - current_detection_.last_update).toSec();
     if (!current_detection_.detected || detect_age > cfg_.drop_detect_timeout) {
         // holdDropHover();
@@ -386,11 +385,25 @@ void MissionManager::handleDropSupply() {
 // 8.7 移动至攻击目标识别区
 void MissionManager::handleMoveToAttackArea() {
     static bool reset_target_called = false;
+    static bool logged_once         = false;
+    if (!logged_once) {
+        ROS_WARN("[DEBUG-ATTACK] 进入 MOVE_TO_ATTACK_AREA, front_camera_active_=%d",
+                 front_camera_active_);
+        logged_once = true;
+    }
     if (!reset_target_called) {
+        ROS_WARN("[DEBUG-ATTACK] 执行 callResetTarget + callSwitchCamera");
         callResetTarget();
-        if (!front_camera_active_) callSwitchCamera();
+        if (!front_camera_active_) {
+            bool ok = callSwitchCamera();
+            ROS_WARN("[DEBUG-ATTACK] callSwitchCamera 返回=%d, front_camera_active_=%d", ok,
+                     front_camera_active_);
+        }
+        reset_target_called = true;
     }
     if (target_confirmed_ || moveTo(wp_attack_area_)) {
+        ROS_WARN("[DEBUG-ATTACK] 转换到 RECOG_ATTACK_TARGET, target_confirmed_=%d",
+                 target_confirmed_);
         current_state_    = RECOG_ATTACK_TARGET;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
@@ -398,8 +411,9 @@ void MissionManager::handleMoveToAttackArea() {
     }
 }
 
-// 8.8 识别攻击目标
+// 8.8 识别攻击目标（vision_laser 定点模式：确认目标后判断左右→设置射击点）
 void MissionManager::handleRecognizeAttackTarget() {
+    // 悬停
     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     current_setpoint_.type_mask        = 0b100111000111;
     current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
@@ -408,31 +422,60 @@ void MissionManager::handleRecognizeAttackTarget() {
 
     if (!target_confirmed_) {
         hover();
-        ROS_INFO_THROTTLE(1.0, "等待前视目标确认...");
+        ROS_WARN_THROTTLE(2.0,
+                          "[DEBUG-ATTACK] RECOG等待: target_confirmed_=%d, confirmed_target_='%s', "
+                          "detected=%d, front_camera_active_=%d",
+                          target_confirmed_, confirmed_target_.c_str(), current_detection_.detected,
+                          front_camera_active_);
         return;
     }
 
+    // 目标已确认，但需要检测到目标才能判断左右
     if (current_detection_.detected) {
-        // float fx      = 500.0f;
-        // float fy      = 500.0f;
-        // float z       = cfg_.takeoff_height;
-        // float world_x = local_odom_.pose.pose.position.x +
-        //                 (current_detection_.center_x - IMG_CENTER_X) * z / fx;
-        // float world_y = local_odom_.pose.pose.position.y +
-        //                 (current_detection_.center_y - IMG_CENTER_Y) * z / fy;
-        // attack_target_world_ = Eigen::Vector3f(world_x, world_y, init_pos_z_);
-        // ROS_INFO("攻击目标世界坐标估算: (%.2f, %.2f)", world_x, world_y);
-        // }
+        float target_cx = current_detection_.center_x;
+        float threshold = cfg_.shoot_left_right_threshold;
 
-        // if ((ros::Time::now() - state_start_time_).toSec() > 1.0) {
-        ROS_INFO("正确攻击目标已确认，正在移动到目标正前方");
+        // 判断目标在图像中的位置（图像中心 = IMG_CENTER_X = 320）
+        if (target_cx < (IMG_CENTER_X - threshold)) {
+            shoot_target_x_ = init_pos_x_ + cfg_.shoot_left_x;
+            shoot_target_y_ = init_pos_y_ + cfg_.shoot_left_y;
+            ROS_INFO("[攻击] 目标偏左 (cx=%.1f)，前往左射击点 (%.2f, %.2f)", target_cx,
+                     shoot_target_x_, shoot_target_y_);
+        }
+        else if (target_cx > (IMG_CENTER_X + threshold)) {
+            shoot_target_x_ = init_pos_x_ + cfg_.shoot_right_x;
+            shoot_target_y_ = init_pos_y_ + cfg_.shoot_right_y;
+            ROS_INFO("[攻击] 目标偏右 (cx=%.1f)，前往右射击点 (%.2f, %.2f)", target_cx,
+                     shoot_target_x_, shoot_target_y_);
+        }
+        else {
+            shoot_target_x_ = init_pos_x_ + cfg_.shoot_default_x;
+            shoot_target_y_ = init_pos_y_ + cfg_.shoot_default_y;
+            ROS_INFO("[攻击] 目标在中心 (cx=%.1f)，前往默认射击点 (%.2f, %.2f)", target_cx,
+                     shoot_target_x_, shoot_target_y_);
+        }
+
+        ROS_INFO("[攻击] 定点射击目标已确定，开始移动");
         current_state_    = ALIGN_ATTACK_TARGET;
-        // nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
+        pix_integral_x_ = pix_integral_y_ = 0.0f;
+        last_pix_err_x_ = last_pix_err_y_ = 0.0f;
     }
     else {
-        ROS_WARN_STREAM_THROTTLE(1.0, "目标已确认，但是当前视野未检测到目标，保持悬停");
+        // 目标已确认但当前视野未检测到
         hover();
+        ROS_WARN_THROTTLE(1.0, "目标已确认但未检测到，等待检测...");
+
+        // 60s超时使用默认射击点
+        if (timeout(cfg_.shoot_detect_timeout)) {
+            ROS_WARN("[攻击] 检测超时(%.0fs)，使用默认射击点", cfg_.shoot_detect_timeout);
+            shoot_target_x_   = init_pos_x_ + cfg_.shoot_default_x;
+            shoot_target_y_   = init_pos_y_ + cfg_.shoot_default_y;
+            current_state_    = ALIGN_ATTACK_TARGET;
+            state_start_time_ = ros::Time::now();
+            pix_integral_x_ = pix_integral_y_ = 0.0f;
+            last_pix_err_x_ = last_pix_err_y_ = 0.0f;
+        }
     }
 }
 
@@ -450,52 +493,40 @@ void MissionManager::handleMoveToFrontOfTarget() {
     }
 }
 
-// 8.10 前视像素对准目标
+// 8.10 定点飞行到射击点（vision_laser 定点模式，抛弃视觉PID）
 void MissionManager::handleAlignAttackTarget() {
-    static ros::Time align_hold_start = ros::Time(0);
-    if (!current_detection_.detected) {
-        ROS_WARN_THROTTLE(1.0, "前视未检测到目标，保持悬停");
-        hover();
-        align_hold_start = ros::Time(0);
-        pix_integral_x_ = pix_integral_y_ = 0.0f;
-        return;
-    }
+    static bool arrived = false;
 
-    float err_x      = IMG_CENTER_X - current_detection_.center_x;
-    float err_y      = IMG_CENTER_Y - current_detection_.center_y;
-    float pixel_dist = sqrt(err_x * err_x + err_y * err_y);
-
-    ros::Time now    = ros::Time::now();
-    float dt = last_pid_control_time_.isZero() ? 0.05f : (now - last_pid_control_time_).toSec();
-    last_pid_control_time_ = now;
-
-    float vel_from_err_x, vel_from_err_y;
-    getPixPidVel(err_x, err_y, dt, vel_from_err_x, vel_from_err_y);
-
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
-    current_setpoint_.type_mask        = 0b110111001110;
-    current_setpoint_.position.x       = wp_attack_area_.x;
-    current_setpoint_.velocity.y       = -vel_from_err_x;
-    current_setpoint_.velocity.z       = -vel_from_err_y;
-    current_setpoint_.yaw              = init_yaw_;
-
-    ROS_INFO_THROTTLE(0.5, "[前视攻击对准] 像素误差: %.1f px, 速度指令: y=%.2f, z=%.2f", pixel_dist,
-                      current_setpoint_.velocity.y, current_setpoint_.velocity.z);
-
-    if (pixel_dist < cfg_.align_pixel_threshold) {
-        if (align_hold_start.isZero()) {
-            align_hold_start = now;
+    // 使用位置控制飞到射击点
+    if (moveTo(shoot_target_x_, shoot_target_y_, wp_attack_area_.z)) {
+        if (!arrived) {
+            arrived           = true;
+            state_start_time_ = ros::Time::now();
+            ROS_INFO("[攻击] 到达射击点 (%.2f, %.2f)，稳定 %.1fs 后射击", shoot_target_x_,
+                     shoot_target_y_, cfg_.shoot_stable_time);
         }
-        else if ((now - align_hold_start).toSec() >= cfg_.drop_align_hold_time) {
-            ROS_INFO("前视对准完成，准备攻击");
+
+        // 稳定后射击（与 vision_laser Sub 4 一致）
+        if (timeout(cfg_.shoot_stable_time)) {
+            ROS_INFO("\n");
+            ROS_INFO("╔════════════════════════════════════════╗");
+            ROS_INFO("║          ★★★ 射击！ ★★★            ║");
+            ROS_INFO("╠════════════════════════════════════════╣");
+            ROS_INFO("║  射击坐标: (%.3f, %.3f, %.3f)     ", local_odom_.pose.pose.position.x,
+                     local_odom_.pose.pose.position.y, local_odom_.pose.pose.position.z);
+            ROS_INFO("║  识别目标: %s", confirmed_target_.c_str());
+            ROS_INFO("╚════════════════════════════════════════╝");
+            ROS_INFO("\n");
+
+            arrived           = false;
             current_state_    = SIMULATE_ATTACK;
             state_start_time_ = ros::Time::now();
-            align_hold_start  = ros::Time(0);
-            pix_integral_x_ = pix_integral_y_ = 0.0f;
         }
     }
     else {
-        align_hold_start = ros::Time(0);
+        arrived = false;
+        ROS_INFO_THROTTLE(0.5, "[攻击] 飞行到射击点 (%.2f, %.2f)...", init_pos_x_ + shoot_target_x_,
+                          init_pos_y_ + shoot_target_y_);
     }
 }
 
@@ -521,7 +552,7 @@ void MissionManager::handleWaitHitConfirmation() {
     hover();
     if (timeout(5) || hit_confirmed_) {
         // PCL模式下去反向柱子航点，EGO模式去环后方
-        current_state_    = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : NAV_TO_RING_BACK;
+        current_state_ = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : NAV_TO_RING_BACK;
         // NAV_TO_RING_BACK  // [注释] 原有EGO路径
         state_start_time_ = ros::Time::now();
         if (hit_confirmed_)
@@ -694,15 +725,93 @@ void MissionManager::handleLand() {
         ROS_INFO("精准降落初始化: 起始高度 %.2f m, 地面高度 %.2f m", start_z, ground_z);
     }
 
-    // === 阶段0: 下降 + 视觉对准 ===
+    // === 阶段0: 下降 + 视觉对准（优先使用圆检测） ===
     if (land_phase == 0) {
-        // 检查下视检测有效性
-        const double detect_age = current_detection_.last_update.isZero()
+        // === 圆检测对准（vision_laser precise_land 状态4，优先尝试） ===
+        const double circle_age = circle_detect_time_.isZero()
                                       ? std::numeric_limits<double>::infinity()
-                                      : (now - current_detection_.last_update).toSec();
+                                      : (now - circle_detect_time_).toSec();
 
+        bool circle_valid       = circle_detected_ && (circle_age < cfg_.circle_detect_timeout_s);
+
+        if (circle_valid) {
+            // 使用圆检测进行像素环PID对准
+            float err_x        = IMG_CENTER_X - circle_center_x_;
+            float err_y        = IMG_CENTER_Y - circle_center_y_;
+
+            // 检查是否在阈值内
+            bool in_threshold  = (std::abs(err_x) < cfg_.circle_align_threshold &&
+                                 std::abs(err_y) < cfg_.circle_align_threshold);
+
+            // 检查坐标是否有变化（防重复帧）
+            float coord_change = std::sqrt(std::pow(circle_center_x_ - last_circle_x_, 2) +
+                                           std::pow(circle_center_y_ - last_circle_y_, 2));
+            bool coord_changed = (coord_change > 0.01f);
+
+            if (in_threshold) {
+                // 阈值内且坐标变化才计数
+                if (coord_changed) {
+                    circle_in_threshold_count_++;
+                    last_circle_x_ = circle_center_x_;
+                    last_circle_y_ = circle_center_y_;
+                    ROS_INFO_THROTTLE(1.0, "[精准降落-圆] 靶标在中心，计数: %d/%d",
+                                      circle_in_threshold_count_, cfg_.circle_confirm_count);
+                }
+
+                // 连续N次确认通过 → 锁定降落坐标
+                if (circle_in_threshold_count_ >= cfg_.circle_confirm_count) {
+                    land_target_x_     = local_odom_.pose.pose.position.x;
+                    land_target_y_     = local_odom_.pose.pose.position.y;
+                    target_pos_locked_ = true;
+                    ROS_INFO("[精准降落-圆] 连续%d次确认通过，锁定坐标: (%.3f, %.3f)",
+                             cfg_.circle_confirm_count, land_target_x_, land_target_y_);
+                    land_phase       = 1;
+                    align_hold_start = now;
+                    return;
+                }
+
+                // 对准良好时保持悬停
+                current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+                current_setpoint_.type_mask        = 0b100111000111;
+                current_setpoint_.velocity.x       = 0.0f;
+                current_setpoint_.velocity.y       = 0.0f;
+                current_setpoint_.velocity.z       = 0.0f;
+                current_setpoint_.yaw              = init_yaw_;
+            }
+            else {
+                // 不在阈值内，计数清零，执行PID微调
+                if (circle_in_threshold_count_ > 0) {
+                    ROS_INFO("[精准降落-圆] 靶标偏离中心，计数重置");
+                    circle_in_threshold_count_ = 0;
+                }
+
+                float dt =
+                    land_last_pid_time_.isZero() ? 0.05f : (now - land_last_pid_time_).toSec();
+                land_last_pid_time_ = now;
+
+                float vel_x, vel_y;
+                getLandPixPidVel(err_x, err_y, dt, vel_x, vel_y);
+
+                // BODY_NED: X=前, Y=右. 图像Y误差→X速度(前后), 图像X误差→Y速度(左右)
+                current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+                current_setpoint_.type_mask        = 0b100111000111;
+                current_setpoint_.velocity.x       = vel_x;
+                current_setpoint_.velocity.y       = vel_y;
+                current_setpoint_.velocity.z       = 0.0f;
+                current_setpoint_.yaw              = init_yaw_;
+
+                ROS_INFO_THROTTLE(0.5, "[精准降落-圆] 像素误差: (%.1f, %.1f), 速度: (%.3f, %.3f)",
+                                  err_x, err_y, vel_x, vel_y);
+            }
+
+            align_hold_start = ros::Time(0);
+            pix_integral_x = pix_integral_y = 0.0f;
+            return;
+        }
+
+        // === 原有的YOLO检测对准（圆检测不可用时回退） ===
         if (!current_detection_.detected) {
-            if (detect_age > cfg_.drop_detect_timeout) {
+            if (timeout(cfg_.drop_detect_timeout)) {
                 ROS_WARN_THROTTLE(1.0, "[精准降落] 下视检测超时，直接采用自动降落模式");
                 land_phase = -1;
                 hover();
@@ -813,8 +922,33 @@ void MissionManager::handleLand() {
         return;
     }
 
-    // === 阶段1: 触地判定 ===
+    // === 阶段1: 触地判定 / 锁定坐标下降 ===
     if (land_phase == 1) {
+        // 如果坐标已由圆检测锁定，使用锁定的XY下降
+        if (target_pos_locked_) {
+            // 锁定坐标垂直下降（vision_laser precise_land 状态5）
+            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+            current_setpoint_.type_mask        = 0b101111111000;
+            current_setpoint_.position.x       = land_target_x_;
+            current_setpoint_.position.y       = land_target_y_;
+            current_setpoint_.position.z       = current_z - 0.3f;  // 持续下降
+            current_setpoint_.yaw              = init_yaw_;
+
+            ROS_INFO_THROTTLE(0.5, "[精准降落-锁定] 保持坐标 (%.3f, %.3f) 下降, 高度: %.2f",
+                              land_target_x_, land_target_y_, current_z);
+
+            // 高度低于0.3m → AUTO.LAND（同 vision_laser）
+            if (current_z <= ground_z + 0.3f) {
+                ROS_INFO("[精准降落-锁定] 高度 < 0.3m，切换 AUTO.LAND");
+                land_phase         = -1;
+                target_pos_locked_ = false;
+                align_hold_start   = ros::Time(0);
+                state_start_time_  = now;
+            }
+            return;
+        }
+
+        // 原有的触地判定逻辑
         current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
         current_setpoint_.type_mask        = 0b101111111000;
         current_setpoint_.position.x       = hold_x;
@@ -899,7 +1033,8 @@ void MissionManager::handlePillarDetect() {
         pillar_wp_index_ = 0;
         if (pillar_case_id_ < static_cast<int>(pillar_waypoints_.size())) {
             pillar_wp_total_ = pillar_waypoints_[pillar_case_id_].size();
-        } else {
+        }
+        else {
             pillar_wp_total_ = 0;
         }
 
@@ -908,7 +1043,8 @@ void MissionManager::handlePillarDetect() {
             state_start_time_ = ros::Time::now();
             start_sent        = false;
             ROS_INFO("[Pillar] 开始导航，共 %zu 个航点", pillar_wp_total_);
-        } else {
+        }
+        else {
             ROS_WARN("[Pillar] 无有效航点，回退EGO");
             current_state_    = NAV_TO_DROP_AREA;
             state_start_time_ = ros::Time::now();
@@ -945,14 +1081,13 @@ void MissionManager::handleNavPillarWaypoints() {
     Waypoint abs_wp(init_pos_x_ + wp.x, init_pos_y_ + wp.y, init_pos_z_ + wp.z);
 
     if (moveTo(abs_wp)) {
-        ROS_INFO("[Pillar] 航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)",
-                 pillar_wp_index_ + 1, waypoints.size(),
-                 abs_wp.x, abs_wp.y, abs_wp.z);
+        ROS_INFO("[Pillar] 航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)", pillar_wp_index_ + 1,
+                 waypoints.size(), abs_wp.x, abs_wp.y, abs_wp.z);
         ++pillar_wp_index_;
-    } else {
-        ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向航点 #%zu/%zu: (%.2f,%.2f,%.2f)",
-                          pillar_wp_index_ + 1, waypoints.size(),
-                          abs_wp.x, abs_wp.y, abs_wp.z);
+    }
+    else {
+        ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向航点 #%zu/%zu: (%.2f,%.2f,%.2f)", pillar_wp_index_ + 1,
+                          waypoints.size(), abs_wp.x, abs_wp.y, abs_wp.z);
     }
 }
 
@@ -964,7 +1099,7 @@ void MissionManager::handleReturnPillarWaypoints() {
         return;
     }
 
-    const auto &waypoints = pillar_waypoints_[pillar_case_id_];
+    const auto &waypoints    = pillar_waypoints_[pillar_case_id_];
     static bool init_reverse = true;
 
     if (init_reverse) {
@@ -975,9 +1110,9 @@ void MissionManager::handleReturnPillarWaypoints() {
 
     if (pillar_wp_index_ == 0) {
         // 反向航点全部完成 → 去穿环返回
-        init_reverse       = true;
-        current_state_     = RETURN_CROSS_RING;
-        state_start_time_  = ros::Time::now();
+        init_reverse      = true;
+        current_state_    = RETURN_CROSS_RING;
+        state_start_time_ = ros::Time::now();
         ROS_INFO("[Pillar] 反向航点全部完成，准备穿环返回");
         return;
     }
@@ -987,13 +1122,13 @@ void MissionManager::handleReturnPillarWaypoints() {
     Waypoint abs_wp(init_pos_x_ + wp.x, init_pos_y_ + wp.y, init_pos_z_ + wp.z);
 
     if (moveTo(abs_wp)) {
-        ROS_INFO("[Pillar] 反向航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)",
-                 waypoints.size() - cur_idx, waypoints.size(),
-                 abs_wp.x, abs_wp.y, abs_wp.z);
+        ROS_INFO("[Pillar] 反向航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)", waypoints.size() - cur_idx,
+                 waypoints.size(), abs_wp.x, abs_wp.y, abs_wp.z);
         --pillar_wp_index_;  // 到达后才递减
-    } else {
+    }
+    else {
         ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向反向航点 #%zu/%zu: (%.2f,%.2f,%.2f)",
-                          waypoints.size() - cur_idx, waypoints.size(),
-                          abs_wp.x, abs_wp.y, abs_wp.z);
+                          waypoints.size() - cur_idx, waypoints.size(), abs_wp.x, abs_wp.y,
+                          abs_wp.z);
     }
 }

@@ -25,6 +25,7 @@
 // 自定义消息（需根据实际包名调整）
 #include <pcl_detection2/SquareRing.h>
 #include <raicom_vision_laser/DetectionInfo.h>
+#include <raicom_vision_laser/CircleDetectResult.h>
 
 // ============================================================================
 // 状态机枚举
@@ -85,10 +86,12 @@ class MissionManager
     ros::Subscriber yolo_detect_sub_;
     ros::Subscriber hit_confirm_sub_;
     ros::Subscriber ring_sub_;
+    ros::Subscriber circle_sub_;
     ros::Subscriber pillar_sub_;
     ros::Publisher pillar_start_pub_;
 
     ros::ServiceClient switch_camera_client_;
+    ros::ServiceClient switch_to_circle_client_;
     ros::ServiceClient reset_target_client_;
     ros::ServiceClient get_status_client_;
     ros::ServiceClient set_mode_client_;
@@ -134,9 +137,36 @@ class MissionManager
     Eigen::Vector3f attack_target_world_;
     bool hit_confirmed_ = false;
 
+    // 定点射击目标（vision_laser 状态6）
+    float shoot_target_x_ = 0.0f;
+    float shoot_target_y_ = 0.0f;
+
     // -----pcl识别环
     bool ensure_ring_   = false;
     DetectionData ring_detection;
+
+    // -----圆检测（精准降落）
+    bool circle_detected_    = false;
+    float circle_center_x_   = 0.0f;
+    float circle_center_y_   = 0.0f;
+    float circle_radius_     = 0.0f;
+    ros::Time circle_detect_time_;
+
+    // -----精准降落像素PID（独立于前视PID）
+    float land_pix_err_sum_x_     = 0.0f;
+    float land_pix_err_sum_y_     = 0.0f;
+    float land_pix_last_err_x_    = 0.0f;
+    float land_pix_last_err_y_    = 0.0f;
+    int circle_in_threshold_count_ = 0;
+    const int CIRCLE_THRESHOLD_COUNT = 3;
+    float last_circle_x_          = -1000.0f;
+    float last_circle_y_          = -1000.0f;
+    ros::Time land_last_pid_time_;
+
+    // -----锁定降落坐标
+    float land_target_x_          = 0.0f;
+    float land_target_y_          = 0.0f;
+    bool target_pos_locked_       = false;
 
     // 记住第一次穿环后的位置（世界坐标），返程导航直接用
     Eigen::Vector3f ring_back_memorized_ = Eigen::Vector3f::Zero();
@@ -252,6 +282,24 @@ class MissionManager
         float ring_front_approach_offset = 0.8f;  // 环前方悬停距离 (m)
         float ring_back_approach_offset  = 2.5f;  // 环后方穿越目标距离 (m)
 
+        // 定点射击参数（vision_laser 状态6，抛弃视觉PID，使用位置判断+定点射击）
+        float shoot_left_x      = -0.60f;   // 左射击点X（相对attack_area）
+        float shoot_left_y      = -2.5f;    // 左射击点Y
+        float shoot_right_x     = -0.60f;   // 右射击点X
+        float shoot_right_y     = -1.8f;    // 右射击点Y
+        float shoot_default_x   = -0.60f;   // 默认射击点X
+        float shoot_default_y   = -2.15f;   // 默认射击点Y
+        float shoot_left_right_threshold = 20.0f;  // 左右判断像素阈值
+        float shoot_detect_timeout       = 60.0f;  // 目标检测超时 (s)
+        float shoot_stable_time          = 0.5f;   // 射击前稳定时间 (s)
+
+        // 精准降落圆检测参数
+        float circle_pix_vel_p            = 0.001f;   // 圆检测像素PID P增益
+        float circle_pix_vel_max          = 0.3f;     // 圆检测最大对准速度
+        float circle_align_threshold      = 30.0f;    // 圆对准像素阈值
+        int circle_confirm_count          = 3;        // 连续确认帧数
+        float circle_detect_timeout_s     = 0.5f;     // 圆检测超时 (s)
+
         // 环多假设追踪参数（类 PCL 强度）
         float track_match_distance       = 0.3f;   // 匹配距离阈值 (m)
         float track_confidence_boost     = 0.15f;  // 每次匹配成功增量
@@ -284,6 +332,7 @@ class MissionManager
     void hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg);
     void ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg);
     void pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg);
+    void circleDetectCallback(const raicom_vision_laser::CircleDetectResult::ConstPtr &msg);
 
     // ---------- 控制辅助函数 ----------
     void sendSetpoint(const mavros_msgs::PositionTarget &sp);
@@ -302,6 +351,11 @@ class MissionManager
 
     void getPixPidVel(float err_x, float err_y, float dt, float &vel_x, float &vel_y);
     float satfunc(float value, float limit);
+
+    // 圆检测精准降落辅助
+    void resetLandPixPid();
+    void getLandPixPidVel(float err_x, float err_y, float dt, float &vel_x, float &vel_y);
+    bool callSwitchCircle();
 
     bool callSwitchCamera();
     bool callResetTarget();

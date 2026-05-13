@@ -61,7 +61,7 @@ void MissionManager::loadParameters() {
                            "land_target");
 
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
-    nh_.param<float>("drop_detect_timeout", cfg_.drop_detect_timeout, 0.30f);
+    nh_.param<float>("drop/detect_timeout", cfg_.drop_detect_timeout, 5.0f);
     nh_.param<float>("drop_align_hold_time", cfg_.drop_align_hold_time, 0.35f);
     nh_.param<float>("drop_release_max_horiz_speed", cfg_.drop_release_max_horiz_speed, 0.12f);
     nh_.param<float>("drop_release_max_vert_speed", cfg_.drop_release_max_vert_speed, 0.06f);
@@ -101,6 +101,24 @@ void MissionManager::loadParameters() {
     nh_.param<int>("ring_track/max_candidates", cfg_.track_max_candidates, 3);
     nh_.param<float>("ring_track/ema_alpha", cfg_.track_ema_alpha, 0.3f);
 
+    // 定点射击参数（vision_laser 状态6）
+    nh_.param<float>("shoot/left_x", cfg_.shoot_left_x, -0.60f);
+    nh_.param<float>("shoot/left_y", cfg_.shoot_left_y, -2.5f);
+    nh_.param<float>("shoot/right_x", cfg_.shoot_right_x, -0.60f);
+    nh_.param<float>("shoot/right_y", cfg_.shoot_right_y, -1.8f);
+    nh_.param<float>("shoot/default_x", cfg_.shoot_default_x, -0.60f);
+    nh_.param<float>("shoot/default_y", cfg_.shoot_default_y, -2.15f);
+    nh_.param<float>("shoot/left_right_threshold", cfg_.shoot_left_right_threshold, 20.0f);
+    nh_.param<float>("shoot/detect_timeout", cfg_.shoot_detect_timeout, 60.0f);
+    nh_.param<float>("shoot/stable_time", cfg_.shoot_stable_time, 0.5f);
+
+    // 精准降落圆检测参数
+    nh_.param<float>("circle_pix_vel_p", cfg_.circle_pix_vel_p, 0.001f);
+    nh_.param<float>("circle_pix_vel_max", cfg_.circle_pix_vel_max, 0.3f);
+    nh_.param<float>("circle_align_threshold", cfg_.circle_align_threshold, 30.0f);
+    nh_.param<int>("circle_confirm_count", cfg_.circle_confirm_count, 3);
+    nh_.param<float>("circle_detect_timeout_s", cfg_.circle_detect_timeout_s, 0.5f);
+
     ROS_INFO("参数加载完成。");
 }
 
@@ -122,12 +140,15 @@ void MissionManager::initROSCommunication() {
         nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
     ring_sub_ =
         nh_.subscribe("/pcl_detection2/square_ring", 10, &MissionManager::ringDetectCallback, this);
+    circle_sub_       = nh_.subscribe("/circle_detect_result", 10,
+                                      &MissionManager::circleDetectCallback, this);
     pillar_sub_       = nh_.subscribe("/pcl_detection2/pillar_case_id", 10,
                                       &MissionManager::pillarDetectCallback, this);
     pillar_start_pub_ = nh_.advertise<std_msgs::Empty>("/pcl_detection2/start_pillar_detect", 1);
 
-    switch_camera_client_ = nh_.serviceClient<std_srvs::Empty>("/switch_camera");
-    reset_target_client_  = nh_.serviceClient<std_srvs::Empty>("/reset_target");
+    switch_camera_client_    = nh_.serviceClient<std_srvs::Empty>("/switch_camera");
+    switch_to_circle_client_ = nh_.serviceClient<std_srvs::Empty>("/switch_to_circle_mode");
+    reset_target_client_     = nh_.serviceClient<std_srvs::Empty>("/reset_target");
     get_status_client_    = nh_.serviceClient<std_srvs::Empty>("/get_system_status");
     set_mode_client_      = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
     arming_client_        = nh_.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
@@ -518,6 +539,40 @@ bool MissionManager::callResetTarget() {
     }
     ROS_WARN("重置目标服务调用失败");
     return false;
+}
+
+bool MissionManager::callSwitchCircle() {
+    std_srvs::Empty srv;
+    if (switch_to_circle_client_.call(srv)) {
+        ROS_INFO("[Circle] 已切换到圆检测模式");
+        return true;
+    }
+    ROS_WARN("[Circle] 切换圆检测模式失败");
+    return false;
+}
+
+void MissionManager::resetLandPixPid() {
+    land_pix_err_sum_x_     = 0.0f;
+    land_pix_err_sum_y_     = 0.0f;
+    land_pix_last_err_x_    = 0.0f;
+    land_pix_last_err_y_    = 0.0f;
+    circle_in_threshold_count_ = 0;
+    last_circle_x_          = -1000.0f;
+    last_circle_y_          = -1000.0f;
+    target_pos_locked_      = false;
+    land_last_pid_time_     = ros::Time::now();
+    ROS_INFO("[精准降落] 像素PID已重置");
+}
+
+void MissionManager::getLandPixPidVel(float err_x, float err_y, float dt,
+                                       float &vel_x, float &vel_y) {
+    // 纯P控制，同 vision_laser precise_land
+    // 坐标轴交换：图像X误差→机体Y(左右)，图像Y误差→机体X(前后)
+    vel_x = cfg_.circle_pix_vel_p * err_y;
+    vel_y = cfg_.circle_pix_vel_p * err_x;
+
+    vel_x = satfunc(vel_x, cfg_.circle_pix_vel_max);
+    vel_y = satfunc(vel_y, cfg_.circle_pix_vel_max);
 }
 
 bool MissionManager::timeout(const float timeout_limit) const noexcept {

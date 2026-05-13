@@ -94,6 +94,13 @@ source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
 roslaunch uav_navigation ego_nav.launch"
 tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
 
+# ---------------------------------------------------------
+# 窗口 3：精准降落 (圆检测)
+# ---------------------------------------------------------
+tmux new-window -t "$SESSION" -n "Landing"
+
+tmux send-keys -t "$SESSION:3" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; rosrun raicom_vision_laser hough_circle_detector.py" C-m
+
 # ============================================
 # 完成配置并附加会话
 # ============================================
