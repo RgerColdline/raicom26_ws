@@ -91,6 +91,7 @@ detection:
   drop_target_class: "drop_target"
   attack_target_class: "attack_target"
   land_target_class: "land_target"
+  attack_real_target: "A" # 真实目标字母（A或B），前视时只匹配此字母，忽略干扰目标
 
 drop:
   # 投放阶段调参

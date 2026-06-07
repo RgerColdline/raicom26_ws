@@ -4,6 +4,7 @@
 void MissionManager::handleInitTakeoff() {
     static int sub_state               = 0;
     static int setpoint_count          = 0;
+    static bool laser_safety_checked   = false;
 
     float target_z                     = init_pos_z_ + cfg_.takeoff_height;
     float current_z                    = local_odom_.pose.pose.position.z;
@@ -19,6 +20,16 @@ void MissionManager::handleInitTakeoff() {
     case 0:
         if (setpoint_count < 100) {
             setpoint_count++;
+            if (setpoint_count == 99) {
+                // 起飞前确保激光关闭（遵守规则：全程不能一直开着激光）
+                if (!laser_safety_checked) {
+                    std_msgs::Bool laser_off;
+                    laser_off.data = false;
+                    laser_control_pub_.publish(laser_off);
+                    ROS_INFO("【安全】激光已关闭");
+                    laser_safety_checked = true;
+                }
+            }
             if (setpoint_count == 100) {
                 ROS_INFO("已发送100个设定点，准备切换OFFBOARD模式");
                 sub_state         = 1;
@@ -182,9 +193,9 @@ void MissionManager::handleNavToDropArea() {
         }
         return;
     }
-    if (navTo(drop_target) && moveTo(drop_target) && isDropWindowStable(drop_target.z)) {
-        // 跳过投放，直入前视攻击
-        current_state_    = MOVE_TO_ATTACK_AREA;
+    if (moveTo(drop_target)) {
+        // 到达投放区，进入悬停识别
+        current_state_    = HOVER_RECOG_DROP;
         nav_goal_sent_    = false;
         nav_status_       = 0;
         state_start_time_ = ros::Time::now();
@@ -198,96 +209,117 @@ void MissionManager::handleNavToDropArea() {
     }
 }
 
-// 8.5 悬停识别投放区标识
+// 8.5 悬停识别投放区标识（圆检测优先，OCR回退）
 void MissionManager::handleHoverRecognizeDrop() {
-    // auto holdDropHover = [this]() {
-    //     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    //     current_setpoint_.type_mask        = 0b100111000111;
-    //     current_setpoint_.velocity.x = current_setpoint_.velocity.y = 0.0f;
-    //     current_setpoint_.velocity.z =
-    //         (init_pos_z_ + cfg_.takeoff_height - local_odom_.pose.pose.position.z) * cfg_.p_z;
-    //     current_setpoint_.yaw = init_yaw_;
-    // };
+    const ros::Time now = ros::Time::now();
+    static int debug_step = 0;
+    debug_step++;
 
-    if (!target_confirmed_) {
-        // holdDropHover();
-        hover();
-        drop_alignment_hold_start_ = ros::Time(0);
-        last_pid_control_time_     = ros::Time(0);
-        pix_integral_x_ = pix_integral_y_ = 0.0f;
-        last_pix_err_x_ = last_pix_err_y_ = 0.0f;
-        ROS_INFO_THROTTLE(1.0, "等待投放标识确认...");
+    // ==================== DEBUG：打印所有相关变量值 ====================
+    const double circle_age = circle_detect_time_.isZero()
+                                  ? -1.0  // -1 = 从未收到过
+                                  : (now - circle_detect_time_).toSec();
+    const bool circle_ok = circle_detected_ && circle_age >= 0 && circle_age < cfg_.circle_detect_timeout_s;
+
+    ROS_WARN("===== [DEBUG-DROP] step=%d state=%d circle_detected=%d circle_age=%.2fs "
+             "circle_ok=%d target_confirmed=%d =====",
+             debug_step, (int)current_state_, (int)circle_detected_,
+             circle_age, (int)circle_ok, (int)target_confirmed_);
+    if (circle_detected_) {
+        ROS_WARN("[DEBUG-DROP]   circle_center=(%.1f,%.1f) radius=%.1f",
+                 circle_center_x_, circle_center_y_, circle_radius_);
+    }
+    ROS_WARN("[DEBUG-DROP]   circle_detect_time_.isZero=%d  timeout=%.1fs",
+             circle_detect_time_.isZero(), cfg_.circle_detect_timeout_s);
+
+    // ---------- 优先：圆检测对准（投放区是800mm圆形）----------
+    if (circle_ok) {
+        ROS_INFO("[投放-圆] ✅ 圆检测有效，开始对准");
+
+        float err_x = IMG_CENTER_X - circle_center_x_;
+        float err_y = IMG_CENTER_Y - circle_center_y_;
+        float pixel_dist = std::sqrt(err_x * err_x + err_y * err_y);
+
+        ROS_INFO("[投放-圆] err=(%.1f,%.1f) dist=%.1f 阈值=%.1f",
+                 err_x, err_y, pixel_dist, cfg_.circle_align_threshold);
+
+        float vel_x, vel_y;
+        getLandPixPidVel(err_x, err_y, 0.05f, vel_x, vel_y);
+
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+        current_setpoint_.type_mask        = 0b100111000111;
+        current_setpoint_.velocity.x       = vel_x;
+        current_setpoint_.velocity.y       = vel_y;
+        current_setpoint_.velocity.z       = 0.0f;
+        current_setpoint_.yaw              = current_yaw_;
+
+        const bool aligned = pixel_dist < cfg_.circle_align_threshold;
+        if (!aligned) {
+            ROS_INFO_THROTTLE(1.0, "[投放-圆] 未对准，继续调整");
+            drop_alignment_hold_start_ = ros::Time(0);
+            return;
+        }
+        if (drop_alignment_hold_start_.isZero()) {
+            ROS_INFO("[投放-圆] 首次对准，开始计时");
+            drop_alignment_hold_start_ = now;
+            return;
+        }
+        double hold = (now - drop_alignment_hold_start_).toSec();
+        ROS_INFO("[投放-圆] 已保持 %.1f/%.1fs", hold, cfg_.drop_align_hold_time);
+        if (hold >= cfg_.drop_align_hold_time) {
+            ROS_INFO("✅ 投放区圆对准完成，进入投放");
+            current_state_             = DROP_SUPPLY;
+            state_start_time_          = now;
+            drop_alignment_hold_start_ = ros::Time(0);
+        }
         return;
     }
 
-    const double detect_age = current_detection_.last_update.isZero()
-                                  ? 0.0  // 从未检测到 → 不超时，等待 OCR
-                                  : (ros::Time::now() - current_detection_.last_update).toSec();
-    if (!current_detection_.detected || detect_age > cfg_.drop_detect_timeout) {
-        // holdDropHover();
-        hover();
-        drop_alignment_hold_start_ = ros::Time(0);
-        last_pid_control_time_     = ros::Time(0);
-        pix_integral_x_ = pix_integral_y_ = 0.0f;
-        last_pix_err_x_ = last_pix_err_y_ = 0.0f;
-        ROS_WARN_THROTTLE(1.0, "投放标识检测丢失或超时，保持悬停");
+    // ---------- 回退1：OCR 检测对准 ----------
+    if (target_confirmed_ && current_detection_.detected) {
+        ROS_INFO("[投放-OCR] ✅ OCR有效，开始对准");
+
+        const float aim_x = IMG_CENTER_X + cfg_.drop_camera_bias_x_px + cfg_.drop_release_bias_x_px;
+        const float aim_y = IMG_CENTER_Y + cfg_.drop_camera_bias_y_px + cfg_.drop_release_bias_y_px;
+
+        float err_x = aim_x - current_detection_.center_x;
+        float err_y = aim_y - current_detection_.center_y;
+        float pixel_dist = std::sqrt(err_x * err_x + err_y * err_y);
+
+        float vel_x, vel_y;
+        getPixPidVel(err_x, err_y, 0.05f, vel_x, vel_y);
+        if (pixel_dist < cfg_.drop_fine_pixel_radius) {
+            vel_x *= cfg_.drop_fine_vel_scale;
+            vel_y *= cfg_.drop_fine_vel_scale;
+        }
+
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+        current_setpoint_.type_mask        = 0b100111000111;
+        current_setpoint_.velocity.x       = vel_y;
+        current_setpoint_.velocity.y       = vel_x;
+        current_setpoint_.velocity.z       = (init_pos_z_ + cfg_.takeoff_height - local_odom_.pose.pose.position.z) * cfg_.p_z;
+        current_setpoint_.yaw              = init_yaw_;
+
+        const bool ready = pixel_dist < cfg_.align_pixel_threshold &&
+                           isDropWindowStable(init_pos_z_ + wp_drop_area_.z);
+        if (!ready) { drop_alignment_hold_start_ = ros::Time(0); return; }
+        if (drop_alignment_hold_start_.isZero()) { drop_alignment_hold_start_ = now; return; }
+        if ((now - drop_alignment_hold_start_).toSec() >= cfg_.drop_align_hold_time) {
+            ROS_INFO("✅ 投放区OCR对准完成，进入投放");
+            current_state_             = DROP_SUPPLY;
+            state_start_time_          = now;
+            drop_alignment_hold_start_ = ros::Time(0);
+            pix_integral_x_ = pix_integral_y_ = 0.0f;
+            last_pix_err_x_ = last_pix_err_y_ = 0.0f;
+        }
         return;
     }
 
-    const float aim_center_x =
-        IMG_CENTER_X + cfg_.drop_camera_bias_x_px + cfg_.drop_release_bias_x_px;
-    const float aim_center_y =
-        IMG_CENTER_Y + cfg_.drop_camera_bias_y_px + cfg_.drop_release_bias_y_px;
-
-    float err_x      = aim_center_x - current_detection_.center_x;
-    float err_y      = aim_center_y - current_detection_.center_y;
-    float pixel_dist = std::sqrt(err_x * err_x + err_y * err_y);
-
-    ros::Time now    = ros::Time::now();
-    float dt         = (now - last_pid_control_time_).toSec();
-    if (last_pid_control_time_.isZero()) dt = 0.05f;
-    last_pid_control_time_ = now;
-
-    float vel_x, vel_y;
-    getPixPidVel(err_x, err_y, dt, vel_x, vel_y);
-
-    if (pixel_dist < cfg_.drop_fine_pixel_radius) {
-        vel_x *= cfg_.drop_fine_vel_scale;
-        vel_y *= cfg_.drop_fine_vel_scale;
-    }
-
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x       = vel_y;
-    current_setpoint_.velocity.y       = vel_x;
-    current_setpoint_.velocity.z =
-        (init_pos_z_ + cfg_.takeoff_height - local_odom_.pose.pose.position.z) * cfg_.p_z;
-    current_setpoint_.yaw = init_yaw_ - 1.57;
-
-    ROS_INFO_THROTTLE(0.5,
-                      "[投放区对准] 像素误差: %.1f px, 有效中心:(%.1f, %.1f), 机体速度: %.2f m/s",
-                      pixel_dist, aim_center_x, aim_center_y, getHorizontalSpeed());
-
-    const bool ready_to_drop = pixel_dist < cfg_.align_pixel_threshold &&
-                               isDropWindowStable(init_pos_z_ + wp_drop_area_.z);
-    if (!ready_to_drop) {
-        drop_alignment_hold_start_ = ros::Time(0);
-        return;
-    }
-
-    if (drop_alignment_hold_start_.isZero()) {
-        drop_alignment_hold_start_ = now;
-        return;
-    }
-
-    if ((now - drop_alignment_hold_start_).toSec() >= cfg_.drop_align_hold_time) {
-        ROS_INFO("投放区对准完成，进入投放");
-        current_state_             = DROP_SUPPLY;
-        state_start_time_          = ros::Time::now();
-        drop_alignment_hold_start_ = ros::Time(0);
-        pix_integral_x_ = pix_integral_y_ = 0.0f;
-        last_pix_err_x_ = last_pix_err_y_ = 0.0f;
-    }
+    // ---------- 回退2：都不可用 → 悬停等待（无超时跳过，方便调试）----------
+    hover();
+    drop_alignment_hold_start_ = ros::Time(0);
+    ROS_WARN("[DEBUG-DROP] ❌ 无可用检测，悬停等待中... circle_detected=%d circle_age=%.1fs/%1.fs target_confirmed=%d",
+             (int)circle_detected_, circle_age, cfg_.circle_detect_timeout_s, (int)target_confirmed_);
 }
 
 // 8.6 投放物资
@@ -327,7 +359,34 @@ void MissionManager::handleDropSupply() {
     current_setpoint_.yaw              = init_yaw_;
 
     if (drop_phase == 0) {
-        current_setpoint_.position.z = release_z;
+        // ---------- 下降阶段：保持圆检测 PID 对准 + 垂直下降 ----------
+        const double circle_age = circle_detect_time_.isZero()
+                                      ? 999.0
+                                      : (now - circle_detect_time_).toSec();
+        const bool circle_ok = circle_detected_ && (circle_age < cfg_.circle_detect_timeout_s);
+
+        if (circle_ok) {
+            // 圆检测 PID 对准同时下降
+            float err_x = IMG_CENTER_X - circle_center_x_;
+            float err_y = IMG_CENTER_Y - circle_center_y_;
+            float vel_x, vel_y;
+            getLandPixPidVel(err_x, err_y, 0.05f, vel_x, vel_y);
+
+            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+            current_setpoint_.type_mask        = 0b100111000111;
+            current_setpoint_.velocity.x       = vel_x;
+            current_setpoint_.velocity.y       = vel_y;
+            current_setpoint_.velocity.z       = -cfg_.land_descend_speed;  // 持续下降
+            current_setpoint_.yaw              = current_yaw_;
+        } else {
+            // 无圆检测：保持当前位置下降
+            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+            current_setpoint_.type_mask        = 0b101111111000;
+            current_setpoint_.position.x       = hold_x;
+            current_setpoint_.position.y       = hold_y;
+            current_setpoint_.position.z       = release_z;
+            current_setpoint_.yaw              = init_yaw_;
+        }
 
         const bool reached_descend_height =
             std::abs(local_odom_.pose.pose.position.z - release_z) < cfg_.hover_vert_tolerance;
@@ -535,10 +594,16 @@ void MissionManager::handleSimulateAttack() {
     static bool laser_fired = false;
     hover();
     if (!laser_fired) {
-        std_msgs::Bool trigger;
-        trigger.data = true;
-        laser_trigger_pub_.publish(trigger);
-        ROS_INFO("激光指示装置已触发，等待裁判确认...");
+        // 安全确认：先关闭激光（竞赛规则：起飞时激光不能开，否则罚时60s）
+        std_msgs::Bool laser_off;
+        laser_off.data = false;
+        laser_control_pub_.publish(laser_off);
+        ROS_INFO("安全确认：激光已关闭");
+
+        // 通过 /shoot 触发 stm32_shooter_node 执行完整射击序列（开→照1s→关）
+        std_msgs::Empty shoot_msg;
+        shoot_pub_.publish(shoot_msg);
+        ROS_INFO("★ 激光射击指令已发送到射手节点，等待裁判确认...");
         laser_fired       = true;
         state_start_time_ = ros::Time::now();
     }

@@ -63,7 +63,7 @@ include_directories(
 
 add_library(${PROJECT_NAME} ${SOURCE_FILES})
 
-add_dependencies(${PROJECT_NAME} multi_map_server_generate_messages_cpp)
+# add_dependencies(${PROJECT_NAME} multi_map_server_generate_messages_cpp)  # 本工作空间无此包
 
 target_link_libraries(${PROJECT_NAME}
     ${catkin_LIBRARIES}

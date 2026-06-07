@@ -55,9 +55,9 @@ void MissionManager::yoloDetectCallback(const raicom_vision_laser::DetectionInfo
     default                     : match_target = ""; break;
     }
 
-    // 前视攻击：用确认文字匹配（vision_laser 方式），不依赖类名
+    // 前视攻击：只匹配配置的真实目标字母（如 "A"），忽略干扰目标
     if (is_attack_state) {
-        match_target = confirmed_target_;  // 下视确认的文字，或空
+        match_target = cfg_.attack_real_target;
     }
 
     ROS_WARN_THROTTLE(2.0,
@@ -152,7 +152,10 @@ void MissionManager::circleDetectCallback(const raicom_vision_laser::CircleDetec
 
     if (circle_detected_) {
         circle_detect_time_ = ros::Time::now();
-        ROS_DEBUG_THROTTLE(1.0, "[Circle] 圆检测: (%.1f, %.1f) r=%.1f",
-                           circle_center_x_, circle_center_y_, circle_radius_);
+        ROS_INFO("[DEBUG-Circle] 收到圆检测: detected=%d center=(%.1f,%.1f) r=%.1f age=%.2fs",
+                 (int)msg->detected, msg->center_x, msg->center_y, msg->radius,
+                 (ros::Time::now() - circle_detect_time_).toSec());
+    } else {
+        ROS_WARN_THROTTLE(2.0, "[DEBUG-Circle] 收到圆检测: detected=0 (无圆)");
     }
 }

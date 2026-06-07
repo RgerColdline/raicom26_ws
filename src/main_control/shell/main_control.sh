@@ -72,7 +72,7 @@ tmux split-window -h -t "$SESSION:1"
 tmux send-keys -t "$SESSION:1" "sleep 10; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch main_control main_control.launch" C-m
 
 tmux split-window -v -t "$SESSION:1"
-tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch raicom_vision_laser raicom_ocr_laser.launch" C-m
+tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch raicom_vision_laser raicom_vision_only.launch" C-m
 
 tmux select-pane -L -t "$SESSION:1"
 tmux split-window -v -t "$SESSION:1"

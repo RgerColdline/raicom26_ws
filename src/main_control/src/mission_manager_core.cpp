@@ -59,6 +59,7 @@ void MissionManager::loadParameters() {
                            "attack_target");
     nh_.param<std::string>("detection/land_target_class", cfg_.detection_land_target_class,
                            "land_target");
+    nh_.param<std::string>("detection/attack_real_target", cfg_.attack_real_target, "A");
 
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
     nh_.param<float>("drop/detect_timeout", cfg_.drop_detect_timeout, 5.0f);
@@ -126,7 +127,8 @@ void MissionManager::initROSCommunication() {
     setpoint_pub_ = nh_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
     ego_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/fsm/ego_goal", 1);
     drop_trigger_pub_  = nh_.advertise<std_msgs::Bool>("/uav/drop_trigger", 1);
-    laser_trigger_pub_ = nh_.advertise<std_msgs::Bool>("/uav/laser_trigger", 1);
+    shoot_pub_ = nh_.advertise<std_msgs::Empty>("/shoot", 1);
+    laser_control_pub_ = nh_.advertise<std_msgs::Bool>("/laser_control", 1);
 
     state_sub_         = nh_.subscribe("/mavros/state", 10, &MissionManager::stateCallback, this);
     odom_sub_ =

@@ -79,7 +79,8 @@ class MissionManager
     ros::Publisher setpoint_pub_;
     ros::Publisher ego_goal_pub_;
     ros::Publisher drop_trigger_pub_;
-    ros::Publisher laser_trigger_pub_;
+    ros::Publisher shoot_pub_;
+    ros::Publisher laser_control_pub_;
     ros::Subscriber state_sub_, odom_sub_;
     ros::Subscriber nav_status_sub_;
     ros::Subscriber detected_target_sub_;
@@ -250,6 +251,7 @@ class MissionManager
         std::string detection_drop_target_class;
         std::string detection_attack_target_class;
         std::string detection_land_target_class;
+        std::string attack_real_target;  // 真实目标字母 "A" 或 "B"，前视只攻击此目标
 
         float drop_arrive_threshold;
         float drop_detect_timeout;
