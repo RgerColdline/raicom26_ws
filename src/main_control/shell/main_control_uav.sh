@@ -22,6 +22,12 @@ EGO_WS="${EGO_WS:-$HOME/ego_ws}"
 # 固定路径: 按需求保留默认值，多设备位置一致
 # PX4_PATH="$HOME/Libraries/PX4-Autopilot"
 
+MAIN_WS="${MAIN_WS:-$HOME/main_ws}"
+
+
+# foxglove topic whitelist
+FOXGLOVE_WHITELIST="${FOXGLOVE_WHITELIST:-'[/camera/color/image_raw/compressed, /camera/depth/points]'}"
+
 # 识别当前终端 Shell 类型，动态匹配 setup 脚本后缀
 CURRENT_SHELL="${SHELL##*/}"
 [ -z "$CURRENT_SHELL" ] && CURRENT_SHELL="bash"
@@ -66,7 +72,12 @@ roslaunch abot_bringup location.launch"
 tmux send-keys -t "$SESSION:0" "$CMD_UAV" C-m
 
 tmux split-window -v -t "$SESSION:0"
-tmux send-keys -t "$SESSION:0" "sleep 4; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch foxglove_bridge foxglove_bridge.launch" C-m
+tmux send-keys -t "$SESSION:0" "sleep 4; roslaunch foxglove_bridge foxglove_bridge.launch" C-m
+# tmux send-keys -t "$SESSION:0" "sleep 4; roslaunch foxglove_bridge foxglove_bridge.launch topic_whitelist:=$FOXGLOVE_WHITELIST" C-m
+tmux split-window -v -t "$SESSION:0"
+tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch usb_cam usb_cam-test.launch" C-m
+tmux split-window -v -t "$SESSION:0"
+tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch astra_camera astra.launch" C-m
 
 # ---------------------------------------------------------
 # 窗口 1：主控、监控与视觉 (四等分 2x2)
@@ -79,7 +90,7 @@ tmux split-window -h -t "$SESSION:1"
 tmux send-keys -t "$SESSION:1" "sleep 10; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch main_control main_control.launch" C-m
 
 tmux split-window -v -t "$SESSION:1"
-tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch raicom_vision_laser raicom_ocr_laser.launch" C-m
+tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch raicom_vision_laser raicom_vision_only.launch" C-m
 
 tmux select-pane -L -t "$SESSION:1"
 tmux split-window -v -t "$SESSION:1"

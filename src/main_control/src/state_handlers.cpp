@@ -246,10 +246,14 @@ void MissionManager::handleHoverRecognizeDrop() {
         float vel_x, vel_y;
         getLandPixPidVel(err_x, err_y, 0.05f, vel_x, vel_y);
 
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+        // 用 LOCAL_NED 坐标系，跟其他状态一致（BODY_NED 下发 yaw 会与速度控制冲突）
+        float y = current_yaw_;
+        float local_vx =  vel_x * cos(y) - vel_y * sin(y);
+        float local_vy =  vel_x * sin(y) + vel_y * cos(y);
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
         current_setpoint_.type_mask        = 0b100111000111;
-        current_setpoint_.velocity.x       = vel_x;
-        current_setpoint_.velocity.y       = vel_y;
+        current_setpoint_.velocity.x       = local_vx;
+        current_setpoint_.velocity.y       = local_vy;
         current_setpoint_.velocity.z       = 0.0f;
         current_setpoint_.yaw              = current_yaw_;
 
@@ -293,12 +297,14 @@ void MissionManager::handleHoverRecognizeDrop() {
             vel_y *= cfg_.drop_fine_vel_scale;
         }
 
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+        // BODY→LOCAL 转换（跟其他状态一致，避免 BODY_NED 下 yaw 冲突）
+        { float y = current_yaw_; float bvx = vel_y; float bvy = vel_x;
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
         current_setpoint_.type_mask        = 0b100111000111;
-        current_setpoint_.velocity.x       = vel_y;
-        current_setpoint_.velocity.y       = vel_x;
+        current_setpoint_.velocity.x       = bvx * cos(y) - bvy * sin(y);
+        current_setpoint_.velocity.y       = bvx * sin(y) + bvy * cos(y);
         current_setpoint_.velocity.z       = (init_pos_z_ + cfg_.takeoff_height - local_odom_.pose.pose.position.z) * cfg_.p_z;
-        current_setpoint_.yaw              = init_yaw_;
+        current_setpoint_.yaw              = current_yaw_; }
 
         const bool ready = pixel_dist < cfg_.align_pixel_threshold &&
                            isDropWindowStable(init_pos_z_ + wp_drop_area_.z);
@@ -372,12 +378,13 @@ void MissionManager::handleDropSupply() {
             float vel_x, vel_y;
             getLandPixPidVel(err_x, err_y, 0.05f, vel_x, vel_y);
 
-            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+            { float y = current_yaw_; float bvx = vel_x; float bvy = vel_y;
+            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
             current_setpoint_.type_mask        = 0b100111000111;
-            current_setpoint_.velocity.x       = vel_x;
-            current_setpoint_.velocity.y       = vel_y;
-            current_setpoint_.velocity.z       = -cfg_.land_descend_speed;  // 持续下降
-            current_setpoint_.yaw              = current_yaw_;
+            current_setpoint_.velocity.x       = bvx * cos(y) - bvy * sin(y);
+            current_setpoint_.velocity.y       = bvx * sin(y) + bvy * cos(y);
+            current_setpoint_.velocity.z       = -cfg_.land_descend_speed;
+            current_setpoint_.yaw              = current_yaw_; }
         } else {
             // 无圆检测：保持当前位置下降
             current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
@@ -857,13 +864,14 @@ void MissionManager::handleLand() {
                 float vel_x, vel_y;
                 getLandPixPidVel(err_x, err_y, dt, vel_x, vel_y);
 
-                // BODY_NED: X=前, Y=右. 图像Y误差→X速度(前后), 图像X误差→Y速度(左右)
-                current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+                // LOCAL_NED: 避免 BODY_NED 下 yaw 与速度耦合冲突
+                { float y = current_yaw_; float bvx = vel_x; float bvy = vel_y;
+                current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
                 current_setpoint_.type_mask        = 0b100111000111;
-                current_setpoint_.velocity.x       = vel_x;
-                current_setpoint_.velocity.y       = vel_y;
+                current_setpoint_.velocity.x       = bvx * cos(y) - bvy * sin(y);
+                current_setpoint_.velocity.y       = bvx * sin(y) + bvy * cos(y);
                 current_setpoint_.velocity.z       = 0.0f;
-                current_setpoint_.yaw              = init_yaw_;
+                current_setpoint_.yaw              = current_yaw_; }
 
                 ROS_INFO_THROTTLE(0.5, "[精准降落-圆] 像素误差: (%.1f, %.1f), 速度: (%.3f, %.3f)",
                                   err_x, err_y, vel_x, vel_y);
@@ -956,13 +964,14 @@ void MissionManager::handleLand() {
         const bool aligned                 = pixel_dist < cfg_.land_align_pixel_threshold;
         float vel_z                        = aligned ? -descend_speed : 0.0f;
 
-        // 发布控制指令
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
+        // 发布控制指令（LOCAL_NED，避免 BODY_NED 下 yaw 冲突）
+        { float y = current_yaw_; float bvx = vel_y; float bvy = vel_x;
+        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
         current_setpoint_.type_mask        = 0b100111000111;
-        current_setpoint_.velocity.x       = vel_y;  // BODY_NED: x=前, y=右
-        current_setpoint_.velocity.y       = vel_x;  // 图像x对应机体y
+        current_setpoint_.velocity.x       = bvx * cos(y) - bvy * sin(y);
+        current_setpoint_.velocity.y       = bvx * sin(y) + bvy * cos(y);
         current_setpoint_.velocity.z       = vel_z;
-        current_setpoint_.yaw              = init_yaw_;
+        current_setpoint_.yaw              = current_yaw_; }
 
         // 对准计时
         if (aligned) {
@@ -987,54 +996,60 @@ void MissionManager::handleLand() {
         return;
     }
 
-    // === 阶段1: 触地判定 / 锁定坐标下降 ===
+    // === 阶段1: 持续PID对准 + 下降（取代原来的死锁坐标）===
     if (land_phase == 1) {
-        // 如果坐标已由圆检测锁定，使用锁定的XY下降
-        if (target_pos_locked_) {
-            // 锁定坐标垂直下降（vision_laser precise_land 状态5）
+        // 持续圆检测 PID 对准 + 下降（跟投放下降逻辑一致）
+        const double circle_age = circle_detect_time_.isZero()
+                                      ? 999.0
+                                      : (now - circle_detect_time_).toSec();
+        const bool circle_ok = circle_detected_ && (circle_age < cfg_.circle_detect_timeout_s);
+
+        if (circle_ok) {
+            float err_x = IMG_CENTER_X - circle_center_x_;
+            float err_y = IMG_CENTER_Y - circle_center_y_;
+            float vel_x, vel_y;
+            getLandPixPidVel(err_x, err_y, 0.05f, vel_x, vel_y);
+
+            float descend = std::min(cfg_.land_descend_speed, std::max(0.05f, current_z - ground_z - 0.3f));
+            { float y = current_yaw_; float bvx = vel_x; float bvy = vel_y;
+            current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+            current_setpoint_.type_mask        = 0b100111000111;
+            current_setpoint_.velocity.x       = bvx * cos(y) - bvy * sin(y);
+            current_setpoint_.velocity.y       = bvx * sin(y) + bvy * cos(y);
+            current_setpoint_.velocity.z       = -descend;
+            current_setpoint_.yaw              = current_yaw_; }
+        } else {
+            // 圆丢失：用上次锁定的坐标保持位置下降
             current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
             current_setpoint_.type_mask        = 0b101111111000;
-            current_setpoint_.position.x       = land_target_x_;
-            current_setpoint_.position.y       = land_target_y_;
-            current_setpoint_.position.z       = current_z - 0.3f;  // 持续下降
-            current_setpoint_.yaw              = init_yaw_;
-
-            ROS_INFO_THROTTLE(0.5, "[精准降落-锁定] 保持坐标 (%.3f, %.3f) 下降, 高度: %.2f",
-                              land_target_x_, land_target_y_, current_z);
-
-            // 高度低于0.3m → AUTO.LAND（同 vision_laser）
-            if (current_z <= ground_z + 0.3f) {
-                ROS_INFO("[精准降落-锁定] 高度 < 0.3m，切换 AUTO.LAND");
-                land_phase         = -1;
-                target_pos_locked_ = false;
-                align_hold_start   = ros::Time(0);
-                state_start_time_  = now;
-            }
-            return;
+            current_setpoint_.position.x       = (target_pos_locked_) ? land_target_x_ : hold_x;
+            current_setpoint_.position.y       = (target_pos_locked_) ? land_target_y_ : hold_y;
+            current_setpoint_.position.z       = ground_z + 0.1f;
+            current_setpoint_.yaw              = current_yaw_;
         }
 
-        // 原有的触地判定逻辑
-        current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-        current_setpoint_.type_mask        = 0b101111111000;
-        current_setpoint_.position.x       = hold_x;
-        current_setpoint_.position.y       = hold_y;
-        current_setpoint_.position.z       = ground_z + 0.1f;
-        current_setpoint_.yaw              = init_yaw_;
+        // 高度低于0.3m → AUTO.LAND
+        if (current_z <= ground_z + 0.3f) {
+            ROS_INFO("[精准降落] 高度 < 0.3m，切换 AUTO.LAND");
+            land_phase         = -1;
+            target_pos_locked_ = false;
+            align_hold_start   = ros::Time(0);
+            state_start_time_  = now;
+        }
 
-        // 稳定判定
+        // 触地稳定判定（防止切换AUTO.LAND前落地不稳）
         const bool stable =
             getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
             std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
             std::abs(current_roll_) < cfg_.drop_max_tilt &&
             std::abs(current_pitch_) < cfg_.drop_max_tilt;
-
-        if (stable && (now - align_hold_start).toSec() >= cfg_.land_final_hold_time) {
+        if (stable && current_z <= ground_z + 0.3f && !align_hold_start.isZero() &&
+            (now - align_hold_start).toSec() >= 0.5f) {
             ROS_INFO("精准降落完成，任务结束");
             land_phase               = 2;
+            target_pos_locked_       = false;
             current_state_           = TASK_END;
             state_start_time_        = now;
-
-            // 重置静态变量
             land_profile_initialized = false;
             align_hold_start         = ros::Time(0);
             pix_integral_x = pix_integral_y = 0.0f;
