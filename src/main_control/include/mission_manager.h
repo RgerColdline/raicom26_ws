@@ -11,6 +11,7 @@
 #include <std_msgs/Bool.h>
 #include <std_msgs/Int8.h>
 #include <std_msgs/Int32.h>
+#include <std_msgs/UInt8.h>
 #include <std_msgs/Empty.h>
 #include <std_msgs/String.h>
 #include <std_srvs/Empty.h>
@@ -78,7 +79,7 @@ class MissionManager
     ros::NodeHandle nh_;
     ros::Publisher setpoint_pub_;
     ros::Publisher ego_goal_pub_;
-    ros::Publisher drop_trigger_pub_;
+    ros::Publisher servo_control_pub_;  // 舵机投放，/servo_control (UInt8)
     ros::Publisher shoot_pub_;
     ros::Publisher laser_control_pub_;
     ros::Subscriber state_sub_, odom_sub_;
@@ -252,6 +253,7 @@ class MissionManager
         std::string detection_attack_target_class;
         std::string detection_land_target_class;
         std::string attack_real_target;  // 真实目标字母 "A" 或 "B"，前视只攻击此目标
+        bool wait_for_vision_services = true;  // 是否等待视觉服务(/switch_camera等)；false跳过，方便单独测试PCL
 
         float drop_arrive_threshold;
         float drop_detect_timeout;

@@ -18,6 +18,7 @@ WS="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 # 可变路径: 支持通过 export 覆盖，适应不同设备
 SIM_WS="${SIM_WS:-$HOME/catkin_ws}"
 EGO_WS="${EGO_WS:-$HOME/ego_ws}"
+LIO_WS="${LIO_WS:-$HOME/ros_libraries_ws}"
 
 # 固定路径: 按需求保留默认值，多设备位置一致
 PX4_PATH="$HOME/Libraries/PX4-Autopilot"
@@ -30,17 +31,22 @@ SESSION="mission"
 tmux kill-session -t "$SESSION" 2>/dev/null
 sleep 1
 
+# 清理上次残留的Gazebo进程（不杀roscore，不影响其他ROS使用）
+killall -9 gzclient gzserver gazebo 2>/dev/null || true
+sleep 1
+
 echo "======================================"
 echo "  无人机竞赛任务启动中..."
 echo "======================================"
 echo "  主控工作空间: $WS"
 echo "  仿真工作空间: $SIM_WS"
 echo "  导航工作空间: $EGO_WS"
+echo "  LiDAR工作空间: $LIO_WS"
 echo "  PX4 路径:     $PX4_PATH"
 echo "======================================"
 
 # 关键目录存在性校验
-for dir in "$WS" "$SIM_WS" "$EGO_WS" "$PX4_PATH"; do
+for dir in "$WS" "$SIM_WS" "$EGO_WS" "$LIO_WS" "$PX4_PATH"; do
     if [ ! -d "$dir" ]; then
         echo "[错误] 依赖目录缺失: $dir"
         exit 1
@@ -81,18 +87,26 @@ tmux send-keys -t "$SESSION:1" "sleep 18; rostopic echo /ego_controller/status" 
 tmux select-layout -t "$SESSION:1" tiled
 
 # ---------------------------------------------------------
-# 窗口 2：感知与导航 (左右分屏)
+# 窗口 2：感知与导航 (2x2 田字格)
 # ---------------------------------------------------------
 tmux new-window -t "$SESSION" -n "Perception_Nav"
 
-tmux send-keys -t "$SESSION:2" "sleep 12; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch pcl_detection2 pcl_detection2.launch" C-m
+# 左上：FAST-LIO2 (LiDAR-IMU紧耦合SLAM)
+tmux send-keys -t "$SESSION:2" "sleep 10; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; roslaunch fast_lio mapping_mid360_fastlio.launch" C-m
 
+# 左下：PCL点云感知 (方环检测 + 障碍物处理)
+tmux split-window -v -t "$SESSION:2"
+tmux send-keys -t "$SESSION:2" "sleep 14; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; source '${WS}/devel/setup.${CURRENT_SHELL}' --extend; roslaunch pcl_detection2 pcl_detection2.launch" C-m
+
+# 右：EGO-Planner 路径规划与避障
 tmux split-window -h -t "$SESSION:2"
-CMD_NAV="sleep 14; \
+CMD_NAV="sleep 16; \
 source '${WS}/devel/setup.${CURRENT_SHELL}'; \
 source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
 roslaunch uav_navigation ego_nav.launch"
 tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
+
+tmux select-layout -t "$SESSION:2" tiled
 
 # ---------------------------------------------------------
 # 窗口 3：精准降落 (圆检测)

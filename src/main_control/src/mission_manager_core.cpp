@@ -60,6 +60,7 @@ void MissionManager::loadParameters() {
     nh_.param<std::string>("detection/land_target_class", cfg_.detection_land_target_class,
                            "land_target");
     nh_.param<std::string>("detection/attack_real_target", cfg_.attack_real_target, "A");
+    nh_.param<bool>("wait_for_vision_services", cfg_.wait_for_vision_services, true);
 
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
     nh_.param<float>("drop/detect_timeout", cfg_.drop_detect_timeout, 5.0f);
@@ -126,7 +127,7 @@ void MissionManager::loadParameters() {
 void MissionManager::initROSCommunication() {
     setpoint_pub_ = nh_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
     ego_goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/fsm/ego_goal", 1);
-    drop_trigger_pub_  = nh_.advertise<std_msgs::Bool>("/uav/drop_trigger", 1);
+    servo_control_pub_ = nh_.advertise<std_msgs::UInt8>("/servo_control", 1);
     shoot_pub_ = nh_.advertise<std_msgs::Empty>("/shoot", 1);
     laser_control_pub_ = nh_.advertise<std_msgs::Bool>("/laser_control", 1);
 
@@ -170,10 +171,14 @@ void MissionManager::waitForConnection() {
     }
     ROS_INFO("初始位姿已接收");
 
-    ROS_INFO("等待YOLO服务...");
-    switch_camera_client_.waitForExistence();
-    reset_target_client_.waitForExistence();
-    ROS_INFO("YOLO服务已就绪");
+    if (cfg_.wait_for_vision_services) {
+        ROS_INFO("等待YOLO服务...");
+        switch_camera_client_.waitForExistence();
+        reset_target_client_.waitForExistence();
+        ROS_INFO("YOLO服务已就绪");
+    } else {
+        ROS_WARN("跳过视觉服务等待（wait_for_vision_services=false），注意无视觉检测时状态机可能异常");
+    }
 }
 
 // --- 控制辅助函数实现 ---
@@ -255,11 +260,7 @@ bool MissionManager::navTo(const float x, const float y, const float z) {
         sendEgoGoal(target_x, target_y, target_z);
     }
 
-    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint_.type_mask        = 0b100111000111;
-    current_setpoint_.velocity.x = current_setpoint_.velocity.y = current_setpoint_.velocity.z =
-        0.0f;
-    current_setpoint_.yaw = init_yaw_;
+    // EGO导航期间由ego_controller_node发setpoint，main_control不参与
 
     return waitForNavArrival();
 }
@@ -622,8 +623,10 @@ void MissionManager::run() {
         default                     : break;
         }
 
-        // 3. 发布设定点
-        sendSetpoint(current_setpoint_);
+        // 3. 发布设定点（EGO导航时由ego_controller_node接管，不再重复发）
+        if (!nav_goal_sent_) {
+            sendSetpoint(current_setpoint_);
+        }
 
         ros::spinOnce();
 

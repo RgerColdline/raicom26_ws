@@ -1,6 +1,6 @@
 # 柱子检测导航配置
 # 导航模式: "ego" (原有EGO路径) 或 "pcl" (PCL检测+定点飞行)
-pillar_nav_mode: "pcl"
+pillar_nav_mode: "ego"
 
 # 是否启用柱子检测和导航（PCL侧）
 pillar_detect_enabled: true

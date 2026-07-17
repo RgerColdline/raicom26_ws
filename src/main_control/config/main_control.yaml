@@ -15,6 +15,11 @@ align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
 shoot_delay: 2.0                    # 射击后等待确认时间（秒）
 use_ego_planner_for_drop_area : true #导航至投放区模式选择：true=使用ego_planner路径规划，false=直接位置控制直飞
 
+# 导航模式: "ego"=EGO-Planner路径规划  "pcl"=PCL柱子检测航点(需pcl_detection2)
+pillar_nav_mode: "ego"
+
+wait_for_vision_services: false        # 是否等待视觉服务(/switch_camera等)；false则跳过，方便单独测试PCL
+
 # ==================== 环穿越动态参数 ====================
 # 优先使用 pcl 实时检测到的环 3D 位姿计算穿越点。
 # 检测失败或超时(3s)时自动回退到硬编码航点 wp_ring_front/back_。
