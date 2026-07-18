@@ -172,7 +172,19 @@ void MissionManager::handleNavToDropArea() {
                         init_pos_z_ + wp_come_mid_.z);
     Waypoint drop_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
                          init_pos_z_ + wp_drop_area_.z);
-    // [调试] 跳过中途点，直接导航到投放区
+    static bool come_mid_reached = false;
+    // PCL柱子导航模式：航点已定位，跳过中途点直接去投放区
+    if (pillar_nav_mode_ == "pcl") { come_mid_reached = true; }
+
+    if (!come_mid_reached) {
+        if (navTo(mid_target)) {
+            come_mid_reached = true;
+            ROS_INFO_STREAM("中途点到达，继续前往投放区");
+            nav_goal_sent_ = false;
+            nav_status_    = 0;
+        }
+        return;
+    }
     if (navTo(drop_target)) {
         // [调试] 跳过投放和射击，直接返回
         current_state_    = NAV_TO_RING_BACK;
@@ -527,7 +539,23 @@ void MissionManager::handleNavToRingBack() {
         }
     }
 
-    // [调试] 跳过中途点，直接返航
+    static bool back_mid_reached = false;
+    if (!back_mid_reached) {
+        if (navTo(mid_target)) {
+            back_mid_reached  = true;
+            nav_goal_sent_    = false;
+            state_start_time_ = ros::Time::now();
+            nav_status_       = 0;
+            ROS_INFO_STREAM("中途点到达，继续前往投放区");
+        }
+        return;
+    }
+    static bool back_mid_hovered = false;
+    if (!back_mid_hovered) {
+        hover();
+        if (timeout(3)) { back_mid_hovered = true; }
+        return;
+    }
     if (navTo(ring_back) || (local_odom_.pose.pose.position.y <= ring_back_memorized_.y() + 0.2 &&
                              ring_detection.detected))
     {
