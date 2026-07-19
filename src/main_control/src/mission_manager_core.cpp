@@ -45,6 +45,9 @@ void MissionManager::loadParameters() {
     nh_.param<float>("wp_back_mid_x", wp_back_mid_.x, -2.35f);
     nh_.param<float>("wp_back_mid_y", wp_back_mid_.y, -2.48f);
     nh_.param<float>("wp_back_mid_z", wp_back_mid_.z, cfg_.takeoff_height);
+    nh_.param<float>("wp_pillar_center_x", wp_pillar_center_.x, -2.35f);
+    nh_.param<float>("wp_pillar_center_y", wp_pillar_center_.y, -1.43f);
+    nh_.param<float>("wp_pillar_center_z", wp_pillar_center_.z, cfg_.takeoff_height);
     nh_.param<float>("wp_drop_area_x", wp_drop_area_.x, 0.45f);
     nh_.param<float>("wp_drop_area_y", wp_drop_area_.y, 2.0f);
     nh_.param<float>("wp_drop_area_z", wp_drop_area_.z, cfg_.takeoff_height);
@@ -612,6 +615,7 @@ void MissionManager::run() {
         case SIMULATE_ATTACK        : handleSimulateAttack(); break;
         case WAIT_HIT_CONFIRMATION  : handleWaitHitConfirmation(); break;
         case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
+        case READY_NAV_TO_RING_BACK : handleReadyNavToRingBack(); break;
         case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
         // --- PCL柱子导航（pillar_nav_mode="pcl"时替换EGO路径） ---
         case PILLAR_DETECT          : handlePillarDetect(); break;

@@ -173,31 +173,35 @@ void MissionManager::handleNavToDropArea() {
     Waypoint drop_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
                          init_pos_z_ + wp_drop_area_.z);
     static bool come_mid_reached = false;
-    // PCL柱子导航模式：航点已定位，跳过中途点直接去投放区
-    if (pillar_nav_mode_ == "pcl") { come_mid_reached = true; }
 
     if (!come_mid_reached) {
         if (navTo(mid_target)) {
             come_mid_reached = true;
-            ROS_INFO_STREAM("中途点到达，继续前往投放区");
+            ROS_INFO_STREAM("到达中途点，继续前往投放区");
             nav_goal_sent_ = false;
             nav_status_    = 0;
         }
         return;
     }
     if (navTo(drop_target)) {
-        // [调试] 跳过投放和射击，直接返回
-        current_state_    = NAV_TO_RING_BACK;
+        if (cfg_.wait_for_vision_services) {
+            // 正常模式：进入视觉识别流程
+            current_state_    = HOVER_RECOG_DROP;
+            if (front_camera_active_) callSwitchCamera();
+            callResetTarget();
+            last_pid_control_time_     = ros::Time(0);
+            drop_alignment_hold_start_ = ros::Time(0);
+            pix_integral_x_ = pix_integral_y_ = 0.0f;
+            last_pix_err_x_ = last_pix_err_y_ = 0.0f;
+            ROS_INFO("到达投放区 (ego_planner)，开始下视识别投放标识");
+        } else {
+            // 无视觉服务模式：跳过投放和攻击，直接返程
+            current_state_    = NAV_TO_RING_BACK;
+            ROS_INFO("到达投放区，跳过视觉识别，直接返程");
+        }
         nav_goal_sent_    = false;
         nav_status_       = 0;
         state_start_time_ = ros::Time::now();
-        if (front_camera_active_) callSwitchCamera();
-        callResetTarget();
-        last_pid_control_time_     = ros::Time(0);
-        drop_alignment_hold_start_ = ros::Time(0);
-        pix_integral_x_ = pix_integral_y_ = 0.0f;
-        last_pix_err_x_ = last_pix_err_y_ = 0.0f;
-        ROS_INFO("到达投放区 (ego_planner)，开始下视识别投放标识");
     }
 }
 
@@ -506,8 +510,8 @@ void MissionManager::handleWaitHitConfirmation() {
     hover();
     if (timeout(5) || hit_confirmed_) {
         // PCL模式下去反向柱子航点，EGO模式去环后方
-        current_state_ = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : NAV_TO_RING_BACK;
-        // NAV_TO_RING_BACK  // [注释] 原有EGO路径
+        current_state_ = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : READY_NAV_TO_RING_BACK;
+        // READY_NAV_TO_RING_BACK  // [注释] 原有EGO路径
         state_start_time_ = ros::Time::now();
         if (hit_confirmed_)
             ROS_INFO("裁判确认击中，返回");
@@ -516,8 +520,20 @@ void MissionManager::handleWaitHitConfirmation() {
     }
 }
 
+void MissionManager::handleReadyNavToRingBack() {
+    // 先到来时的目标点（投放区），对齐后再开始返程导航
+    Waypoint forward_target(init_pos_x_ + wp_drop_area_.x, init_pos_y_ + wp_drop_area_.y,
+                            init_pos_z_ + wp_drop_area_.z);
+    if (moveTo(forward_target.x, forward_target.y, forward_target.z)) {
+        current_state_    = NAV_TO_RING_BACK;
+        nav_goal_sent_    = false;
+        state_start_time_ = ros::Time::now();
+        ROS_INFO("到达投放区，开始返程");
+    }
+}
+
 void MissionManager::handleNavToRingBack() {
-    Waypoint mid_target(init_pos_x_ + wp_come_mid_.x, init_pos_y_ + wp_come_mid_.y,
+    Waypoint mid_target(init_pos_x_ + wp_back_mid_.x, init_pos_y_ + wp_back_mid_.y,
                         init_pos_z_ + wp_come_mid_.z);
 
     // 优先用记住的第一次穿环位置（绝对坐标），其次动态计算
@@ -539,6 +555,7 @@ void MissionManager::handleNavToRingBack() {
         }
     }
 
+    // 回程：先到中途点，再到穿环点
     static bool back_mid_reached = false;
     if (!back_mid_reached) {
         if (navTo(mid_target)) {
@@ -546,14 +563,8 @@ void MissionManager::handleNavToRingBack() {
             nav_goal_sent_    = false;
             state_start_time_ = ros::Time::now();
             nav_status_       = 0;
-            ROS_INFO_STREAM("中途点到达，继续前往投放区");
+            ROS_INFO_STREAM("到达中途点，继续返程");
         }
-        return;
-    }
-    static bool back_mid_hovered = false;
-    if (!back_mid_hovered) {
-        hover();
-        if (timeout(3)) { back_mid_hovered = true; }
         return;
     }
     if (navTo(ring_back) || (local_odom_.pose.pose.position.y <= ring_back_memorized_.y() + 0.2 &&

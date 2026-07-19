@@ -48,6 +48,7 @@ enum MissionState {
     WAIT_HIT_CONFIRMATION,    // 等待裁判确认
 
     NAV_TO_RING_BACK,
+    READY_NAV_TO_RING_BACK,       // 返程前先飞到来时的目标点，再开始返程导航
     RETURN_CROSS_RING,
 
     // === 柱子检测导航（PCL模式） ===
@@ -318,6 +319,7 @@ class MissionManager
     Waypoint wp_ring_back_;                        // 返回穿环前悬停点
     Waypoint wp_come_mid_;
     Waypoint wp_back_mid_;
+    Waypoint wp_pillar_center_;                    // 两柱中心点
     Waypoint wp_drop_area_;
     Waypoint wp_attack_area_;
 
@@ -383,6 +385,7 @@ class MissionManager
     void handleSimulateAttack();
     void handleWaitHitConfirmation();
     void handleNavToRingBack();
+    void handleReadyNavToRingBack();
     void handleReturnCrossRing();
     void handleReturn();
     void handleLand();
