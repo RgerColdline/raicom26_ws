@@ -2,7 +2,33 @@
     <!-- 先加载参数到节点的私有命名空间 -->
     <rosparam file="$(find main_control)/config/main_control.yaml" command="load" ns="main_control"/>
     <rosparam file="$(find main_control)/config/pillar_nav.yaml" command="load" ns="main_control"/>
-    
-    <!-- 再启动节点 -->
+
+    <!-- ==================== 运行模式参数（实机默认；虚拟机仿真传 use_stm32:=false yolo_device:=cpu 覆盖） ==================== -->
+    <!-- use_stm32: 实机接STM32串口(true)。仿真无串口时stm32_shooter_node会退出，
+         required会拖垮整个launch(含main_control)，仿真必须false -->
+    <arg name="use_stm32"    default="true"/>
+    <!-- 实机Jetson: best.engine + cuda:0；虚拟机无GPU: best.pt(绝对路径传入) + cpu -->
+    <arg name="yolo_weights" default="$(find raicom_vision_laser)/models/best.engine"/>
+    <arg name="yolo_device"  default="cuda:0"/>
+
+    <!-- ==================== 主控状态机节点 ==================== -->
     <node name="main_control" pkg="main_control" type="main_control" output="screen"/>
+
+    <!-- ==================== 前视 YOLO 检测节点 (raicom_vision_laser, mission_flow融合) ==================== -->
+    <!-- 发布全局话题 /yolo_front_detect (DetectionInfo)，图像压缩为 320x240，中心 (160,120) -->
+    <!-- weights_path/device 由上面的 yolo_weights/yolo_device arg 设置（实机engine+cuda，仿真pt+cpu）；
+         confidence/imgsz/image_topic 等从 main_control.yaml 的 yolo_front_detector 段读取（私有参数 ~xxx） -->
+    <node name="yolo_front_detector" pkg="raicom_vision_laser" type="yolo_front_detector.py" output="screen" ns="main_control">
+        <param name="weights_path" value="$(arg yolo_weights)"/>
+        <param name="device" value="$(arg yolo_device)"/>
+    </node>
+
+    <!-- ==================== STM32 激光/舵机控制节点 (raicom_vision_laser) ==================== -->
+    <!-- /servo_control (UInt8) 投货舵机(data<135->0x03开舱, >=135->0x04关舱)
+         /shoot (Empty) 一键激光射击(开->1s->关)
+         /laser_control (Bool) 激光开关(安全保险) -->
+    <node name="stm32_shooter" pkg="raicom_vision_laser" type="stm32_shooter_node" output="screen" required="true" if="$(arg use_stm32)">
+        <param name="shooter/port" value="/dev/ttyCH343USB0"/>
+        <param name="shooter/baud" value="115200"/>
+    </node>
 </launch>

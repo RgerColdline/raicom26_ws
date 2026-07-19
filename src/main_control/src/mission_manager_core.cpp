@@ -45,6 +45,9 @@ void MissionManager::loadParameters() {
     nh_.param<float>("wp_back_mid_x", wp_back_mid_.x, -2.35f);
     nh_.param<float>("wp_back_mid_y", wp_back_mid_.y, -2.48f);
     nh_.param<float>("wp_back_mid_z", wp_back_mid_.z, cfg_.takeoff_height);
+    nh_.param<float>("wp_pillar_center_x", wp_pillar_center_.x, -2.35f);
+    nh_.param<float>("wp_pillar_center_y", wp_pillar_center_.y, -1.43f);
+    nh_.param<float>("wp_pillar_center_z", wp_pillar_center_.z, cfg_.takeoff_height);
     nh_.param<float>("wp_drop_area_x", wp_drop_area_.x, 0.45f);
     nh_.param<float>("wp_drop_area_y", wp_drop_area_.y, 2.0f);
     nh_.param<float>("wp_drop_area_z", wp_drop_area_.z, cfg_.takeoff_height);
@@ -53,21 +56,12 @@ void MissionManager::loadParameters() {
     nh_.param<float>("wp_attack_area_z", wp_attack_area_.z, cfg_.takeoff_height);
 
     nh_.param<float>("detection/min_confidence", cfg_.detection_min_confidence, 0.5f);
-    nh_.param<std::string>("detection/drop_target_class", cfg_.detection_drop_target_class,
-                           "drop_target");
-    nh_.param<std::string>("detection/attack_target_class", cfg_.detection_attack_target_class,
-                           "attack_target");
-    nh_.param<std::string>("detection/land_target_class", cfg_.detection_land_target_class,
-                           "land_target");
     nh_.param<std::string>("detection/attack_real_target", cfg_.attack_real_target, "A");
     nh_.param<bool>("wait_for_vision_services", cfg_.wait_for_vision_services, true);
 
     nh_.param<float>("drop_arrive_threshold", cfg_.drop_arrive_threshold, 0.35f);
     nh_.param<float>("drop/detect_timeout", cfg_.drop_detect_timeout, 5.0f);
     nh_.param<float>("drop_align_hold_time", cfg_.drop_align_hold_time, 0.35f);
-    nh_.param<float>("drop_release_max_horiz_speed", cfg_.drop_release_max_horiz_speed, 0.12f);
-    nh_.param<float>("drop_release_max_vert_speed", cfg_.drop_release_max_vert_speed, 0.06f);
-    nh_.param<float>("drop_max_tilt", cfg_.drop_max_tilt, 0.08f);
     nh_.param<float>("drop_camera_bias_x_px", cfg_.drop_camera_bias_x_px, 0.0f);
     nh_.param<float>("drop_camera_bias_y_px", cfg_.drop_camera_bias_y_px, 0.0f);
     nh_.param<float>("drop_release_bias_x_px", cfg_.drop_release_bias_x_px, 0.0f);
@@ -77,16 +71,7 @@ void MissionManager::loadParameters() {
     nh_.param<float>("drop_descend_distance", cfg_.drop_descend_distance, 0.0f);
 
 
-    nh_.param<float>("land/kp", cfg_.land_kp, 0.005f);
-    nh_.param<float>("land/ki", cfg_.land_ki, 0.0005f);
-    nh_.param<float>("land/kd", cfg_.land_kd, 0.0001f);
-    nh_.param<float>("land/max_align_speed", cfg_.land_max_align_speed, 0.5f);
     nh_.param<float>("land/descend_speed", cfg_.land_descend_speed, 0.3f);
-    nh_.param<float>("land/align_pixel_threshold", cfg_.land_align_pixel_threshold, 15.0f);
-    nh_.param<float>("land/fine_pixel_radius", cfg_.land_fine_pixel_radius, 30.0f);
-    nh_.param<float>("land/fine_vel_scale", cfg_.land_fine_vel_scale, 0.4f);
-    nh_.param<float>("land/final_height", cfg_.land_final_height, 0.2f);
-    nh_.param<float>("land/final_hold_time", cfg_.land_final_hold_time, 1.5f);
 
     nh_.param<bool>("use_ego_planner_for_drop_area", cfg_.use_ego_planner_for_drop_area, true);
 
@@ -113,13 +98,21 @@ void MissionManager::loadParameters() {
     nh_.param<float>("shoot/left_right_threshold", cfg_.shoot_left_right_threshold, 20.0f);
     nh_.param<float>("shoot/detect_timeout", cfg_.shoot_detect_timeout, 60.0f);
     nh_.param<float>("shoot/stable_time", cfg_.shoot_stable_time, 0.5f);
+    nh_.param<float>("shoot/duration", cfg_.shoot_duration, 1.5f);
+    nh_.param<float>("shoot/z", cfg_.shoot_z, 1.5f);
 
-    // 精准降落圆检测参数
-    nh_.param<float>("circle_pix_vel_p", cfg_.circle_pix_vel_p, 0.001f);
-    nh_.param<float>("circle_pix_vel_max", cfg_.circle_pix_vel_max, 0.3f);
-    nh_.param<float>("circle_align_threshold", cfg_.circle_align_threshold, 30.0f);
-    nh_.param<int>("circle_confirm_count", cfg_.circle_confirm_count, 3);
-    nh_.param<float>("circle_detect_timeout_s", cfg_.circle_detect_timeout_s, 0.5f);
+    // === mission_flow 融合：投货参数（/servo_control -> stm32_shooter） ===
+    nh_.param<int>("cargo/drop_angle", cfg_.cargo_drop_angle, 0);
+    nh_.param<int>("cargo/reset_angle", cfg_.cargo_reset_angle, 180);
+    nh_.param<float>("cargo/hold_time", cfg_.cargo_hold_time, 4.0f);
+    nh_.param<float>("cargo/descent_timeout", cfg_.descent_timeout, 10.0f);
+    nh_.param<float>("cargo/drop_hover_time", cfg_.drop_hover_time, 2.0f);
+    nh_.param<float>("cargo/drop_z", cfg_.drop_z, 0.3f);
+
+    // === mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ===
+    nh_.param<float>("yolo/img_center_x", cfg_.yolo_img_center_x, 160.0f);
+    nh_.param<float>("yolo/target_timeout", cfg_.yolo_target_timeout, 0.5f);
+    nh_.param<float>("yolo/detect_timeout", cfg_.yolo_detect_timeout, 60.0f);
 
     ROS_INFO("参数加载完成。");
 }
@@ -138,19 +131,16 @@ void MissionManager::initROSCommunication() {
         nh_.subscribe("/ego_controller/status", 10, &MissionManager::navStatusCallback, this);
     detected_target_sub_ =
         nh_.subscribe("/detected_target", 10, &MissionManager::detectedTargetCallback, this);
-    yolo_detect_sub_ = nh_.subscribe("/ocr_detect", 10, &MissionManager::yoloDetectCallback, this);
+    yolo_detect_sub_ = nh_.subscribe("/yolo_front_detect", 10, &MissionManager::yoloDetectCallback, this);
     hit_confirm_sub_ =
         nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
     ring_sub_ =
         nh_.subscribe("/pcl_detection2/square_ring", 10, &MissionManager::ringDetectCallback, this);
-    circle_sub_       = nh_.subscribe("/circle_detect_result", 10,
-                                      &MissionManager::circleDetectCallback, this);
     pillar_sub_       = nh_.subscribe("/pcl_detection2/pillar_case_id", 10,
                                       &MissionManager::pillarDetectCallback, this);
     pillar_start_pub_ = nh_.advertise<std_msgs::Empty>("/pcl_detection2/start_pillar_detect", 1);
 
     switch_camera_client_    = nh_.serviceClient<std_srvs::Empty>("/switch_camera");
-    switch_to_circle_client_ = nh_.serviceClient<std_srvs::Empty>("/switch_to_circle_mode");
     reset_target_client_     = nh_.serviceClient<std_srvs::Empty>("/reset_target");
     get_status_client_    = nh_.serviceClient<std_srvs::Empty>("/get_system_status");
     set_mode_client_      = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
@@ -448,31 +438,6 @@ float MissionManager::getHorizontalSpeed() const {
     return std::hypot(local_odom_.twist.twist.linear.x, local_odom_.twist.twist.linear.y);
 }
 
-bool MissionManager::isDropWindowStable(float target_z) const {
-    int i1   = getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed;
-    int i2   = std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed;
-    int i3   = std::abs(local_odom_.pose.pose.position.z - target_z) < cfg_.hover_vert_tolerance;
-    int i4   = std::abs(current_roll_) < cfg_.drop_max_tilt;
-    int i5   = std::abs(current_pitch_) < cfg_.drop_max_tilt;
-    int full = i1 << 4 | i2 << 3 | i3 << 2 | i4 << 1 | i5;
-    ROS_INFO_STREAM_THROTTLE(0.5, "Drop窗口稳定性检查 - 二进制状态: "
-                                      << std::bitset<5>(full) << " (" << i1 << ", " << i2 << ", "
-                                      << i3 << ", " << i4 << ", " << i5 << ")");
-    bool window_stable =
-        getHorizontalSpeed() < cfg_.drop_release_max_horiz_speed &&
-        std::abs(local_odom_.twist.twist.linear.z) < cfg_.drop_release_max_vert_speed &&
-        std::abs(local_odom_.pose.pose.position.z - target_z) < cfg_.hover_vert_tolerance &&
-        std::abs(current_roll_) < cfg_.drop_max_tilt &&
-        std::abs(current_pitch_) < cfg_.drop_max_tilt;
-    ROS_INFO_STREAM_THROTTLE(
-        0.5, "水平速度: " << getHorizontalSpeed()
-                          << " m/s, 垂直速度: " << local_odom_.twist.twist.linear.z
-                          << " m/s, 离地高度: " << local_odom_.pose.pose.position.z
-                          << " m, roll: " << current_roll_ << " rad, pitch: " << current_pitch_
-                          << " rad, 窗口稳定: " << (window_stable ? "是" : "否"));
-    return window_stable;
-}
-
 float MissionManager::satfunc(float value, float limit) {
     return std::clamp(value, -limit, limit);
 }
@@ -536,46 +501,11 @@ bool MissionManager::callResetTarget() {
     if (reset_target_client_.call(srv)) {
         target_confirmed_ = false;
         confirmed_target_.clear();
-        current_detection_.detected = false;
         ROS_INFO("目标记忆已重置");
         return true;
     }
     ROS_WARN("重置目标服务调用失败");
     return false;
-}
-
-bool MissionManager::callSwitchCircle() {
-    std_srvs::Empty srv;
-    if (switch_to_circle_client_.call(srv)) {
-        ROS_INFO("[Circle] 已切换到圆检测模式");
-        return true;
-    }
-    ROS_WARN("[Circle] 切换圆检测模式失败");
-    return false;
-}
-
-void MissionManager::resetLandPixPid() {
-    land_pix_err_sum_x_     = 0.0f;
-    land_pix_err_sum_y_     = 0.0f;
-    land_pix_last_err_x_    = 0.0f;
-    land_pix_last_err_y_    = 0.0f;
-    circle_in_threshold_count_ = 0;
-    last_circle_x_          = -1000.0f;
-    last_circle_y_          = -1000.0f;
-    target_pos_locked_      = false;
-    land_last_pid_time_     = ros::Time::now();
-    ROS_INFO("[精准降落] 像素PID已重置");
-}
-
-void MissionManager::getLandPixPidVel(float err_x, float err_y, float dt,
-                                       float &vel_x, float &vel_y) {
-    // 纯P控制，同 vision_laser precise_land
-    // 坐标轴交换：图像X误差→机体Y(左右)，图像Y误差→机体X(前后)
-    vel_x = cfg_.circle_pix_vel_p * err_y;
-    vel_y = cfg_.circle_pix_vel_p * err_x;
-
-    vel_x = satfunc(vel_x, cfg_.circle_pix_vel_max);
-    vel_y = satfunc(vel_y, cfg_.circle_pix_vel_max);
 }
 
 bool MissionManager::timeout(const float timeout_limit) const noexcept {
@@ -612,6 +542,7 @@ void MissionManager::run() {
         case SIMULATE_ATTACK        : handleSimulateAttack(); break;
         case WAIT_HIT_CONFIRMATION  : handleWaitHitConfirmation(); break;
         case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
+        case READY_NAV_TO_RING_BACK : handleReadyNavToRingBack(); break;
         case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
         // --- PCL柱子导航（pillar_nav_mode="pcl"时替换EGO路径） ---
         case PILLAR_DETECT          : handlePillarDetect(); break;

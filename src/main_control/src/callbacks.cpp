@@ -33,88 +33,46 @@ void MissionManager::detectedTargetCallback(const std_msgs::String::ConstPtr &ms
 }
 
 void MissionManager::yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg) {
-    bool found            = false;
-    float best_center_x   = 0, best_center_y = 0;
-    float best_confidence = 0;
-    std::string best_class;
+    // mission_flow 融合：前视 YOLO 检测回调（订阅 /yolo_front_detect，320x240，中心 160）
+    // 仅在攻击相关状态生效：找配置的真实目标字母(attack_real_target, 如"A")，记录像素中心+时间
 
-    // 判断当前是否为前视攻击状态
     bool is_attack_state = (current_state_ == MOVE_TO_ATTACK_AREA ||
                             current_state_ == RECOG_ATTACK_TARGET ||
-                            current_state_ == MOVE_TO_FRONT_OF_TARGET ||
                             current_state_ == ALIGN_ATTACK_TARGET ||
                             current_state_ == SIMULATE_ATTACK);
+    if (!is_attack_state) return;
 
-    // 确定匹配目标文字
-    std::string match_target;
-    switch (current_state_) {
-    case HOVER_RECOG_DROP:
-    case DROP_SUPPLY            : match_target = cfg_.detection_drop_target_class; break;
-    case RETURN                 :
-    case LAND                   : match_target = cfg_.detection_land_target_class; break;
-    default                     : match_target = ""; break;
-    }
+    const std::string &match_target = cfg_.attack_real_target;  // 前视攻击只匹配真实目标字母
+    if (match_target.empty()) return;
 
-    // 前视攻击：只匹配配置的真实目标字母（如 "A"），忽略干扰目标
-    if (is_attack_state) {
-        match_target = cfg_.attack_real_target;
-    }
-
-    ROS_WARN_THROTTLE(2.0,
-        "[DEBUG-YOLO] 收到 %d 个检测, state=%d, is_attack=%d, match_target='%s', "
-        "confirmed_target_='%s', target_confirmed_=%d",
-        msg->num_detections, (int)current_state_, is_attack_state,
-        match_target.c_str(), confirmed_target_.c_str(), target_confirmed_);
+    // 在检测结果里找匹配目标(取置信度最高的)
+    bool  found          = false;
+    float best_center_x   = 0.0f;
+    float best_center_y   = 0.0f;
+    float best_confidence = 0.0f;
+    std::string best_class;
 
     for (int i = 0; i < msg->num_detections; ++i) {
-        std::string ocr_text = msg->class_names[i];
-        float conf = msg->confidences[i];
-
-        bool is_target = false;
-        if (is_attack_state) {
-            // 前视攻击：匹配确认文字；若无确认文字则取首个检测
-            if (match_target.empty()) {
-                is_target = true;  // 自动接受
-            } else {
-                is_target = (ocr_text == match_target);
-            }
-        } else if (!match_target.empty()) {
-            is_target = (ocr_text == match_target);
-        }
-
-        if (is_target) {
-            if (!found || conf > best_confidence) {
+        if (msg->class_names[i] == match_target) {
+            if (!found || msg->confidences[i] > best_confidence) {
                 best_center_x   = msg->center_x[i];
                 best_center_y   = msg->center_y[i];
-                best_confidence = conf;
-                best_class      = ocr_text;
+                best_confidence = msg->confidences[i];
+                best_class      = msg->class_names[i];
                 found           = true;
             }
         }
     }
 
     if (found && best_confidence >= cfg_.detection_min_confidence) {
-        current_detection_.detected    = true;
-        current_detection_.center_x    = best_center_x;
-        current_detection_.center_y    = best_center_y;
-        current_detection_.confidence  = best_confidence;
-        current_detection_.last_update = ros::Time::now();
-
-        ROS_WARN("[DEBUG-YOLO] 检测命中! text='%s' conf=%.2f pos=(%.1f,%.1f)",
-                 best_class.c_str(), best_confidence, best_center_x, best_center_y);
-
-        // 前视攻击下若无确认目标，自动确认（跳过下视时的自救）
-        if (is_attack_state && confirmed_target_.empty()) {
-            confirmed_target_  = best_class;
-            target_confirmed_  = true;
-            ROS_WARN("★★★ [DEBUG-YOLO] 自动确认攻击目标: %s (置信度: %.2f) ★★★",
-                     best_class.c_str(), best_confidence);
-        }
-    }
-    else if (!current_detection_.last_update.isZero() &&
-             ros::Time::now() - current_detection_.last_update > ros::Duration(2.0))
-    {
-        current_detection_.detected = false;
+        front_target_matched_ = true;
+        matched_target_       = best_class;
+        matched_center_x_     = best_center_x;
+        matched_center_y_     = best_center_y;
+        last_matched_time_    = ros::Time::now();
+        ROS_INFO_THROTTLE(1.0, "★★★ [前视] 找到目标 %s, 像素(%.1f, %.1f) conf=%.2f ★★★",
+                          matched_target_.c_str(), matched_center_x_, matched_center_y_,
+                          best_confidence);
     }
 }
 
@@ -142,20 +100,4 @@ void MissionManager::ringDetectCallback(const pcl_detection2::SquareRing::ConstP
 void MissionManager::pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg) {
     pillar_case_id_ = msg->data;
     ROS_INFO_THROTTLE(2.0, "[Pillar] 收到柱子配置 #%d", pillar_case_id_);
-}
-
-void MissionManager::circleDetectCallback(const raicom_vision_laser::CircleDetectResult::ConstPtr &msg) {
-    circle_detected_  = msg->detected;
-    circle_center_x_  = msg->center_x;
-    circle_center_y_  = msg->center_y;
-    circle_radius_    = msg->radius;
-
-    if (circle_detected_) {
-        circle_detect_time_ = ros::Time::now();
-        ROS_INFO("[DEBUG-Circle] 收到圆检测: detected=%d center=(%.1f,%.1f) r=%.1f age=%.2fs",
-                 (int)msg->detected, msg->center_x, msg->center_y, msg->radius,
-                 (ros::Time::now() - circle_detect_time_).toSec());
-    } else {
-        ROS_WARN_THROTTLE(2.0, "[DEBUG-Circle] 收到圆检测: detected=0 (无圆)");
-    }
 }

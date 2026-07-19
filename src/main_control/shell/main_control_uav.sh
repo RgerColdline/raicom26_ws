@@ -18,7 +18,7 @@ WS="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 # 可变路径: 支持通过 export 覆盖，适应不同设备
 # SIM_WS="${SIM_WS:-$HOME/catkin_ws}"
 EGO_WS="${EGO_WS:-$HOME/ego_ws}"
-LIO_WS="${LIO_WS:-$HOME/ros_libraries_ws}"
+LIO_WS="${LIO_WS:-$HOME/abot_ws}"
 
 # 固定路径: 按需求保留默认值，多设备位置一致
 # PX4_PATH="$HOME/Libraries/PX4-Autopilot"
@@ -96,7 +96,7 @@ tmux split-window -h -t "$SESSION:1"
 tmux send-keys -t "$SESSION:1" "sleep 10; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch main_control main_control.launch" C-m
 
 tmux split-window -v -t "$SESSION:1"
-tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch raicom_vision_laser raicom_vision_only.launch" C-m
+tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; rostopic echo /yolo_front_detect" C-m
 
 tmux select-pane -L -t "$SESSION:1"
 tmux split-window -v -t "$SESSION:1"
@@ -110,7 +110,7 @@ tmux select-layout -t "$SESSION:1" tiled
 tmux new-window -t "$SESSION" -n "Perception_Nav"
 
 # 左上：FAST-LIO2 (LiDAR-IMU紧耦合SLAM)
-tmux send-keys -t "$SESSION:2" "sleep 10; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; roslaunch fast_lio mapping_mid360.launch rviz:=false" C-m
+tmux send-keys -t "$SESSION:2" "sleep 10; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; roslaunch fast_lio mapping_mid360_fastlio.launch rviz:=false" C-m
 
 # 左下：PCL点云感知 (方环检测 + 障碍物处理)
 tmux split-window -v -t "$SESSION:2"

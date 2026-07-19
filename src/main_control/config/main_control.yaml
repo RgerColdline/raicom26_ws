@@ -13,10 +13,10 @@ target_front_offset_y: 0.0          # 无人机要去的相对于目标靶子y�
 nav_goal_timeout: 60.0              # 导航到达超时时间（秒）
 align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
 shoot_delay: 2.0                    # 射击后等待确认时间（秒）
-use_ego_planner_for_drop_area : true #导航至投放区模式选择：true=使用ego_planner路径规划，false=直接位置控制直飞
+use_ego_planner_for_drop_area : false # pcl-dev: 定点控制，不用EGO
 
 # 导航模式: "ego"=EGO-Planner路径规划  "pcl"=PCL柱子检测航点(需pcl_detection2)
-pillar_nav_mode: "ego"
+pillar_nav_mode: "pcl"
 
 wait_for_vision_services: false        # 是否等待视觉服务(/switch_camera等)；false则跳过，方便单独测试PCL
 
@@ -24,7 +24,7 @@ wait_for_vision_services: false        # 是否等待视觉服务(/switch_camera
 # 优先使用 pcl 实时检测到的环 3D 位姿计算穿越点。
 # 检测失败或超时(3s)时自动回退到硬编码航点 wp_ring_front/back_。
 ring_front_approach_offset: 0.8    # 环前方悬停距离 (m)
-ring_back_approach_offset: 0.8     # 环后方穿越目标距离 (m)
+ring_back_approach_offset:  1.2    # 环后方穿越目标距离 (m)
 
 # 环多假设追踪（类 PCL 强度机制）
 ring_track:
@@ -38,22 +38,17 @@ ring_track:
 
 # ==================== 定点射击参数（vision_laser 状态6，抛弃视觉PID） ====================
 shoot:
-  left_x: -0.60                  # 左射击点X（相对attack_area）
-  left_y: -1.6                   # 左射击点Y
-  right_x: -0.60                 # 右射击点X
-  right_y: -2.6                  # 右射击点Y
-  default_x: -0.60               # 默认射击点X
-  default_y: -2.15               # 默认射击点Y
-  left_right_threshold: 20.0     # 左右判断像素阈值（像素）
+  left_x: -0.45                  # 左射击点X（相对起飞点）：用户指定(-0.45,-1.5)
+  left_y: -1.5                   # 左射击点Y（+Y侧，目标在图像左->飞左）
+  right_x: -0.45                 # 右射击点X：用户指定(-0.45,-2.5)
+  right_y: -2.5                  # 右射击点Y（-Y侧，目标在图像右->飞右）
+  default_x: -0.45               # 默认射击点X：投放区(-0.45,-2.0)居中
+  default_y: -2.0                # 默认射击点Y
+  left_right_threshold: 20.0     # 左右判断像素阈值（前视YOLO 320x240 中心160）
   detect_timeout: 60.0           # 目标检测超时 (s)
   stable_time: 0.5               # 射击前稳定时间 (s)
-
-# ==================== 精准降落圆检测参数 ====================
-circle_pix_vel_p: 0.001         # 圆检测像素PID P增益（纯P控制）
-circle_pix_vel_max: 0.3         # 圆检测最大对准速度 (m/s)
-circle_align_threshold: 30.0    # 圆对准像素阈值
-circle_confirm_count: 3         # 连续确认帧数
-circle_detect_timeout_s: 0.5    # 圆检测超时 (s)
+  duration: 1.5                  # 激光射击后等待时间(s)（stm32_shooter 开->1s->关+余量）
+  z: 1.5                         # 射击高度（相对init_pos，与投放区同高）
 
 # ==================== 像素PID参数 ====================
 PIX_VEL_P: 0.003                    # 像素误差比例系数
@@ -74,28 +69,30 @@ wp_ring_back_z: 1.0
 
 # 中间点
 wp_come_mid_x: -1.70
-wp_come_mid_y: -2.80
+wp_come_mid_y: -2.90
 wp_come_mid_z: 1.2               # 通常与 takeoff_height 一致
-wp_back_mid_x: -1.70
+wp_back_mid_x: -2.6
 wp_back_mid_y: -2.80
 wp_back_mid_z: 1.2            
+
+# 柱子中心点（两柱之间）
+wp_pillar_center_x: -2.35
+wp_pillar_center_y: -1.42
+wp_pillar_center_z: 1.2
 
 # 物资投放区
 wp_drop_area_x: -0.45
 wp_drop_area_y: -2.0
-wp_drop_area_z: 1.2
+wp_drop_area_z: 1.5
 
 # 攻击目标识别区
 wp_attack_area_x: -0.45
 wp_attack_area_y: -2.0
-wp_attack_area_z: 1.2
+wp_attack_area_z: 1.5
 
 # 识别参数
 detection:
-  min_confidence: 0.9           # 目标检测最小置信度阈值
-  drop_target_class: "drop_target"
-  attack_target_class: "attack_target"
-  land_target_class: "land_target"
+  min_confidence: 0.4           # 目标检测最小置信度阈值（前视YOLO，与yolo_front_detector.confidence一致）
   attack_real_target: "A" # 真实目标字母（A或B），前视时只匹配此字母，忽略干扰目标
 
 drop:
@@ -103,9 +100,6 @@ drop:
   arrive_threshold: 0.35
   detect_timeout: 10.0
   align_hold_time: 0.35
-  release_max_horiz_speed: 0.12
-  release_max_vert_speed: 0.06
-  max_tilt: 0.08
 
   # 经验像素偏置：先从 0 开始，实飞后慢慢调
   camera_bias_x_px: 0.0
@@ -117,14 +111,31 @@ drop:
   fine_vel_scale: 0.45
   descend_distance: 0.6
 
+# 定点降落（无视觉：起飞点上方限速下降，<0.3m切AUTO.LAND）
 land:
-  kp: 0.005                   // 水平对准 P 增益
-  ki: 0.0005                    // 水平对准 I 增益
-  kd: 0.0001                    // 水平对准 D 增益
-  max_align_speed: 0.5                    // 最大对准速度 (m/s)
-  descend_speed: 0.2                    // 基础下降速度 (m/s)
-  align_pixel_threshold: 15.0                   // 对准像素阈值
-  fine_pixel_radius: 30.0                   // 精细调整半径
-  fine_vel_scale: 0.4                   // 精细速度缩放
-  final_height: 0.2                   // 最终判定高度 (m)
-  final_hold_time: 1.5                    // 最终稳定保持时间 (s)
+  descend_speed: 0.2            # 定点下降速度 (m/s)
+# ==================== mission_flow 融合：投货参数（/servo_control -> stm32_shooter） ====================
+# 固件: 0°=货舱开(投货), 160°=货舱关(复位); stm32_shooter: 发<135->0x03(开), 发>=135->0x04(关)
+cargo:
+  drop_angle: 0               # 投货(开舱): 发0(<135) -> 0x03 -> 固件舵机0°
+  reset_angle: 180            # 复位(关舱): 发180(>=135) -> 0x04 -> 固件舵机160°
+  hold_time: 4.0              # 货舱保持打开时间(s)
+  descent_timeout: 10.0       # 下降到投货高度超时(s); 超时未到也在当前位置投货
+  drop_hover_time: 2.0        # 投货前在投放点悬停时间(s)
+  drop_z: 0.3                 # 投货下降高度(相对init_pos)
+
+# ==================== mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ====================
+yolo:
+  img_center_x: 160.0         # 前视YOLO图像中心X(图像320x240)
+  target_timeout: 0.5         # 检测结果有效期(s), 超过算目标丢失
+  detect_timeout: 60.0        # 前视识别总超时(s), 超时走默认射击点
+
+# ==================== 前视 YOLO 检测节点私有参数（Python 节点 yolo_front_detector 使用） ====================
+# weights_path 不在此处（YAML 不支持 $(find)），在 main_control.launch 里用 $(find) 设置
+yolo_front_detector:
+  device: "cuda:0"            # 推理设备：jetson 用 cuda:0（无 GPU 改 cpu）
+  confidence: 0.4             # 置信度阈值
+  imgsz: 320                  # 模型输入尺寸（与压缩图 320x240 一致）
+  show_image: true            # 是否显示检测结果图像
+  image_topic: "/camera/color/image_raw"  # 前视摄像头话题（astra相机）
+  window_name: "YOLO Front Detection"
