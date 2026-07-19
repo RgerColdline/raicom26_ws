@@ -26,7 +26,6 @@
 // 自定义消息（需根据实际包名调整）
 #include <pcl_detection2/SquareRing.h>
 #include <raicom_vision_laser/DetectionInfo.h>
-#include <raicom_vision_laser/CircleDetectResult.h>
 
 // ============================================================================
 // 状态机枚举
@@ -89,12 +88,10 @@ class MissionManager
     ros::Subscriber yolo_detect_sub_;
     ros::Subscriber hit_confirm_sub_;
     ros::Subscriber ring_sub_;
-    ros::Subscriber circle_sub_;
     ros::Subscriber pillar_sub_;
     ros::Publisher pillar_start_pub_;
 
     ros::ServiceClient switch_camera_client_;
-    ros::ServiceClient switch_to_circle_client_;
     ros::ServiceClient reset_target_client_;
     ros::ServiceClient get_status_client_;
     ros::ServiceClient set_mode_client_;
@@ -135,41 +132,34 @@ class MissionManager
         float confidence = 0.0f;
         ros::Time last_update;
     };
-    DetectionData current_detection_;
 
     Eigen::Vector3f attack_target_world_;
     bool hit_confirmed_ = false;
 
     // 定点射击目标（vision_laser 状态6）
+    // 注意：以下两个变量存【相对init_pos的偏移】(=cfg.shoot_*_x/y)，传给 moveTo() 由其内部加 init_pos
     float shoot_target_x_ = 0.0f;
     float shoot_target_y_ = 0.0f;
+
+    // === mission_flow 融合：前视YOLO检测状态 ===
+    bool        front_target_matched_ = false;
+    std::string matched_target_;
+    float       matched_center_x_     = 0.0f;
+    float       matched_center_y_     = 0.0f;
+    ros::Time   last_matched_time_;
+
+    // === mission_flow 融合：投货子状态（对应 mission_flow 状态3 Sub1/Sub2） ===
+    int       drop_sub_state_   = 0;  // 1=下降到投货高度 2=保持重发投货指令
+    ros::Time last_drop_pub_time_;
+    ros::Time drop_hover_start_;
+
+    // === mission_flow 融合：射击状态 ===
+    bool      shoot_triggered_ = false;
+    ros::Time shoot_time_;
 
     // -----pcl识别环
     bool ensure_ring_   = false;
     DetectionData ring_detection;
-
-    // -----圆检测（精准降落）
-    bool circle_detected_    = false;
-    float circle_center_x_   = 0.0f;
-    float circle_center_y_   = 0.0f;
-    float circle_radius_     = 0.0f;
-    ros::Time circle_detect_time_;
-
-    // -----精准降落像素PID（独立于前视PID）
-    float land_pix_err_sum_x_     = 0.0f;
-    float land_pix_err_sum_y_     = 0.0f;
-    float land_pix_last_err_x_    = 0.0f;
-    float land_pix_last_err_y_    = 0.0f;
-    int circle_in_threshold_count_ = 0;
-    const int CIRCLE_THRESHOLD_COUNT = 3;
-    float last_circle_x_          = -1000.0f;
-    float last_circle_y_          = -1000.0f;
-    ros::Time land_last_pid_time_;
-
-    // -----锁定降落坐标
-    float land_target_x_          = 0.0f;
-    float land_target_y_          = 0.0f;
-    bool target_pos_locked_       = false;
 
     // 记住第一次穿环后的位置（世界坐标），返程导航直接用
     Eigen::Vector3f ring_back_memorized_ = Eigen::Vector3f::Zero();
@@ -250,18 +240,12 @@ class MissionManager
         float PIX_FAR_NORM_DIST;
 
         float detection_min_confidence;
-        std::string detection_drop_target_class;
-        std::string detection_attack_target_class;
-        std::string detection_land_target_class;
         std::string attack_real_target;  // 真实目标字母 "A" 或 "B"，前视只攻击此目标
         bool wait_for_vision_services = true;  // 是否等待视觉服务(/switch_camera等)；false跳过，方便单独测试PCL
 
         float drop_arrive_threshold;
         float drop_detect_timeout;
         float drop_align_hold_time;
-        float drop_release_max_horiz_speed;
-        float drop_release_max_vert_speed;
-        float drop_max_tilt;
         float drop_camera_bias_x_px;
         float drop_camera_bias_y_px;
         float drop_release_bias_x_px;
@@ -270,16 +254,7 @@ class MissionManager
         float drop_fine_vel_scale;
         float drop_descend_distance;
 
-        float land_kp                    = 0.005f;   // 水平对准 P 增益
-        float land_ki                    = 0.0005f;  // 水平对准 I 增益
-        float land_kd                    = 0.0001f;  // 水平对准 D 增益
-        float land_max_align_speed       = 0.5f;     // 最大对准速度 (m/s)
-        float land_descend_speed         = 0.3f;     // 基础下降速度 (m/s)
-        float land_align_pixel_threshold = 15.0f;    // 对准像素阈值
-        float land_fine_pixel_radius     = 30.0f;    // 精细调整半径
-        float land_fine_vel_scale        = 0.4f;     // 精细速度缩放
-        float land_final_height          = 0.2f;     // 最终判定高度 (m)
-        float land_final_hold_time       = 1.5f;     // 最终稳定保持时间 (s)
+        float land_descend_speed         = 0.3f;     // 定点下降速度 (m/s)
 
         bool use_ego_planner_for_drop_area;
 
@@ -297,13 +272,22 @@ class MissionManager
         float shoot_left_right_threshold = 20.0f;  // 左右判断像素阈值
         float shoot_detect_timeout       = 60.0f;  // 目标检测超时 (s)
         float shoot_stable_time          = 0.5f;   // 射击前稳定时间 (s)
+        float shoot_duration             = 1.5f;   // 激光射击后等待时间(s)（stm32_shooter 开->1s->关 + 余量）
+        float shoot_z                    = 1.5f;   // 射击高度(相对init_pos)
 
-        // 精准降落圆检测参数
-        float circle_pix_vel_p            = 0.001f;   // 圆检测像素PID P增益
-        float circle_pix_vel_max          = 0.3f;     // 圆检测最大对准速度
-        float circle_align_threshold      = 30.0f;    // 圆对准像素阈值
-        int circle_confirm_count          = 3;        // 连续确认帧数
-        float circle_detect_timeout_s     = 0.5f;     // 圆检测超时 (s)
+        // === mission_flow 融合：投货参数（/servo_control -> stm32_shooter） ===
+        // 固件: 0°=货舱开(投货), 160°=货舱关(复位); stm32_shooter: 发<135->0x03(开), 发>=135->0x04(关)
+        int   cargo_drop_angle           = 0;      // 投货(开舱): 发0(<135) -> 0x03
+        int   cargo_reset_angle          = 180;    // 复位(关舱): 发180(>=135) -> 0x04
+        float cargo_hold_time            = 4.0f;   // 货舱保持打开时间(s)
+        float descent_timeout            = 10.0f;  // 下降到投货高度超时(s); 超时未到也在当前位置投货
+        float drop_hover_time            = 2.0f;   // 投货前在投放点悬停时间(s)
+        float drop_z                     = 0.3f;   // 投货下降高度(相对init_pos)
+
+        // === mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ===
+        float yolo_img_center_x          = 160.0f; // 前视YOLO图像中心X(图像320x240)
+        float yolo_target_timeout        = 0.5f;   // 检测结果有效期(s), 超过算目标丢失
+        float yolo_detect_timeout        = 60.0f;  // 前视识别总超时(s), 超时走默认射击点
 
         // 环多假设追踪参数（类 PCL 强度）
         float track_match_distance       = 0.3f;   // 匹配距离阈值 (m)
@@ -323,9 +307,6 @@ class MissionManager
     Waypoint wp_drop_area_;
     Waypoint wp_attack_area_;
 
-    const float IMG_CENTER_X = 320.0f;
-    const float IMG_CENTER_Y = 240.0f;
-
     // ---------- 初始化函数 ----------
     void loadParameters();
 
@@ -338,7 +319,6 @@ class MissionManager
     void hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg);
     void ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg);
     void pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg);
-    void circleDetectCallback(const raicom_vision_laser::CircleDetectResult::ConstPtr &msg);
 
     // ---------- 控制辅助函数 ----------
     void sendSetpoint(const mavros_msgs::PositionTarget &sp);
@@ -353,15 +333,9 @@ class MissionManager
     inline bool moveTo(const Waypoint wp) { return moveTo(wp.x, wp.y, wp.z); }
     void hover();
     float getHorizontalSpeed() const;
-    bool isDropWindowStable(float target_z) const;
 
     void getPixPidVel(float err_x, float err_y, float dt, float &vel_x, float &vel_y);
     float satfunc(float value, float limit);
-
-    // 圆检测精准降落辅助
-    void resetLandPixPid();
-    void getLandPixPidVel(float err_x, float err_y, float dt, float &vel_x, float &vel_y);
-    bool callSwitchCircle();
 
     bool callSwitchCamera();
     bool callResetTarget();

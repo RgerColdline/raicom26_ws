@@ -69,16 +69,25 @@ tmux send-keys -t "$SESSION:0" "$CMD_SIM" C-m
 
 # ---------------------------------------------------------
 # 窗口 1：主控、监控与视觉 (四等分 2x2)
+# 注: main_control.launch 内含 状态机 + 前视YOLO + stm32_shooter(仿真已禁用)
 # ---------------------------------------------------------
 tmux new-window -t "$SESSION" -n "Control_Vision"
 
 tmux send-keys -t "$SESSION:1" "sleep 18; rostopic echo /mavros/local_position/pose" C-m
 
 tmux split-window -h -t "$SESSION:1"
-tmux send-keys -t "$SESSION:1" "sleep 10; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch main_control main_control.launch" C-m
+# 仿真覆盖: use_stm32:=false(无串口, required节点退出会拖垮launch)
+#           yolo走 best.pt + cpu(无GPU, engine是Jetson TensorRT专用)
+CMD_MAIN="sleep 10; \
+source '${WS}/devel/setup.${CURRENT_SHELL}'; \
+roslaunch main_control main_control.launch \
+use_stm32:=false \
+yolo_device:=cpu \
+yolo_weights:=${WS}/src/raicom_vision_laser/models/best.pt"
+tmux send-keys -t "$SESSION:1" "$CMD_MAIN" C-m
 
 tmux split-window -v -t "$SESSION:1"
-tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch raicom_vision_laser raicom_vision_only.launch" C-m
+tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; rostopic echo /yolo_front_detect" C-m
 
 tmux select-pane -L -t "$SESSION:1"
 tmux split-window -v -t "$SESSION:1"
@@ -94,11 +103,12 @@ tmux new-window -t "$SESSION" -n "Perception_Nav"
 # 左上：FAST-LIO2 (LiDAR-IMU紧耦合SLAM)
 tmux send-keys -t "$SESSION:2" "sleep 10; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; roslaunch fast_lio mapping_mid360_fastlio.launch" C-m
 
-# 左下：PCL点云感知 (方环检测 + 障碍物处理)
+# 左下：PCL点云感知 (方环检测 + 柱子检测pillar_case_id + 障碍物处理)
 tmux split-window -v -t "$SESSION:2"
 tmux send-keys -t "$SESSION:2" "sleep 14; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; source '${WS}/devel/setup.${CURRENT_SHELL}' --extend; roslaunch pcl_detection2 pcl_detection2.launch" C-m
 
 # 右：EGO-Planner 路径规划与避障
+# 注: pillar_nav_mode="pcl" 时主流程全走 moveTo 不依赖EGO，此项仅为 PCL 检测失败时的 navTo 兜底路径保留
 tmux split-window -h -t "$SESSION:2"
 CMD_NAV="sleep 16; \
 source '${WS}/devel/setup.${CURRENT_SHELL}'; \
@@ -109,11 +119,12 @@ tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
 tmux select-layout -t "$SESSION:2" tiled
 
 # ---------------------------------------------------------
-# 窗口 3：精准降落 (圆检测)
+# 窗口 3：PCL柱子检测监控
 # ---------------------------------------------------------
-tmux new-window -t "$SESSION" -n "Landing"
+tmux new-window -t "$SESSION" -n "Pillar_Monitor"
 
-tmux send-keys -t "$SESSION:3" "sleep 16; source '${WS}/devel/setup.${CURRENT_SHELL}'; rosrun raicom_vision_laser hough_circle_detector.py" C-m
+# PCL柱子检测结果监控 (pillar_nav_mode:=pcl 时 PILLAR_DETECT 状态等这个话题)
+tmux send-keys -t "$SESSION:3" "sleep 16; rostopic echo /pcl_detection2/pillar_case_id" C-m
 
 # ============================================
 # 完成配置并附加会话
