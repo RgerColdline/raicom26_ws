@@ -183,7 +183,9 @@ void MissionManager::handleNavToDropArea() {
         }
         return;
     }
-    if (navTo(drop_target)) {
+    // PCL模式用moveTo（不依赖EGO），EGO模式用navTo
+    bool drop_arrived = (pillar_nav_mode_ == "pcl") ? moveTo(drop_target) : navTo(drop_target);
+    if (drop_arrived) {
         if (cfg_.wait_for_vision_services) {
             // 正常模式：进入视觉识别流程
             current_state_    = HOVER_RECOG_DROP;
@@ -194,8 +196,12 @@ void MissionManager::handleNavToDropArea() {
             pix_integral_x_ = pix_integral_y_ = 0.0f;
             last_pix_err_x_ = last_pix_err_y_ = 0.0f;
             ROS_INFO("到达投放区 (ego_planner)，开始下视识别投放标识");
+        } else if (pillar_nav_mode_ == "pcl") {
+            // PCL模式：跳过视觉，走PCL返程航点
+            current_state_    = RETURN_PILLAR_WAYPOINTS;
+            ROS_INFO("到达投放区，跳过视觉识别，进入PCL返程");
         } else {
-            // 无视觉服务模式：跳过投放和攻击，直接返程
+            // EGO模式无视觉：跳过投放和攻击，直接返程
             current_state_    = NAV_TO_RING_BACK;
             ROS_INFO("到达投放区，跳过视觉识别，直接返程");
         }
@@ -1046,9 +1052,9 @@ void MissionManager::handleNavPillarWaypoints() {
     const auto &waypoints = pillar_waypoints_[pillar_case_id_];
 
     if (pillar_wp_index_ >= waypoints.size()) {
-        // 所有正向航点完成 → 去投放区
-        ROS_INFO("[Pillar] 正向航点全部完成，进入投放区");
-        current_state_    = NAV_TO_DROP_AREA;
+        // 正向航点完成 → 直接返程（PCL已到投放区附近，不再多走一步）
+        ROS_INFO("[Pillar] 正向航点全部完成，PCL返程");
+        current_state_    = RETURN_PILLAR_WAYPOINTS;
         state_start_time_ = ros::Time::now();
         return;
     }
