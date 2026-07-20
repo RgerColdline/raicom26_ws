@@ -18,7 +18,7 @@ WS="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 # 可变路径: 支持通过 export 覆盖，适应不同设备
 # SIM_WS="${SIM_WS:-$HOME/catkin_ws}"
 EGO_WS="${EGO_WS:-$HOME/ego_ws}"
-LIO_WS="${LIO_WS:-$HOME/abot_ws}"
+LIO_WS="${LIO_WS:-$HOME/fast_lio_ws}"
 
 # 固定路径: 按需求保留默认值，多设备位置一致
 # PX4_PATH="$HOME/Libraries/PX4-Autopilot"
@@ -83,7 +83,7 @@ tmux send-keys -t "$SESSION:0" "sleep 4; roslaunch foxglove_bridge foxglove_brid
 tmux split-window -v -t "$SESSION:0"
 tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch usb_cam usb_cam-test.launch" C-m
 tmux split-window -v -t "$SESSION:0"
-tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch astra_camera astra.launch" C-m
+tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch astra_camera gemini.launch" C-m
 
 # ---------------------------------------------------------
 # 窗口 1：主控、监控与视觉 (四等分 2x2)
