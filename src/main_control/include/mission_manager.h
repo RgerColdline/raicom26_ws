@@ -194,7 +194,9 @@ class MissionManager
     bool ensure_ring_   = false;
     DetectionData ring_detection;
 
-    // 记住第一次穿环后的位置（世界坐标），返程导航直接用
+    // 记住第一次穿环前悬停点和穿环后位置（世界坐标），返程定点直飞
+    Eigen::Vector3f ring_front_memorized_ = Eigen::Vector3f::Zero();
+    bool ring_front_memorized_valid_ = false;
     Eigen::Vector3f ring_back_memorized_ = Eigen::Vector3f::Zero();
     bool ring_back_memorized_valid_ = false;
 

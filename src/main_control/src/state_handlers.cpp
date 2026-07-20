@@ -137,12 +137,14 @@ void MissionManager::handleMoveToRingFront() {
 }
 void MissionManager::handleSetoutCrossRing() {
     // 进入状态时计算一次穿越点，冻结不再变动
-    static Waypoint cross_target = wp_ring_back_;
-    static bool cross_wp_frozen  = false;
+    static Waypoint cross_target    = wp_ring_back_;
+    static Waypoint approach_target = wp_ring_front_;
+    static bool cross_wp_frozen     = false;
     if (!cross_wp_frozen) {
         Waypoint dyn_front, dyn_back;
         if (computeRingApproachWP(dyn_front, dyn_back)) {
-            cross_target = dyn_back;
+            cross_target    = dyn_back;
+            approach_target = dyn_front;
             ROS_INFO("[Ring] 去程穿越点已冻结: (%.2f, %.2f, %.2f)", dyn_back.x, dyn_back.y,
                      dyn_back.z);
         }
@@ -151,6 +153,14 @@ void MissionManager::handleSetoutCrossRing() {
     }
 
     if (moveTo(cross_target)) {
+        // 记住穿越前悬停点（世界坐标），返程定点直飞
+        ring_front_memorized_.x()   = init_pos_x_ + approach_target.x;
+        ring_front_memorized_.y()   = init_pos_y_ + approach_target.y;
+        ring_front_memorized_.z()   = init_pos_z_ + approach_target.z;
+        ring_front_memorized_valid_ = true;
+        ROS_INFO("[Ring] 记住环前方位置: (%.2f, %.2f, %.2f)", ring_front_memorized_.x(),
+                 ring_front_memorized_.y(), ring_front_memorized_.z());
+
         // 记住穿越后的位置（世界坐标），返程直接导航到此处
         ring_back_memorized_.x()   = init_pos_x_ + cross_target.x;
         ring_back_memorized_.y()   = init_pos_y_ + cross_target.y;
@@ -159,17 +169,6 @@ void MissionManager::handleSetoutCrossRing() {
         ROS_INFO("[Ring] 记住环后方位置: (%.2f, %.2f, %.2f)", ring_back_memorized_.x(),
                  ring_back_memorized_.y(), ring_back_memorized_.z());
 
-        // PCL模式=穿越平滑轨迹：穿环后先去悬停扫描点；地图没加载成功则回退 EGO 路径
-        if (pillar_nav_mode_ == "pcl" && traverse_cfg_ok_) {
-            current_state_ = TRAVERSE_TO_SCAN;
-            ROS_INFO("进入穿越赛段：飞向悬停扫描点");
-        }
-        else {
-            if (pillar_nav_mode_ == "pcl" && !traverse_cfg_ok_)
-                ROS_WARN("[穿越] 地图未加载成功，回退 EGO 路径");
-            current_state_ = NAV_TO_DROP_AREA;
-            ROS_INFO("准备穿随机障碍物");
-        }
         // PCL模式=穿越平滑轨迹：穿环后先去悬停扫描点；地图没加载成功则回退 EGO 路径
         if (pillar_nav_mode_ == "pcl" && traverse_cfg_ok_) {
             current_state_ = TRAVERSE_TO_SCAN;
@@ -519,6 +518,41 @@ void MissionManager::handleNavToRingBack() {
 void MissionManager::handleReturnCrossRing() {
     enum class SubState { MOVE_TO_RING_FRONT, CROSS_RING };
     static SubState sub_state = SubState::MOVE_TO_RING_FRONT;
+
+    // ================================================================
+    // 快速路径：去程已记录前后记忆点，返程定点直飞，跳过环检测
+    // ================================================================
+    static bool fast_phase1_done = false;
+
+    if (ring_front_memorized_valid_ && ring_back_memorized_valid_) {
+        // Phase 1: 飞到环后方记忆点（当前侧接近点）
+        if (!fast_phase1_done) {
+            ROS_INFO_THROTTLE(1.0, "[Ring] 记忆点返程-Phase1: 飞向环后方(%.2f,%.2f,%.2f)",
+                              ring_back_memorized_.x(), ring_back_memorized_.y(),
+                              ring_back_memorized_.z());
+            if (moveToAbs(ring_back_memorized_.x(), ring_back_memorized_.y(),
+                          ring_back_memorized_.z())) {
+                fast_phase1_done = true;
+                state_start_time_ = ros::Time::now();
+                ROS_INFO("[Ring] 记忆点返程：到达环后方，准备穿越");
+            }
+            return;
+        }
+        // Phase 2: 穿越到环前方记忆点
+        if (moveToAbs(ring_front_memorized_.x(), ring_front_memorized_.y(),
+                      ring_front_memorized_.z())) {
+            current_state_      = RETURN;
+            state_start_time_   = ros::Time::now();
+            fast_phase1_done    = false;
+            sub_state           = SubState::MOVE_TO_RING_FRONT;
+            ROS_INFO("[Ring] 记忆点返程完成，已穿环，返回起飞点");
+        }
+        return;
+    }
+
+    // ================================================================
+    // 回退路径：记忆点无效时，使用环检测（原有逻辑不变）
+    // ================================================================
     switch (sub_state) {
         static bool should_move = false;
     case SubState::MOVE_TO_RING_FRONT: {
