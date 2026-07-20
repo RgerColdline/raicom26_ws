@@ -2,7 +2,7 @@
 
 MissionManager::MissionManager(ros::NodeHandle &nh) : nh_(nh), current_state_(INIT_TAKEOFF) {
     loadParameters();
-    loadPillarConfig();
+    loadTraverseConfig();
     current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     current_setpoint_.type_mask        = 0b100111000111;
     current_setpoint_.velocity.x       = 0.0f;
@@ -113,6 +113,25 @@ void MissionManager::loadParameters() {
     nh_.param<float>("yolo/img_center_x", cfg_.yolo_img_center_x, 160.0f);
     nh_.param<float>("yolo/target_timeout", cfg_.yolo_target_timeout, 0.5f);
     nh_.param<float>("yolo/detect_timeout", cfg_.yolo_detect_timeout, 60.0f);
+
+    // === 穿越赛段参数（traverse_map.yaml，pillar_nav_mode="pcl" 时生效） ===
+    nh_.param<std::string>("pillar_nav_mode", pillar_nav_mode_, "ego");
+    nh_.param<float>("traverse/flight_z", cfg_.trav_flight_z, 1.3f);
+    nh_.param<float>("traverse/err_max", cfg_.trav_err_max, 0.15f);
+    nh_.param<double>("traverse/v_max", cfg_.trav_v_max, 0.5);
+    nh_.param<double>("traverse/a_max", cfg_.trav_a_max, 0.4);
+    nh_.param<double>("traverse/a_lat_max", cfg_.trav_a_lat_max, 0.6);
+    nh_.param<double>("traverse/inflation", cfg_.trav_inflation, 0.3);
+    nh_.param<double>("traverse/sample_ds", cfg_.trav_sample_ds, 0.01);
+    nh_.param<int>("traverse/force_fly", cfg_.trav_force_fly, 0);
+    nh_.param<float>("traverse/traj_timeout_margin", cfg_.trav_timeout_margin, 15.0f);
+    nh_.param<float>("traverse/scan_hover_time", cfg_.scan_hover_time, 3.0f);
+    nh_.param<float>("traverse/scan_timeout", cfg_.scan_timeout, 4.0f);
+    nh_.param<int>("traverse/default_case", cfg_.default_case, 1);
+    nh_.param<int>("traverse/force_case", cfg_.force_case, -1);
+    nh_.param<double>("map/origin_x", origin_fx_, 0.65);
+    nh_.param<double>("map/origin_y", origin_fy_, 0.75);
+    nh_.param<double>("map/pillar_radius", pillar_radius_, 0.1);
 
     ROS_INFO("参数加载完成。");
 }
@@ -544,10 +563,12 @@ void MissionManager::run() {
         case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
         case READY_NAV_TO_RING_BACK : handleReadyNavToRingBack(); break;
         case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
-        // --- PCL柱子导航（pillar_nav_mode="pcl"时替换EGO路径） ---
-        case PILLAR_DETECT          : handlePillarDetect(); break;
-        case NAV_PILLAR_WAYPOINTS   : handleNavPillarWaypoints(); break;
-        case RETURN_PILLAR_WAYPOINTS: handleReturnPillarWaypoints(); break;
+        // --- 穿越赛段（pillar_nav_mode="pcl" 时替换EGO路径，traverse 平滑轨迹） ---
+        case TRAVERSE_TO_SCAN      : handleTraverseToScan(); break;
+        case TRAVERSE_SCAN         : handleTraverseScan(); break;
+        case TRAVERSE_LEG2         : handleTraverseLeg2(); break;
+        case TRAVERSE_READY_RETURN : handleTraverseReadyReturn(); break;
+        case TRAVERSE_RETURN_LEG2  : handleTraverseReturnLeg2(); break;
         case RETURN                 : handleReturn(); break;
         case LAND                   : handleLand(); break;
         case TASK_END               : handleTaskEnd(); break;
@@ -568,41 +589,265 @@ void MissionManager::run() {
     }
 }
 
-// === 柱子导航配置加载 ===
-void MissionManager::loadPillarConfig() {
-    // 导航模式
-    nh_.param<std::string>("pillar_nav_mode", pillar_nav_mode_, "ego");
-    nh_.param<float>("pillar_detect_timeout", pillar_detect_timeout_, 5.0f);
-    nh_.param<float>("pillar_waypoint_tolerance", pillar_waypoint_tolerance_, 0.3f);
+// ============================================================
+//  穿越赛段：地图读取 + leg2 规划 + 轨迹跟踪（traverse_node 融合）
+//  地图与途经点全部是【场地系】官方坐标，规划器内部转 odom 系；
+//  trackLeg/moveToAbs 用的是绝对 odom 坐标（起飞点=出生点=odom 原点）
+// ============================================================
 
-    // 读取4组航点 (嵌套YAML: pillar_waypoints/case_00, case_01, ...)
-    pillar_waypoints_.clear();
-    std::string case_keys[4] = {"case_00", "case_01", "case_02", "case_03"};
+// XmlRpc 数值解析（rosparam 可能把 0.65 读成 double、把 2 读成 int）
+static double xmlNum(const XmlRpc::XmlRpcValue &v) {
+    if (v.getType() == XmlRpc::XmlRpcValue::TypeInt) return (int)v;
+    return (double)v;
+}
 
-    for (int c = 0; c < 4; ++c) {
-        std::string key = "pillar_waypoints/" + case_keys[c];
-        XmlRpc::XmlRpcValue wp_list;
-        if (!nh_.getParam(key, wp_list) || wp_list.getType() != XmlRpc::XmlRpcValue::TypeArray) {
-            ROS_WARN("[Pillar] 无法读取航点: %s", key.c_str());
-            continue;
+// 读二维点列表（途经点 / 候选柱位）
+static bool loadPointList(ros::NodeHandle &nh, const std::string &key, std::vector<Vec2f> &out) {
+    XmlRpc::XmlRpcValue lst;
+    if (!nh.getParam(key, lst)) return false;
+    for (int i = 0; i < lst.size(); i++)
+        if (lst[i].size() >= 2) {
+            Vec2f p;
+            p.x = xmlNum(lst[i][0]);
+            p.y = xmlNum(lst[i][1]);
+            out.push_back(p);
         }
+    return true;
+}
 
-        std::vector<Waypoint> waypoints;
-        for (int i = 0; i < wp_list.size(); ++i) {
-            if (wp_list[i].getType() == XmlRpc::XmlRpcValue::TypeArray && wp_list[i].size() >= 2) {
-                float x = static_cast<float>(static_cast<double>(wp_list[i][0]));
-                float y = static_cast<float>(static_cast<double>(wp_list[i][1]));
-                float z = cfg_.takeoff_height;
-                if (wp_list[i].size() >= 3) {
-                    z = static_cast<float>(static_cast<double>(wp_list[i][2]));
-                }
-                waypoints.push_back(Waypoint(x, y, z));
-            }
-        }
-        pillar_waypoints_.push_back(waypoints);
-        ROS_INFO("[Pillar] case_%02d: %zu 个航点", c, waypoints.size());
+void MissionManager::loadTraverseConfig() {
+    if (pillar_nav_mode_ != "pcl") {
+        ROS_INFO("[穿越] pillar_nav_mode=%s，不加载穿越地图", pillar_nav_mode_.c_str());
+        return;
     }
 
-    ROS_INFO("[Pillar] 导航模式=%s, 加载 %zu 组航点", pillar_nav_mode_.c_str(),
-             pillar_waypoints_.size());
+    // 参数合法性检查
+    if (cfg_.default_case < 0 || cfg_.default_case > 3) {
+        ROS_ERROR("[穿越] traverse/default_case=%d 非法（必须 0~3），回退 EGO 路径", cfg_.default_case);
+        return;
+    }
+    if (cfg_.force_case < -1 || cfg_.force_case > 3) {
+        ROS_ERROR("[穿越] traverse/force_case=%d 非法（必须 -1 或 0~3），回退 EGO 路径", cfg_.force_case);
+        return;
+    }
+
+    // ---- 墙 + 场地边界 ----
+    XmlRpc::XmlRpcValue wl;
+    if (nh_.getParam("map/walls", wl)) {
+        for (int i = 0; i < wl.size(); i++)
+            if (wl[i].size() >= 4) {
+                SegObs sg;
+                sg.x1 = xmlNum(wl[i][0]);
+                sg.y1 = xmlNum(wl[i][1]);
+                sg.x2 = xmlNum(wl[i][2]);
+                sg.y2 = xmlNum(wl[i][3]);
+                walls_.push_back(sg);
+            }
+    }
+
+    // ---- 4 套 leg2 绕柱段途经点 + 4 个候选柱位 ----
+    for (int cid = 0; cid < 4; cid++) {
+        char key[64];
+        snprintf(key, sizeof(key), "map/via_points_leg2_case%d", cid);
+        loadPointList(nh_, key, via_leg2_[cid]);
+    }
+    loadPointList(nh_, "map/pillar_candidates", pillar_cand_);
+
+    // ---- 悬停扫描点（yaml 里是 map/scan_hover: [x, y] 列表） ----
+    {
+        XmlRpc::XmlRpcValue sh;
+        if (nh_.getParam("map/scan_hover", sh) && sh.size() >= 2) {
+            scan_hover_fx_ = xmlNum(sh[0]);
+            scan_hover_fy_ = xmlNum(sh[1]);
+        }
+        else {
+            ROS_WARN("[穿越] map/scan_hover 读取失败，用默认值 (%.2f, %.2f)",
+                     scan_hover_fx_, scan_hover_fy_);
+        }
+    }
+
+    // ---- 硬性检查 ----
+    for (int cid = 0; cid < 4; cid++) {
+        if (via_leg2_[cid].size() < 2) {
+            ROS_ERROR("[穿越] map/via_points_leg2_case%d 为空或点数不足，回退 EGO 路径", cid);
+            return;
+        }
+    }
+    if (pillar_cand_.size() != 4) {
+        ROS_ERROR("[穿越] map/pillar_candidates 必须是 4 个候选柱位（当前 %zu 个），回退 EGO 路径",
+                  pillar_cand_.size());
+        return;
+    }
+
+    // ---- 一致性检查（只告警，不阻断）----
+    for (int cid = 0; cid < 4; cid++) {
+        const Vec2f &p0 = via_leg2_[cid].front();
+        if (fabs(p0.x - scan_hover_fx_) > 1e-6 || fabs(p0.y - scan_hover_fy_) > 1e-6)
+            ROS_WARN("[穿越] leg2_case%d 首点(%.2f,%.2f) != scan_hover(%.2f,%.2f)，轨迹将从其他点起画！",
+                     cid, p0.x, p0.y, scan_hover_fx_, scan_hover_fy_);
+        const Vec2f &p1  = via_leg2_[cid].back();
+        const Vec2f &ref = via_leg2_[0].back();
+        if (fabs(p1.x - ref.x) > 1e-6 || fabs(p1.y - ref.y) > 1e-6)
+            ROS_WARN("[穿越] leg2_case%d 末点(%.2f,%.2f) 与 case0 末点(%.2f,%.2f) 不一致，"
+                     "投放区以 case0 末点为准！", cid, p1.x, p1.y, ref.x, ref.y);
+    }
+
+    // ---- 关键点位（场地系 -> odom 系绝对坐标）----
+    Vec2f ho  = field_to_odom(scan_hover_fx_, scan_hover_fy_, origin_fx_, origin_fy_);
+    hover_ox_ = ho.x;
+    hover_oy_ = ho.y;
+    Vec2f ep  = field_to_odom(via_leg2_[0].back().x, via_leg2_[0].back().y, origin_fx_, origin_fy_);
+    end_x_    = ep.x;   // 投放区（各 case 末点一致性已在上面检查）
+    end_y_    = ep.y;
+
+    // ---- 启动预检：4 套 leg2 净距一览（正式规划在悬停扫描时按 case 做）----
+    {
+        bool case_ok[4];
+        ROS_INFO("[穿越] 启动预检：4 套 leg2 绕柱段净距一览");
+        for (int cid = 0; cid < 4; cid++) {
+            TraversePlanner tp;
+            tp.plan(via_leg2_[cid], origin_fx_, origin_fy_, walls_, caseCircles(cid),
+                    cfg_.trav_v_max, cfg_.trav_a_max, cfg_.trav_a_lat_max, cfg_.trav_sample_ds);
+            case_ok[cid] = (tp.min_clearance() >= cfg_.trav_inflation);
+            ROS_INFO("[穿越]   case%d（%s）：总长 %.2f m，单程 %.1f s，最小净距 %.3f m %s",
+                     cid, TRAV_CASE_DESC[cid], tp.total_length(), tp.duration(),
+                     tp.min_clearance(), case_ok[cid] ? "✓" : "✗ 不达标！");
+        }
+        // default_case 是兜底，它挂了整个回退链就没了
+        if (!case_ok[cfg_.default_case] && cfg_.trav_force_fly != 1) {
+            ROS_ERROR("[穿越] default_case=%d 净距不达标，回退链失效，回退 EGO 路径！"
+                      "请调整 map/via_points_leg2_case%d", cfg_.default_case, cfg_.default_case);
+            return;
+        }
+        if (cfg_.force_case >= 0 && !case_ok[cfg_.force_case] && cfg_.trav_force_fly != 1) {
+            ROS_ERROR("[穿越] force_case=%d 净距不达标，回退 EGO 路径！"
+                      "请调整对应 via_points 或改 force_case", cfg_.force_case);
+            return;
+        }
+    }
+
+    traverse_cfg_ok_ = true;
+    ROS_INFO("[穿越] 地图加载完成：悬停扫描点 odom(%.2f, %.2f)，投放区 odom(%.2f, %.2f)，定高 %.2f",
+             hover_ox_, hover_oy_, end_x_, end_y_, cfg_.trav_flight_z);
+}
+
+// 组装某个 case 的圆形障碍（两根实际存在的柱子）
+std::vector<CircleObs> MissionManager::caseCircles(int cid) const {
+    std::vector<CircleObs> circles;
+    for (int k = 0; k < 2; k++) {
+        const Vec2f &c = pillar_cand_[TRAV_CASE_PILLARS[cid][k]];
+        CircleObs co;
+        co.x = c.x;
+        co.y = c.y;
+        co.r = pillar_radius_;
+        circles.push_back(co);
+    }
+    return circles;
+}
+
+// leg2 规划报告打印
+void MissionManager::printLeg2Report(int cid) const {
+    ROS_INFO("╔══════════════════════════════════════════════════╗");
+    ROS_INFO("║  leg2 绕柱段规划报告 case%d（%s）", cid, TRAV_CASE_DESC[cid]);
+    ROS_INFO("╚══════════════════════════════════════════════════╝");
+    const std::vector<Vec2f> &via = via_leg2_[cid];
+    for (size_t i = 0; i < via.size(); i++) {
+        Vec2f o = field_to_odom(via[i].x, via[i].y, origin_fx_, origin_fy_);
+        ROS_INFO("  [%2zu] 场地(%5.2f, %5.2f) -> odom(%6.2f, %6.2f)", i, via[i].x, via[i].y, o.x, o.y);
+    }
+    ROS_INFO("  轨迹总长 %.2f m，单程时长 %.1f s，采样点 %zu 个",
+             planner_leg2_.total_length(), planner_leg2_.duration(), planner_leg2_.point_count());
+    ROS_INFO("  碰撞检测：最小净距 %.3f m @ 场地(%.2f, %.2f)，最近障碍：%s",
+             planner_leg2_.min_clearance(), planner_leg2_.min_clearance_pos().x,
+             planner_leg2_.min_clearance_pos().y, planner_leg2_.min_clearance_what().c_str());
+    ROS_INFO("  膨胀要求：%.2f m -> %s", cfg_.trav_inflation,
+             planner_leg2_.min_clearance() >= cfg_.trav_inflation ? "✓ 通过" : "✗ 不通过！");
+}
+
+// 按 case 规划 leg2；返回 true = 规划成功且净距达标
+// （不达标时 planner_leg2_ 里仍持有该 case 的轨迹，供 force_fly 用）
+bool MissionManager::planLeg2ForCase(int cid) {
+    if (!planner_leg2_.plan(via_leg2_[cid], origin_fx_, origin_fy_, walls_, caseCircles(cid),
+                            cfg_.trav_v_max, cfg_.trav_a_max, cfg_.trav_a_lat_max,
+                            cfg_.trav_sample_ds)) {
+        ROS_ERROR("[穿越] case%d 轨迹规划失败（途经点异常）！", cid);
+        return false;
+    }
+    printLeg2Report(cid);
+    return planner_leg2_.min_clearance() >= cfg_.trav_inflation;
+}
+
+// 悬停扫描拿到 case 后的规划入口（含净距回退）
+// 先按 cid 规划，净距不达标回退 default_case；仍不达标看 force_fly。
+// 成功返回 true 并把实际采用的 case 写入 active_case_；false = 全部失败（悬停等人工接管）
+bool MissionManager::tryPlanLeg2(int cid) {
+    if (planLeg2ForCase(cid)) {
+        active_case_ = cid;
+        return true;
+    }
+    if (cid != cfg_.default_case) {
+        ROS_WARN("[穿越] case%d 净距不达标，回退 default_case=%d 重试", cid, cfg_.default_case);
+        if (planLeg2ForCase(cfg_.default_case)) {
+            active_case_ = cfg_.default_case;
+            return true;
+        }
+    }
+    if (cfg_.trav_force_fly == 1) {
+        planLeg2ForCase(cid);   // 把 cid 的（不达标）轨迹重新装入 planner_leg2_
+        active_case_ = cid;
+        ROS_WARN("[穿越] force_fly=1，强行按 case%d 飞行（净距 %.3f < %.3f，危险！）",
+                 cid, planner_leg2_.min_clearance(), cfg_.trav_inflation);
+        return true;
+    }
+    return false;
+}
+
+// 轨迹跟踪（核心）：按航段经过的时间取轨迹点发位置设定点
+//   reverse  false=正向(悬停点->投放区)，true=返程(时间倒放=原路返回)
+//   goal_x/goal_y 到位判定目标（odom 系绝对坐标）
+//   返回 true = 跟踪完成且已到达端点；超时也会返回 true 并告警
+bool MissionManager::trackLeg(bool reverse, double goal_x, double goal_y, const char *label) {
+    double t  = (ros::Time::now() - leg_start_time_).toSec();
+    double T  = planner_leg2_.duration();
+    double qt = reverse ? (T - t) : t;   // 返程 = 时间倒放，实现"原路返回"
+    if (qt < 0.0) qt = 0.0;
+
+    double sx, sy;
+    planner_leg2_.sample(qt, sx, sy);
+
+    // 位置控制掩码（忽略速度/加速度/yaw_rate，与 traverse_node 一致）
+    current_setpoint_.type_mask        = TRAV_TYPE_MASK_POSITION_ONLY;
+    current_setpoint_.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+    current_setpoint_.position.x       = sx;
+    current_setpoint_.position.y       = sy;
+    current_setpoint_.position.z       = cfg_.trav_flight_z;
+    current_setpoint_.yaw              = init_yaw_;
+
+    double cx = local_odom_.pose.pose.position.x;
+    double cy = local_odom_.pose.pose.position.y;
+    double cz = local_odom_.pose.pose.position.z;
+
+    bool arrived = (fabs(cx - goal_x) < cfg_.trav_err_max &&
+                    fabs(cy - goal_y) < cfg_.trav_err_max &&
+                    fabs(cz - cfg_.trav_flight_z) < cfg_.trav_err_max);
+
+    ROS_INFO_THROTTLE(0.5, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f) 当前(%.2f,%.2f,%.2f)",
+                      label, t, T, sx, sy, cx, cy, cz);
+
+    if (t >= T && arrived) return true;
+
+    // 超时兜底：避免卡死（轨迹时长 + 余量仍未到位就进入下一状态）
+    if (t > T + cfg_.trav_timeout_margin) {
+        ROS_WARN("[跟踪%s] 超时(t=%.1f > %.1f+%.1f)，当前(%.2f,%.2f) 强制进入下一状态",
+                 label, t, T, cfg_.trav_timeout_margin, cx, cy);
+        return true;
+    }
+    return false;
+}
+
+// 绝对 odom 坐标定点（穿越段用，不走 init_pos 偏移；速度P控制，与 moveTo 同款）
+bool MissionManager::moveToAbs(double x, double y, double z) {
+    positionControl(Eigen::Vector3f(x, y, z), current_setpoint_);
+    current_setpoint_.yaw = init_yaw_;
+    return reachedTarget(Eigen::Vector3f(x, y, z), cfg_.err_max);
 }

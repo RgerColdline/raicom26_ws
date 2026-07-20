@@ -16,9 +16,11 @@
 #include <std_msgs/String.h>
 #include <std_srvs/Empty.h>
 #include <tf/tf.h>
+#include <XmlRpcValue.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <eigen3/Eigen/Dense>
 #include <iostream>
 #include <limits>
@@ -26,6 +28,25 @@
 // 自定义消息（需根据实际包名调整）
 #include <pcl_detection2/SquareRing.h>
 #include <raicom_vision_laser/DetectionInfo.h>
+
+// 穿越赛段平滑轨迹规划器（从 raicom_vision_laser 拷入，纯计算无 ROS 依赖）
+#include "traverse_planner.h"
+
+// ==================== case -> 候选柱索引映射（全队统一，勿单独改） ====================
+// 候选索引（map/pillar_candidates 顺序固定）：
+//   0=A左(2.7,1.55)  1=A右(3.3,1.55)  2=B左(2.7,2.8)  3=B右(3.3,2.8)
+// 与 traverse_map.yaml、pcl_detection2 模板 pillar_case_0X.png 保持一致
+inline const int TRAV_CASE_PILLARS[4][2] = {{0, 2}, {0, 3}, {1, 2}, {1, 3}};
+inline const char* TRAV_CASE_DESC[4] = {
+    "A左+B左（两柱都在 x=2.7）",
+    "A左+B右（(2.7,1.55)+(3.3,2.8)）",
+    "A右+B左（(3.3,1.55)+(2.7,2.8)）",
+    "A右+B右（两柱都在 x=3.3）"
+};
+
+// 穿越段轨迹跟踪用的位置控制掩码：忽略 vx/vy/vz/afx/afy/afz + IGNORE_YAW_RATE=2048
+// （与 traverse_node 一致，2026-07-19 仿真新规，不带 512）
+inline const uint16_t TRAV_TYPE_MASK_POSITION_ONLY = 8 + 16 + 32 + 64 + 128 + 256 + 2048;
 
 // ============================================================================
 // 状态机枚举
@@ -50,10 +71,12 @@ enum MissionState {
     READY_NAV_TO_RING_BACK,       // 返程前先飞到来时的目标点，再开始返程导航
     RETURN_CROSS_RING,
 
-    // === 柱子检测导航（PCL模式） ===
-    PILLAR_DETECT,              // 悬停等待PCL检测柱子配置
-    NAV_PILLAR_WAYPOINTS,       // 按顺序飞航点（正向）
-    RETURN_PILLAR_WAYPOINTS,    // 反向飞航点（返程）
+    // === 穿越赛段（traverse 融合：pillar_nav_mode="pcl" 时替换 EGO 路径） ===
+    TRAVERSE_TO_SCAN,       // 穿环后飞到悬停扫描点
+    TRAVERSE_SCAN,          // 悬停扫描选 case + 现场规划 leg2
+    TRAVERSE_LEG2,          // leg2 绕柱段轨迹跟踪（悬停点 -> 投放区）
+    TRAVERSE_READY_RETURN,  // 射击后先回投放区（轨迹终点），再开始倒放
+    TRAVERSE_RETURN_LEG2,   // leg2 时间倒放原路返回（投放区 -> 悬停扫描点）
 
     RETURN,
     LAND,
@@ -193,19 +216,40 @@ class MissionManager
     // 根据检测位姿动态计算穿越点，失败返回 false（用硬编码回退）
     bool computeRingApproachWP(Waypoint &front_wp, Waypoint &back_wp) const;
 
-    // === 柱子检测导航 ===
-    std::string pillar_nav_mode_;                               // "ego" 或 "pcl"
-    int pillar_case_id_                  = -1;                  // 检测到的配置ID (0-3), -1=未检测
-    std::vector<std::vector<Waypoint>> pillar_waypoints_;      // 4种配置的航点序列
-    size_t pillar_wp_index_              = 0;                   // 当前航点索引
-    size_t pillar_wp_total_              = 0;                   // 当前配置总航点数
-    float pillar_detect_timeout_         = 5.0f;                // 检测超时
-    float pillar_waypoint_tolerance_     = 0.3f;                // 航点到达判定距离
+    // === 穿越赛段（traverse_node 融合：悬停扫描选 case + leg2 平滑轨迹 + 时间倒放返程） ===
+    std::string pillar_nav_mode_;       // "ego"=EGO路径  "pcl"=穿越平滑轨迹（沿用旧参数名）
+    int detected_case_   = -1;          // pcl_detection2 检测结果(0~3)，-1=未收到
+    int active_case_     = -1;          // 实际采用的 case（规划成功后锁定）
+    int scan_sub_state_  = 0;           // TRAVERSE_SCAN 子状态：0入口 1等结果 9失败悬停
+    ros::Time scan_entry_time_;         // 进入扫描子状态的时刻
+    ros::Time leg_start_time_;          // 当前航段轨迹跟踪的起始时刻
+    bool traverse_cfg_ok_ = false;      // 地图读取+启动预检是否通过（不通过回退 EGO 路径）
 
-    void loadPillarConfig();                                    // 加载柱子导航YAML
-    void handlePillarDetect();                                  // PILLAR_DETECT 状态
-    void handleNavPillarWaypoints();                            // 正向飞航点
-    void handleReturnPillarWaypoints();                         // 反向飞航点
+    TraversePlanner planner_leg2_;      // leg2 绕柱段（悬停扫描拿到 case 后现场规划）
+    double hover_ox_ = 0, hover_oy_ = 0; // 悬停扫描点（odom 系绝对坐标）
+    double end_x_ = 0, end_y_ = 0;      // 轨迹终点=投放区（odom 系绝对坐标）
+
+    // 地图数据（yaml 里全是场地系官方坐标，规划器内部转 odom）
+    double origin_fx_ = 0.65, origin_fy_ = 0.75;  // 出生点（场地系）= odom 原点
+    double scan_hover_fx_ = 3.00, scan_hover_fy_ = 0.75;  // 悬停扫描点（场地系）
+    double pillar_radius_ = 0.1;                  // 圆柱实际半径
+    std::vector<Vec2f> pillar_cand_;              // 4 个候选柱位（索引见 TRAV_CASE_PILLARS）
+    std::vector<Vec2f> via_leg2_[4];              // 4 套 leg2 途经点（按 case）
+    std::vector<SegObs> walls_;                   // 线段障碍（墙 + 场地边界）
+
+    void loadTraverseConfig();                      // 读 traverse_map.yaml + 4 case 启动预检
+    std::vector<CircleObs> caseCircles(int cid) const; // 组装某 case 的两根圆柱障碍
+    bool planLeg2ForCase(int cid);                  // 按 case 规划 leg2，返回净距是否达标
+    bool tryPlanLeg2(int cid);                      // 规划入口（不达标回退 default_case/force_fly）
+    void printLeg2Report(int cid) const;            // leg2 规划报告打印
+    bool trackLeg(bool reverse, double goal_x, double goal_y, const char* label); // 轨迹跟踪
+    bool moveToAbs(double x, double y, double z);   // 绝对 odom 坐标定点（不走 init_pos 偏移）
+
+    void handleTraverseToScan();                    // TRAVERSE_TO_SCAN 状态
+    void handleTraverseScan();                      // TRAVERSE_SCAN 状态
+    void handleTraverseLeg2();                      // TRAVERSE_LEG2 状态
+    void handleTraverseReadyReturn();               // TRAVERSE_READY_RETURN 状态
+    void handleTraverseReturnLeg2();                // TRAVERSE_RETURN_LEG2 状态
 
     // PID控制相关
     ros::Time last_pid_control_time_;
@@ -297,6 +341,21 @@ class MissionManager
         float track_min_confidence       = 0.08f;  // 最低保留置信度
         int track_max_candidates         = 3;      // 最大候选数
         float track_ema_alpha            = 0.3f;   // EMA 平滑系数
+
+        // === 穿越赛段参数（traverse_map.yaml 的 traverse/ 段，pillar_nav_mode="pcl" 时生效） ===
+        float trav_flight_z        = 1.3f;   // 穿越段定高（规则锁死）
+        float trav_err_max         = 0.15f;  // 轨迹端点到位容差（通道窄，比主流程紧）
+        double trav_v_max          = 0.5;    // 最大线速度
+        double trav_a_max          = 0.4;    // 最大线加速度
+        double trav_a_lat_max      = 0.6;    // 最大向心加速度（弯道限速）
+        double trav_inflation      = 0.3;    // 障碍膨胀半径（验收底线）
+        double trav_sample_ds      = 0.01;   // 轨迹采样步长
+        int trav_force_fly         = 0;      // 1=碰撞检测不通过也强行飞（仅调试用）
+        float trav_timeout_margin  = 15.0f;  // 轨迹跟踪超时余量(s)，超时强制进下一状态
+        float scan_hover_time      = 3.0f;   // 悬停扫描时长(s)：收到 case 且满该时长即走
+        float scan_timeout         = 4.0f;   // 扫描超时(s)：超时未收到 case 用 default_case
+        int default_case           = 1;      // 检测失败/超时回退 case
+        int force_case             = -1;     // >=0：跳过检测与悬停，直接用该 case（仿真/应急）
     } cfg_;
 
     Waypoint wp_ring_front_;                       // 出发穿环前悬停点

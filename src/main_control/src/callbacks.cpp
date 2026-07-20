@@ -98,6 +98,14 @@ void MissionManager::ringDetectCallback(const pcl_detection2::SquareRing::ConstP
 }
 
 void MissionManager::pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg) {
-    pillar_case_id_ = msg->data;
-    ROS_INFO_THROTTLE(2.0, "[Pillar] 收到柱子配置 #%d", pillar_case_id_);
+    // pcl_detection2 模板匹配输出的柱子布局（0~3，编号与 traverse_map.yaml/模板一致）
+    if (msg->data >= 0 && msg->data < 4) {
+        if (detected_case_ != msg->data)
+            ROS_INFO("[穿越] 收到柱子布局检测结果 case%d（%s）", msg->data,
+                     TRAV_CASE_DESC[msg->data]);
+        detected_case_ = msg->data;
+    }
+    else {
+        ROS_WARN("[穿越] 收到非法 case_id=%d，忽略", msg->data);
+    }
 }
