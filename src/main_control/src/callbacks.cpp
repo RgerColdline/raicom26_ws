@@ -102,13 +102,6 @@ void MissionManager::yoloDownDetectCallback(const raicom_vision_laser::Detection
                       best_cls.c_str(), best_conf, down_vote_a_, down_vote_b_);
 }
 
-void MissionManager::hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg) {
-    if (msg->data) {
-        hit_confirmed_ = true;
-        ROS_INFO("裁判确认击中目标！");
-    }
-}
-
 void MissionManager::ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg) {
     if (msg->corners.size() >= 4) {
         ring_detection.detected    = true;

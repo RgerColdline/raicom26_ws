@@ -60,12 +60,11 @@ enum MissionState {
     NAV_TO_DROP_AREA,         // 导航至物资投放区
     HOVER_RECOG_DROP,         // 悬停识别投放区标识
     DROP_SUPPLY,              // 投放物资箱
-    MOVE_TO_ATTACK_AREA,      // 移动至攻击目标识别区
+    MOVE_TO_ATTACK_AREA,      // 移动至攻击目标识别区（2026-07-21 起被跳过：投货后直接进 RECOG_ATTACK_TARGET 去射击点）
     RECOG_ATTACK_TARGET,      // 识别正确攻击目标
     MOVE_TO_FRONT_OF_TARGET,  // 移动到目标正前方
     ALIGN_ATTACK_TARGET,      // 前视像素对准目标
-    SIMULATE_ATTACK,          // 激光指示攻击
-    WAIT_HIT_CONFIRMATION,    // 等待裁判确认
+    SIMULATE_ATTACK,          // 激光指示攻击（2026-07-21 起射完直接返程，无等待裁判确认环节）
 
     NAV_TO_RING_BACK,
     READY_NAV_TO_RING_BACK,       // 返程前先飞到来时的目标点，再开始返程导航
@@ -110,7 +109,6 @@ class MissionManager
     ros::Subscriber detected_target_sub_;
     ros::Subscriber yolo_detect_sub_;
     ros::Subscriber yolo_down_detect_sub_;  // 下视 YOLO（投货悬停字母投票）
-    ros::Subscriber hit_confirm_sub_;
     ros::Subscriber ring_sub_;
     ros::Subscriber pillar_sub_;
     ros::Publisher pillar_start_pub_;
@@ -158,7 +156,6 @@ class MissionManager
     };
 
     Eigen::Vector3f attack_target_world_;
-    bool hit_confirmed_ = false;
 
     // 定点射击目标（vision_laser 状态6）
     // 注意：以下两个变量存【相对init_pos的偏移】(=cfg.shoot_*_x/y)，传给 moveTo() 由其内部加 init_pos
@@ -329,16 +326,16 @@ class MissionManager
         float shoot_detect_timeout       = 60.0f;  // 目标检测超时 (s)
         float shoot_stable_time          = 0.5f;   // 射击前稳定时间 (s)
         float shoot_duration             = 1.5f;   // 激光射击后等待时间(s)（stm32_shooter 开->1s->关 + 余量）
-        float shoot_z                    = 1.5f;   // 射击高度(相对init_pos)
+        float shoot_z                    = 1.0f;   // 射击高度(相对init_pos)（2026-07-21 由1.5改为1.0）
 
         // === mission_flow 融合：投货参数（/servo_control -> stm32_shooter） ===
         // 固件: 0°=货舱开(投货), 160°=货舱关(复位); stm32_shooter: 发<135->0x03(开), 发>=135->0x04(关)
         int   cargo_drop_angle           = 0;      // 投货(开舱): 发0(<135) -> 0x03
         int   cargo_reset_angle          = 180;    // 复位(关舱): 发180(>=135) -> 0x04
-        float cargo_hold_time            = 4.0f;   // 货舱保持打开时间(s)
+        float cargo_hold_time            = 2.0f;   // 投货悬停时间(s)：开舱后在投货高度保持的时间（2026-07-21 由4.0改为2.0）
         float descent_timeout            = 10.0f;  // 下降到投货高度超时(s); 超时未到也在当前位置投货
         float drop_hover_time            = 2.0f;   // 投货前在投放点悬停时间(s)
-        float drop_z                     = 0.3f;   // 投货下降高度(相对init_pos)
+        float drop_z                     = 0.8f;   // 投货下降高度(相对init_pos)（2026-07-21 由0.3改为0.8）
 
         // === mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ===
         float yolo_img_center_x          = 160.0f; // 前视YOLO图像中心X(图像320x240)
@@ -392,7 +389,6 @@ class MissionManager
     void detectedTargetCallback(const std_msgs::String::ConstPtr &msg);
     void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
     void yoloDownDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
-    void hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg);
     void ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg);
     void pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg);
 
@@ -433,7 +429,6 @@ class MissionManager
     void handleMoveToFrontOfTarget();
     void handleAlignAttackTarget();
     void handleSimulateAttack();
-    void handleWaitHitConfirmation();
     void handleNavToRingBack();
     void handleReadyNavToRingBack();
     void handleReturnCrossRing();
