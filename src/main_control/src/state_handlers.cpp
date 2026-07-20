@@ -267,16 +267,18 @@ void MissionManager::handleDropSupply() {
             ROS_INFO("[投货] 投货完成，货舱复位(角度 %d -> 0x04 -> 货舱关闭) x3",
                      cfg_.cargo_reset_angle);
 
-            // 投货完成，前往攻击目标识别区（升回 1.5）
+            // 投货完成：2026-07-21 起不再升回攻击区(1.5m)，直接按悬停识别出的字母
+            // 去对应射击点（z=shoot_z=1.0），跳过 MOVE_TO_ATTACK_AREA
             drop_sub_state_   = 0;
-            current_state_    = MOVE_TO_ATTACK_AREA;
+            current_state_    = RECOG_ATTACK_TARGET;
             nav_goal_sent_    = false;
             state_start_time_ = now;
         }
     }
 }
 
-// 8.7 升回攻击区高度（mission_flow：投放区=攻击区，仅升回 z=1.5 后前视识别）
+// 8.7 升回攻击区高度【2026-07-21 起弃用/被跳过】：投货后直接进 RECOG_ATTACK_TARGET 飞去
+// 射击点(z=1.0)，不再先升回攻击区 1.5m。本状态保留仅为可回退，正常流程不会进入。
 void MissionManager::handleMoveToAttackArea() {
     // 投放区与攻击区为同一点(-0.45,-2.0)，投货后只需升回攻击区高度(1.5)即可识别射击
     if (moveTo(wp_attack_area_)) {
@@ -298,13 +300,12 @@ void MissionManager::handleMoveToAttackArea() {
     }
 }
 
-// 8.8 选择攻击目标射击点（2026-07-20 固定映射，免前视识别）
+// 8.8 选择攻击目标射击点（2026-07-20 固定映射，免前视识别；2026-07-21 起投货完直接进入本状态）
 // 左射击点上方永远是 A 靶，右射击点上方永远是 B 靶（shoot/a_side 可配镜像）。
 // 投货悬停时下视投票出的 shoot_letter_ -> 直接飞对应射击点，不再等前视识别。
 void MissionManager::handleRecognizeAttackTarget() {
-    // 悬停在攻击区
-    moveTo(wp_attack_area_);
-
+    // 纯决策状态（不发位置指令）：2026-07-21 起不再先悬停攻击区升回1.5m，
+    // 选定射击点后下一帧即由 ALIGN_ATTACK_TARGET 从投货高度(0.8)直飞射击点(z=1.0)。
     bool letter_is_a = (shoot_letter_ != "B");   // 非 B 一律按 A 处置（兜底字母也走这）
     bool go_left     = (letter_is_a == a_on_left_);
 
@@ -388,27 +389,14 @@ void MissionManager::handleSimulateAttack() {
         shoot_time_      = ros::Time::now();
     }
 
-    // 等 shoot_duration 后进入等待确认（stm32_shooter 开->1s->关序列完成）
+    // 等 shoot_duration（stm32_shooter 开->1s->关序列完成）后直接返程
+    // 2026-07-21：删除"等待裁判确认"悬停环节（原 WAIT_HIT_CONFIRMATION），射完就走
     if ((ros::Time::now() - shoot_time_).toSec() > cfg_.shoot_duration) {
-        ROS_INFO("[射击] 射击完成，等待裁判确认");
-        current_state_    = WAIT_HIT_CONFIRMATION;
-        state_start_time_ = ros::Time::now();
-    }
-}
-
-// 8.12 等待裁判确认
-void MissionManager::handleWaitHitConfirmation() {
-    hover();
-    if (timeout(5) || hit_confirmed_) {
         // PCL模式=穿越平滑轨迹：先回投放区再 leg2 倒放；EGO模式去环后方
         current_state_ = (pillar_nav_mode_ == "pcl" && traverse_cfg_ok_) ? TRAVERSE_READY_RETURN
                                                                          : READY_NAV_TO_RING_BACK;
-        // READY_NAV_TO_RING_BACK  // [注释] 原有EGO路径
         state_start_time_ = ros::Time::now();
-        if (hit_confirmed_)
-            ROS_INFO("裁判确认击中，返回");
-        else
-            ROS_WARN("等待击中确认超时，返回");
+        ROS_INFO("[射击] 射击完成，直接返程");
     }
 }
 

@@ -99,15 +99,15 @@ void MissionManager::loadParameters() {
     nh_.param<float>("shoot/detect_timeout", cfg_.shoot_detect_timeout, 60.0f);
     nh_.param<float>("shoot/stable_time", cfg_.shoot_stable_time, 0.5f);
     nh_.param<float>("shoot/duration", cfg_.shoot_duration, 1.5f);
-    nh_.param<float>("shoot/z", cfg_.shoot_z, 1.5f);
+    nh_.param<float>("shoot/z", cfg_.shoot_z, 1.0f);
 
     // === mission_flow 融合：投货参数（/servo_control -> stm32_shooter） ===
     nh_.param<int>("cargo/drop_angle", cfg_.cargo_drop_angle, 0);
     nh_.param<int>("cargo/reset_angle", cfg_.cargo_reset_angle, 180);
-    nh_.param<float>("cargo/hold_time", cfg_.cargo_hold_time, 4.0f);
+    nh_.param<float>("cargo/hold_time", cfg_.cargo_hold_time, 2.0f);
     nh_.param<float>("cargo/descent_timeout", cfg_.descent_timeout, 10.0f);
     nh_.param<float>("cargo/drop_hover_time", cfg_.drop_hover_time, 2.0f);
-    nh_.param<float>("cargo/drop_z", cfg_.drop_z, 0.3f);
+    nh_.param<float>("cargo/drop_z", cfg_.drop_z, 0.8f);
 
     // === mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ===
     nh_.param<float>("yolo/img_center_x", cfg_.yolo_img_center_x, 160.0f);
@@ -158,8 +158,6 @@ void MissionManager::initROSCommunication() {
         nh_.subscribe("/detected_target", 10, &MissionManager::detectedTargetCallback, this);
     yolo_detect_sub_ = nh_.subscribe("/yolo_front_detect", 10, &MissionManager::yoloDetectCallback, this);
     yolo_down_detect_sub_ = nh_.subscribe("/yolo_down_detect", 10, &MissionManager::yoloDownDetectCallback, this);
-    hit_confirm_sub_ =
-        nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
     ring_sub_ =
         nh_.subscribe("/pcl_detection2/square_ring", 10, &MissionManager::ringDetectCallback, this);
     pillar_sub_       = nh_.subscribe("/pcl_detection2/pillar_case_id", 10,
@@ -566,7 +564,6 @@ void MissionManager::run() {
         case MOVE_TO_FRONT_OF_TARGET: handleMoveToFrontOfTarget(); break;
         case ALIGN_ATTACK_TARGET    : handleAlignAttackTarget(); break;
         case SIMULATE_ATTACK        : handleSimulateAttack(); break;
-        case WAIT_HIT_CONFIRMATION  : handleWaitHitConfirmation(); break;
         case NAV_TO_RING_BACK       : handleNavToRingBack(); break;
         case READY_NAV_TO_RING_BACK : handleReadyNavToRingBack(); break;
         case RETURN_CROSS_RING      : handleReturnCrossRing(); break;
