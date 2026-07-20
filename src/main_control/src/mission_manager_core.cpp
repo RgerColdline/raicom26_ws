@@ -114,6 +114,12 @@ void MissionManager::loadParameters() {
     nh_.param<float>("yolo/target_timeout", cfg_.yolo_target_timeout, 0.5f);
     nh_.param<float>("yolo/detect_timeout", cfg_.yolo_detect_timeout, 60.0f);
 
+    // === 下视字母识别 + 固定映射射击（2026-07-20） ===
+    nh_.param<int>("down/min_votes", cfg_.down_min_votes, 3);
+    nh_.param<std::string>("shoot/a_side", cfg_.shoot_a_side, "left");
+    a_on_left_ = (cfg_.shoot_a_side != "right");
+    shoot_letter_ = cfg_.attack_real_target;   // 初始=兜底字母，投货悬停时投票覆盖
+
     ROS_INFO("参数加载完成。");
 }
 
@@ -132,6 +138,7 @@ void MissionManager::initROSCommunication() {
     detected_target_sub_ =
         nh_.subscribe("/detected_target", 10, &MissionManager::detectedTargetCallback, this);
     yolo_detect_sub_ = nh_.subscribe("/yolo_front_detect", 10, &MissionManager::yoloDetectCallback, this);
+    yolo_down_detect_sub_ = nh_.subscribe("/yolo_down_detect", 10, &MissionManager::yoloDownDetectCallback, this);
     hit_confirm_sub_ =
         nh_.subscribe("/referee/hit_confirmed", 10, &MissionManager::hitConfirmCallback, this);
     ring_sub_ =

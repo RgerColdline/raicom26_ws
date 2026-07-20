@@ -36,19 +36,26 @@ ring_track:
   max_candidates: 3             # 最大候选数
   ema_alpha: 0.3                # EMA 平滑系数 (0~1, 越小越平滑)
 
-# ==================== 定点射击参数（vision_laser 状态6，抛弃视觉PID） ====================
+# ==================== 定点射击参数（2026-07-20 固定映射：投货识别字母 -> 对应射击点） ====================
+# 左射击点上方永远是 A 靶，右射击点上方永远是 B 靶；投货悬停下视识别字母后直接飞对应点，免前视识别。
 shoot:
   left_x: -0.45                  # 左射击点X（相对起飞点）：用户指定(-0.45,-1.5)
-  left_y: -1.5                   # 左射击点Y（+Y侧，目标在图像左->飞左）
+  left_y: -1.5                   # 左射击点Y（+Y侧），上方永远是 A 靶
   right_x: -0.45                 # 右射击点X：用户指定(-0.45,-2.5)
-  right_y: -2.5                  # 右射击点Y（-Y侧，目标在图像右->飞右）
-  default_x: -0.45               # 默认射击点X：投放区(-0.45,-2.0)居中
-  default_y: -2.0                # 默认射击点Y
-  left_right_threshold: 20.0     # 左右判断像素阈值（前视YOLO 320x240 中心160）
-  detect_timeout: 60.0           # 目标检测超时 (s)
+  right_y: -2.5                  # 右射击点Y（-Y侧），上方永远是 B 靶
+  a_side: "left"                 # A 靶固定在哪侧："left"=左A右B（默认）；"right"=左B右A（赛场镜像时改这里，免重编译）
+  default_x: -0.45               # 【已废弃】固定映射流程不再使用（旧前视识别超时的兜底点）
+  default_y: -2.0                # 【已废弃】
+  left_right_threshold: 20.0     # 【已废弃】固定映射流程不再做前视左右判决
+  detect_timeout: 60.0           # 【已废弃】
   stable_time: 0.5               # 射击前稳定时间 (s)
   duration: 1.5                  # 激光射击后等待时间(s)（stm32_shooter 开->1s->关+余量）
   z: 1.5                         # 射击高度（相对init_pos，与投放区同高）
+
+# ==================== 下视字母识别（投货悬停时投票 A/B，决定射击哪个靶标） ====================
+# 每帧最多投一票（取该帧置信度最高的 A/B 检测），悬停结束按多数票定 shoot_letter。
+down:
+  min_votes: 3                   # 某字母得票 >= 该值才采用，否则回退 detection/attack_real_target 兜底字母
 
 # ==================== 像素PID参数 ====================
 PIX_VEL_P: 0.003                    # 像素误差比例系数
@@ -93,7 +100,7 @@ wp_attack_area_z: 1.5
 # 识别参数
 detection:
   min_confidence: 0.4           # 目标检测最小置信度阈值（前视YOLO，与yolo_front_detector.confidence一致）
-  attack_real_target: "A" # 真实目标字母（A或B），前视时只匹配此字母，忽略干扰目标
+  attack_real_target: "A"       # 兜底字母（A或B）：投货悬停下视识别票数不足时按此字母射击
 
 drop:
   # 投放阶段调参
@@ -125,6 +132,7 @@ cargo:
   drop_z: 0.3                 # 投货下降高度(相对init_pos)
 
 # ==================== mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ====================
+# 【2026-07-20 注】固定映射射击后前视不再参与射击点判决，以下参数仅遗留兼容，不再影响流程
 yolo:
   img_center_x: 160.0         # 前视YOLO图像中心X(图像320x240)
   target_timeout: 0.5         # 检测结果有效期(s), 超过算目标丢失
@@ -139,3 +147,13 @@ yolo_front_detector:
   show_image: true            # 是否显示检测结果图像
   image_topic: "/camera/color/image_raw"  # 前视摄像头话题（astra相机）
   window_name: "YOLO Front Detection"
+
+# ==================== 下视 YOLO 检测节点私有参数（Python 节点 yolo_down_detector 使用） ====================
+# 投货悬停时识别投放区字母 A/B（投票决定射击靶标）；weights_path 在 main_control.launch 里设置
+yolo_down_detector:
+  device: "cuda:0"            # 推理设备：jetson 用 cuda:0（无 GPU 改 cpu）
+  confidence: 0.4             # 置信度阈值
+  imgsz: 320                  # 模型输入尺寸（与压缩图 320x240 一致）
+  show_image: true            # 是否显示检测结果图像
+  image_topic: "/usb_cam/image_raw"       # 下视摄像头话题（usb_cam，main_control_uav.sh 已启动）
+  window_name: "YOLO Down Detection"

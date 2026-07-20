@@ -186,7 +186,8 @@ void MissionManager::handleNavToDropArea() {
     // PCL模式用moveTo（不依赖EGO），EGO模式用navTo
     bool drop_arrived = (pillar_nav_mode_ == "pcl") ? moveTo(drop_target) : navTo(drop_target);
     if (drop_arrived) {
-        // mission_flow 融合：到达投放区，进入悬停投货流程（不再做下视识别投放标识）
+        // mission_flow 融合：到达投放区，进入悬停投货流程
+        // 2026-07-20：悬停期间开启下视字母投票（决定射击 A/B 靶）
         current_state_      = HOVER_RECOG_DROP;
         drop_sub_state_     = 0;
         drop_hover_start_   = ros::Time(0);
@@ -194,7 +195,11 @@ void MissionManager::handleNavToDropArea() {
         nav_goal_sent_      = false;
         nav_status_         = 0;
         state_start_time_   = ros::Time::now();
-        ROS_INFO("到达投放区，开始 mission_flow 悬停投货流程");
+
+        down_vote_a_ = 0;
+        down_vote_b_ = 0;
+        down_voting_ = true;
+        ROS_INFO("到达投放区，开始悬停投货流程 + 下视字母识别投票");
     }
 }
 
@@ -213,6 +218,18 @@ void MissionManager::handleHoverRecognizeDrop() {
                       cfg_.drop_hover_time - (ros::Time::now() - drop_hover_start_).toSec());
 
     if ((ros::Time::now() - drop_hover_start_).toSec() > cfg_.drop_hover_time) {
+        // 悬停结束：关闭投票窗口，按票数决定射击字母（票数不足回退兜底字母）
+        down_voting_ = false;
+        if (down_vote_a_ >= cfg_.down_min_votes || down_vote_b_ >= cfg_.down_min_votes) {
+            shoot_letter_ = (down_vote_a_ >= down_vote_b_) ? "A" : "B";
+            ROS_INFO("[投货] ✓ 下视字母识别完成：%s（A=%d 票 B=%d 票）-> 射击 %s 靶",
+                     shoot_letter_.c_str(), down_vote_a_, down_vote_b_, shoot_letter_.c_str());
+        } else {
+            shoot_letter_ = cfg_.attack_real_target;
+            ROS_WARN("[投货] ⚠ 下视字母票数不足（A=%d B=%d，需≥%d），回退兜底字母 %s",
+                     down_vote_a_, down_vote_b_, cfg_.down_min_votes, shoot_letter_.c_str());
+        }
+
         ROS_INFO("[投货] 悬停 %.1fs 完成，开始下降投货", cfg_.drop_hover_time);
         drop_sub_state_   = 1;  // 进入下降阶段
         state_start_time_ = ros::Time::now();
@@ -293,14 +310,14 @@ void MissionManager::handleMoveToAttackArea() {
         current_state_    = RECOG_ATTACK_TARGET;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
-        // 重置前视匹配状态，等待 /yolo_front_detect 回调填充
+        // 重置前视匹配状态（仅日志用；射击点选择已改为固定映射，不依赖前视）
         front_target_matched_ = false;
         matched_target_.clear();
         matched_center_x_   = 0.0f;
         matched_center_y_   = 0.0f;
         last_matched_time_  = ros::Time(0);
-        ROS_INFO("升回攻击区高度(%.2f)，开始前视识别目标 %s", cfg_.shoot_z,
-                 cfg_.attack_real_target.c_str());
+        ROS_INFO("升回攻击区高度(%.2f)，按投货识别字母 %s 选择射击点", cfg_.shoot_z,
+                 shoot_letter_.c_str());
     }
     else {
         ROS_INFO_THROTTLE(0.5, "[攻击] 升回攻击区高度中... 当前 z=%.2f",
@@ -308,62 +325,25 @@ void MissionManager::handleMoveToAttackArea() {
     }
 }
 
-// 8.8 识别攻击目标（mission_flow 状态5 Sub1：前视找 target，判左/右/中，设射击点偏移）
+// 8.8 选择攻击目标射击点（2026-07-20 固定映射，免前视识别）
+// 左射击点上方永远是 A 靶，右射击点上方永远是 B 靶（shoot/a_side 可配镜像）。
+// 投货悬停时下视投票出的 shoot_letter_ -> 直接飞对应射击点，不再等前视识别。
 void MissionManager::handleRecognizeAttackTarget() {
     // 悬停在攻击区
     moveTo(wp_attack_area_);
 
-    // 检查目标是否在有效期内（mission_flow 的 target_timeout 机制）
-    bool target_valid = front_target_matched_ &&
-                        ((ros::Time::now() - last_matched_time_).toSec() < cfg_.yolo_target_timeout);
+    bool letter_is_a = (shoot_letter_ != "B");   // 非 B 一律按 A 处置（兜底字母也走这）
+    bool go_left     = (letter_is_a == a_on_left_);
 
-    if (target_valid) {
-        ROS_INFO("[识别] 检测到目标 %s, 像素(%.1f, %.1f)",
-                 matched_target_.c_str(), matched_center_x_, matched_center_y_);
+    shoot_target_x_ = go_left ? cfg_.shoot_left_x : cfg_.shoot_right_x;
+    shoot_target_y_ = go_left ? cfg_.shoot_left_y : cfg_.shoot_right_y;
 
-        // 判断目标在图像左/右/中（前视不镜像：图像左=机体左=+Y，图像右=-Y）
-        if (matched_center_x_ < (cfg_.yolo_img_center_x - cfg_.shoot_left_right_threshold)) {
-            // 目标在图像左 -> 左射击点(+Y 侧)
-            shoot_target_x_ = cfg_.shoot_left_x;
-            shoot_target_y_ = cfg_.shoot_left_y;
-            ROS_INFO("[识别] 目标偏左(像素 %.1f)，前往左射击点(%.2f, %.2f)",
-                     matched_center_x_, shoot_target_x_, shoot_target_y_);
-            current_state_    = ALIGN_ATTACK_TARGET;
-            state_start_time_ = ros::Time::now();
-        }
-        else if (matched_center_x_ > (cfg_.yolo_img_center_x + cfg_.shoot_left_right_threshold)) {
-            // 目标在图像右 -> 右射击点(-Y 侧)
-            shoot_target_x_ = cfg_.shoot_right_x;
-            shoot_target_y_ = cfg_.shoot_right_y;
-            ROS_INFO("[识别] 目标偏右(像素 %.1f)，前往右射击点(%.2f, %.2f)",
-                     matched_center_x_, shoot_target_x_, shoot_target_y_);
-            current_state_    = ALIGN_ATTACK_TARGET;
-            state_start_time_ = ros::Time::now();
-        }
-        else {
-            // 目标在中心附近 -> 默认射击点
-            shoot_target_x_ = cfg_.shoot_default_x;
-            shoot_target_y_ = cfg_.shoot_default_y;
-            ROS_INFO("[识别] 目标在中心(像素 %.1f)，前往默认射击点(%.2f, %.2f)",
-                     matched_center_x_, shoot_target_x_, shoot_target_y_);
-            current_state_    = ALIGN_ATTACK_TARGET;
-            state_start_time_ = ros::Time::now();
-        }
-        return;
-    }
+    ROS_INFO("[识别] 投货识别字母 = %s -> 射击 %s 靶（%s射击点 %.2f, %.2f）",
+             shoot_letter_.c_str(), letter_is_a ? "A" : "B",
+             go_left ? "左" : "右", shoot_target_x_, shoot_target_y_);
 
-    // 未检测到有效目标，继续等待
-    ROS_WARN_THROTTLE(1.0, "[识别] 等待目标 %s 出现...", cfg_.attack_real_target.c_str());
-
-    // 超时保护：超时走默认射击点
-    if ((ros::Time::now() - state_start_time_).toSec() > cfg_.yolo_detect_timeout) {
-        ROS_WARN("[识别] 目标检测超时(%.0fs)，使用默认射击点(%.2f, %.2f)",
-                 cfg_.yolo_detect_timeout, cfg_.shoot_default_x, cfg_.shoot_default_y);
-        shoot_target_x_   = cfg_.shoot_default_x;
-        shoot_target_y_   = cfg_.shoot_default_y;
-        current_state_    = ALIGN_ATTACK_TARGET;
-        state_start_time_ = ros::Time::now();
-    }
+    current_state_    = ALIGN_ATTACK_TARGET;
+    state_start_time_ = ros::Time::now();
 }
 
 // 8.9 移动到目标正前方
@@ -427,7 +407,8 @@ void MissionManager::handleSimulateAttack() {
         ROS_INFO("║  射击坐标: (%.3f, %.3f, %.3f)",
                  local_odom_.pose.pose.position.x, local_odom_.pose.pose.position.y,
                  local_odom_.pose.pose.position.z);
-        ROS_INFO("║  识别目标: %s", cfg_.attack_real_target.c_str());
+        ROS_INFO("║  投货识别字母: %s -> 射击 %s 靶", shoot_letter_.c_str(),
+                 (shoot_letter_ != "B") ? "A" : "B");
         ROS_INFO("╚════════════════════════════════════════╝");
 
         shoot_triggered_ = true;

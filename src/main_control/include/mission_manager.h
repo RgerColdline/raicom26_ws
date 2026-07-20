@@ -86,6 +86,7 @@ class MissionManager
     ros::Subscriber nav_status_sub_;
     ros::Subscriber detected_target_sub_;
     ros::Subscriber yolo_detect_sub_;
+    ros::Subscriber yolo_down_detect_sub_;  // 下视 YOLO（投货悬停字母投票）
     ros::Subscriber hit_confirm_sub_;
     ros::Subscriber ring_sub_;
     ros::Subscriber pillar_sub_;
@@ -147,6 +148,15 @@ class MissionManager
     float       matched_center_x_     = 0.0f;
     float       matched_center_y_     = 0.0f;
     ros::Time   last_matched_time_;
+
+    // === 下视字母识别（投货悬停投票，2026-07-20 固定映射射击流程） ===
+    // 投货悬停时对下视检测到的字母 A/B 投票（只会是 A 或 B），悬停结束按多数票
+    // 定 shoot_letter_；射击按固定映射飞对应射击点：左=A 靶、右=B 靶（a_side 可配）。
+    std::string shoot_letter_ = "A";   // 射击字母：悬停结束时投票决定，初始=兜底字母
+    bool        down_voting_  = false; // true=正在投票窗口（HOVER_RECOG_DROP 期间）
+    int         down_vote_a_  = 0;
+    int         down_vote_b_  = 0;
+    bool        a_on_left_    = true;  // 由 cfg_.shoot_a_side 换算
 
     // === mission_flow 融合：投货子状态（对应 mission_flow 状态3 Sub1/Sub2） ===
     int       drop_sub_state_   = 0;  // 1=下降到投货高度 2=保持重发投货指令
@@ -240,7 +250,7 @@ class MissionManager
         float PIX_FAR_NORM_DIST;
 
         float detection_min_confidence;
-        std::string attack_real_target;  // 真实目标字母 "A" 或 "B"，前视只攻击此目标
+        std::string attack_real_target;  // 兜底字母 "A" 或 "B"：投货悬停下视识别失败时按此字母射击
         bool wait_for_vision_services = true;  // 是否等待视觉服务(/switch_camera等)；false跳过，方便单独测试PCL
 
         float drop_arrive_threshold;
@@ -289,6 +299,10 @@ class MissionManager
         float yolo_target_timeout        = 0.5f;   // 检测结果有效期(s), 超过算目标丢失
         float yolo_detect_timeout        = 60.0f;  // 前视识别总超时(s), 超时走默认射击点
 
+        // === 下视字母识别 + 固定映射射击（2026-07-20） ===
+        int   down_min_votes             = 3;      // 悬停期间某字母得票>=该值才采用，否则回退兜底字母
+        std::string shoot_a_side         = "left"; // A 靶固定在哪侧射击点("left"=左A右B, "right"=镜像)
+
         // 环多假设追踪参数（类 PCL 强度）
         float track_match_distance       = 0.3f;   // 匹配距离阈值 (m)
         float track_confidence_boost     = 0.15f;  // 每次匹配成功增量
@@ -316,6 +330,7 @@ class MissionManager
     void navStatusCallback(const std_msgs::Int8::ConstPtr &msg);
     void detectedTargetCallback(const std_msgs::String::ConstPtr &msg);
     void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
+    void yoloDownDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
     void hitConfirmCallback(const std_msgs::Bool::ConstPtr &msg);
     void ringDetectCallback(const pcl_detection2::SquareRing::ConstPtr &msg);
     void pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg);

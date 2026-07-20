@@ -23,6 +23,14 @@
         <param name="device" value="$(arg yolo_device)"/>
     </node>
 
+    <!-- ==================== 下视 YOLO 检测节点 (raicom_vision_laser, 投货字母识别) ==================== -->
+    <!-- 发布全局话题 /yolo_down_detect (DetectionInfo)。投货悬停时对字母 A/B 投票，
+         决定射击 A 靶(左射击点)还是 B 靶(右射击点)。下视相机 usb_cam 由 main_control_uav.sh 启动 -->
+    <node name="yolo_down_detector" pkg="raicom_vision_laser" type="yolo_down_detector.py" output="screen" ns="main_control">
+        <param name="weights_path" value="$(arg yolo_weights)"/>
+        <param name="device" value="$(arg yolo_device)"/>
+    </node>
+
     <!-- ==================== STM32 激光/舵机控制节点 (raicom_vision_laser) ==================== -->
     <!-- /servo_control (UInt8) 投货舵机(data<135->0x03开舱, >=135->0x04关舱)
          /shoot (Empty) 一键激光射击(开->1s->关)
