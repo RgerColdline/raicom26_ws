@@ -99,72 +99,27 @@ void MissionManager::handleInitTakeoff() {
 }
 
 void MissionManager::handleMoveToRingFront() {
-    static Waypoint target_wp;
-    static bool should_move = false;
-    if (!should_move && !timeout(2.0f)) {
-        if (!ring_detection.detected) {
-            hover();
-            ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
-            return;
-        }
-        else {
-            ROS_INFO_STREAM("pcl确认成功");
-            should_move = true;
-            // 优先用检测位姿动态计算，失败回退硬编码
-            Waypoint dyn_front, dyn_back;
-            if (computeRingApproachWP(dyn_front, dyn_back)) {
-                target_wp = dyn_front;
-                ROS_INFO("[Ring] 动态前方悬停点: (%.2f, %.2f, %.2f)", dyn_front.x, dyn_front.y,
-                         dyn_front.z);
-            }
-            else {
-                target_wp = wp_ring_front_;
-                ROS_WARN("[Ring] 动态位姿无效，使用硬编码前方点");
-            }
-        }
-    }
-    if (!should_move) {
-        ROS_WARN_STREAM("pcl确认环超时，改换定点");
-        should_move = true;
-        target_wp   = wp_ring_front_;
-    }
-    ROS_INFO_STREAM_THROTTLE(1, target_wp.x << target_wp.y << target_wp.z);
-    if (moveTo(target_wp)) {
+    ROS_INFO_STREAM_THROTTLE(1, wp_ring_front_.x << wp_ring_front_.y << wp_ring_front_.z);
+    if (moveTo(wp_ring_front_)) {
         current_state_    = SETOUT_CROSS_RING;
         state_start_time_ = ros::Time::now();
         ROS_INFO_STREAM("准备穿环");
     }
 }
 void MissionManager::handleSetoutCrossRing() {
-    // 进入状态时计算一次穿越点，冻结不再变动
-    static Waypoint cross_target    = wp_ring_back_;
-    static Waypoint approach_target = wp_ring_front_;
-    static bool cross_wp_frozen     = false;
-    if (!cross_wp_frozen) {
-        Waypoint dyn_front, dyn_back;
-        if (computeRingApproachWP(dyn_front, dyn_back)) {
-            cross_target    = dyn_back;
-            approach_target = dyn_front;
-            ROS_INFO("[Ring] 去程穿越点已冻结: (%.2f, %.2f, %.2f)", dyn_back.x, dyn_back.y,
-                     dyn_back.z);
-        }
-        else { ROS_WARN("[Ring] 动态穿越点无效，使用硬编码"); }
-        cross_wp_frozen = true;
-    }
-
-    if (moveTo(cross_target)) {
-        // 记住穿越前悬停点（世界坐标），返程定点直飞
-        ring_front_memorized_.x()   = init_pos_x_ + approach_target.x;
-        ring_front_memorized_.y()   = init_pos_y_ + approach_target.y;
-        ring_front_memorized_.z()   = init_pos_z_ + approach_target.z;
+    if (moveTo(wp_ring_back_)) {
+        // 记录环前方悬停点（绝对世界坐标），返程定点直飞
+        ring_front_memorized_.x()   = init_pos_x_ + wp_ring_front_.x;
+        ring_front_memorized_.y()   = init_pos_y_ + wp_ring_front_.y;
+        ring_front_memorized_.z()   = init_pos_z_ + wp_ring_front_.z;
         ring_front_memorized_valid_ = true;
         ROS_INFO("[Ring] 记住环前方位置: (%.2f, %.2f, %.2f)", ring_front_memorized_.x(),
                  ring_front_memorized_.y(), ring_front_memorized_.z());
 
-        // 记住穿越后的位置（世界坐标），返程直接导航到此处
-        ring_back_memorized_.x()   = init_pos_x_ + cross_target.x;
-        ring_back_memorized_.y()   = init_pos_y_ + cross_target.y;
-        ring_back_memorized_.z()   = init_pos_z_ + cross_target.z;
+        // 记录环后方位置（绝对世界坐标），返程直接导航到此处
+        ring_back_memorized_.x()   = init_pos_x_ + wp_ring_back_.x;
+        ring_back_memorized_.y()   = init_pos_y_ + wp_ring_back_.y;
+        ring_back_memorized_.z()   = init_pos_z_ + wp_ring_back_.z;
         ring_back_memorized_valid_ = true;
         ROS_INFO("[Ring] 记住环后方位置: (%.2f, %.2f, %.2f)", ring_back_memorized_.x(),
                  ring_back_memorized_.y(), ring_back_memorized_.z());
@@ -181,7 +136,6 @@ void MissionManager::handleSetoutCrossRing() {
             ROS_INFO("准备穿随机障碍物");
         }
         state_start_time_ = ros::Time::now();
-        cross_wp_frozen   = false;
     }
 }
 
@@ -474,7 +428,7 @@ void MissionManager::handleNavToRingBack() {
     Waypoint mid_target(init_pos_x_ + wp_back_mid_.x, init_pos_y_ + wp_back_mid_.y,
                         init_pos_z_ + wp_come_mid_.z);
 
-    // 优先用记住的第一次穿环位置（绝对坐标），其次动态计算
+    // 优先用记住的第一次穿环位置（绝对坐标），否则用硬编码
     Waypoint ring_back(init_pos_x_ + wp_ring_back_.x, init_pos_y_ + wp_ring_back_.y,
                        init_pos_z_ + wp_ring_back_.z);
     if (ring_back_memorized_valid_) {
@@ -483,14 +437,6 @@ void MissionManager::handleNavToRingBack() {
         ring_back.z = ring_back_memorized_.z();
         ROS_INFO_THROTTLE(5.0, "[Ring] 返程导航到记住的位置: (%.2f, %.2f, %.2f)", ring_back.x,
                           ring_back.y, ring_back.z);
-    }
-    else {
-        Waypoint dyn_front, dyn_back;
-        if (computeRingApproachWP(dyn_front, dyn_back)) {
-            ring_back.x = init_pos_x_ + dyn_back.x;
-            ring_back.y = init_pos_y_ + dyn_back.y;
-            ring_back.z = init_pos_z_ + dyn_back.z;
-        }
     }
 
     // 回程：先到中途点，再到穿环点
@@ -505,9 +451,7 @@ void MissionManager::handleNavToRingBack() {
         }
         return;
     }
-    if (navTo(ring_back) || (local_odom_.pose.pose.position.y <= ring_back_memorized_.y() + 0.2 &&
-                             ring_detection.detected))
-    {
+    if (navTo(ring_back)) {
         current_state_    = RETURN_CROSS_RING;
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
@@ -551,37 +495,11 @@ void MissionManager::handleReturnCrossRing() {
     }
 
     // ================================================================
-    // 回退路径：记忆点无效时，使用环检测（原有逻辑不变）
+    // 回退路径：记忆点无效时，直接使用硬编码航点
     // ================================================================
     switch (sub_state) {
-        static bool should_move = false;
     case SubState::MOVE_TO_RING_FRONT: {
-
-        static Waypoint target_wp;
-        if (!should_move && !timeout(2.0f)) {
-            if (!ring_detection.detected) {
-                ROS_INFO_STREAM_THROTTLE(1, "等待pcl确认环位置");
-                return;
-            }
-            else {
-                ROS_INFO_STREAM("pcl确认成功");
-                should_move = true;
-                // 此时 UAV 在环后方，front_wp = 指向UAV = 环后方悬停
-                Waypoint dyn_front, dyn_back;
-                if (computeRingApproachWP(dyn_front, dyn_back)) {
-                    target_wp = dyn_front;
-                    ROS_INFO("[Ring] 动态返回悬停点: (%.2f, %.2f, %.2f)", dyn_front.x, dyn_front.y,
-                             dyn_front.z);
-                }
-                else { target_wp = wp_ring_back_; }
-            }
-        }
-        if (!should_move) {
-            ROS_WARN_STREAM("pcl确认环超时，改换定点");
-            should_move = true;
-            target_wp   = wp_ring_back_;
-        }
-        if (moveTo(target_wp)) {
+        if (moveTo(wp_ring_back_)) {
             sub_state         = SubState::CROSS_RING;
             state_start_time_ = ros::Time::now();
             ROS_INFO_STREAM("准备穿环");
@@ -590,23 +508,9 @@ void MissionManager::handleReturnCrossRing() {
     }
     case SubState::CROSS_RING:
     default                  : {
-        // 穿越回前方 → back_wp = 远离UAV = 环前方目标点
-        static Waypoint return_cross_target = wp_ring_front_;
-        static bool return_cross_frozen     = false;
-        if (!return_cross_frozen) {
-            Waypoint dyn_front, dyn_back;
-            if (computeRingApproachWP(dyn_front, dyn_back)) {
-                return_cross_target = dyn_back;
-                ROS_INFO("[Ring] 返程穿越点已冻结: (%.2f, %.2f, %.2f)", dyn_back.x, dyn_back.y,
-                         dyn_back.z);
-            }
-            else { ROS_WARN("[Ring] 动态返程穿越点无效，使用硬编码"); }
-            return_cross_frozen = true;
-        }
-        if (moveTo(return_cross_target)) {
+        if (moveTo(wp_ring_front_)) {
             current_state_      = RETURN;
             state_start_time_   = ros::Time::now();
-            return_cross_frozen = false;  // 重置供下次使用
             ROS_INFO_STREAM("已穿环，正在返回起飞点上方");
         }
         break;
