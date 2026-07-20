@@ -582,8 +582,8 @@ void MissionManager::run() {
         default                     : break;
         }
 
-        // 3. 发布设定点（EGO导航时由ego_controller_node接管，不再重复发）
-        if (!nav_goal_sent_) {
+        // 3. 发布设定点（EGO正常模式由ego_controller_node接管；PCL/影子模式继续发）
+        if (!nav_goal_sent_ || pillar_nav_mode_ == "pcl") {
             sendSetpoint(current_setpoint_);
         }
 

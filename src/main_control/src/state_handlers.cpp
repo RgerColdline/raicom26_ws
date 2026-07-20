@@ -99,14 +99,23 @@ void MissionManager::handleInitTakeoff() {
 }
 
 void MissionManager::handleMoveToRingFront() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(init_pos_x_ + wp_ring_front_.x, init_pos_y_ + wp_ring_front_.y,
+                    init_pos_z_ + wp_ring_front_.z);
+    }
     ROS_INFO_STREAM_THROTTLE(1, wp_ring_front_.x << wp_ring_front_.y << wp_ring_front_.z);
     if (moveTo(wp_ring_front_)) {
         current_state_    = SETOUT_CROSS_RING;
+        nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
         ROS_INFO_STREAM("准备穿环");
     }
 }
 void MissionManager::handleSetoutCrossRing() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(init_pos_x_ + wp_ring_back_.x, init_pos_y_ + wp_ring_back_.y,
+                    init_pos_z_ + wp_ring_back_.z);
+    }
     if (moveTo(wp_ring_back_)) {
         // 记录环前方悬停点（绝对世界坐标），返程定点直飞
         ring_front_memorized_.x()   = init_pos_x_ + wp_ring_front_.x;
@@ -135,6 +144,7 @@ void MissionManager::handleSetoutCrossRing() {
             current_state_ = NAV_TO_DROP_AREA;
             ROS_INFO("准备穿随机障碍物");
         }
+        nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
     }
 }
@@ -148,7 +158,8 @@ void MissionManager::handleNavToDropArea() {
     static bool come_mid_reached = false;
 
     if (!come_mid_reached) {
-        if (navTo(mid_target)) {
+        bool mid_arrived = (pillar_nav_mode_ == "pcl") ? moveTo(mid_target) : navTo(mid_target);
+        if (mid_arrived) {
             come_mid_reached = true;
             ROS_INFO_STREAM("到达中途点，继续前往投放区");
             nav_goal_sent_ = false;
@@ -466,29 +477,44 @@ void MissionManager::handleReturnCrossRing() {
     // ================================================================
     // 快速路径：去程已记录前后记忆点，返程定点直飞，跳过环检测
     // ================================================================
-    static bool fast_phase1_done = false;
+    static bool fast_phase1_done  = false;
+    static bool ego_sent_phase1   = false;
+    static bool ego_sent_phase2   = false;
 
     if (ring_front_memorized_valid_ && ring_back_memorized_valid_) {
         // Phase 1: 飞到环后方记忆点（当前侧接近点）
         if (!fast_phase1_done) {
+            if (!ego_sent_phase1) {
+                sendEgoGoal(ring_back_memorized_.x(), ring_back_memorized_.y(),
+                            ring_back_memorized_.z());
+                ego_sent_phase1 = true;
+            }
             ROS_INFO_THROTTLE(1.0, "[Ring] 记忆点返程-Phase1: 飞向环后方(%.2f,%.2f,%.2f)",
                               ring_back_memorized_.x(), ring_back_memorized_.y(),
                               ring_back_memorized_.z());
             if (moveToAbs(ring_back_memorized_.x(), ring_back_memorized_.y(),
                           ring_back_memorized_.z())) {
-                fast_phase1_done = true;
+                fast_phase1_done  = true;
                 state_start_time_ = ros::Time::now();
                 ROS_INFO("[Ring] 记忆点返程：到达环后方，准备穿越");
             }
             return;
         }
         // Phase 2: 穿越到环前方记忆点
+        if (!ego_sent_phase2) {
+            sendEgoGoal(ring_front_memorized_.x(), ring_front_memorized_.y(),
+                        ring_front_memorized_.z());
+            ego_sent_phase2 = true;
+        }
         if (moveToAbs(ring_front_memorized_.x(), ring_front_memorized_.y(),
                       ring_front_memorized_.z())) {
             current_state_      = RETURN;
             state_start_time_   = ros::Time::now();
             fast_phase1_done    = false;
+            ego_sent_phase1     = false;
+            ego_sent_phase2     = false;
             sub_state           = SubState::MOVE_TO_RING_FRONT;
+            nav_goal_sent_      = false;
             ROS_INFO("[Ring] 记忆点返程完成，已穿环，返回起飞点");
         }
         return;
@@ -499,8 +525,13 @@ void MissionManager::handleReturnCrossRing() {
     // ================================================================
     switch (sub_state) {
     case SubState::MOVE_TO_RING_FRONT: {
+        if (!nav_goal_sent_) {
+            sendEgoGoal(init_pos_x_ + wp_ring_back_.x, init_pos_y_ + wp_ring_back_.y,
+                        init_pos_z_ + wp_ring_back_.z);
+        }
         if (moveTo(wp_ring_back_)) {
             sub_state         = SubState::CROSS_RING;
+            nav_goal_sent_    = false;
             state_start_time_ = ros::Time::now();
             ROS_INFO_STREAM("准备穿环");
         }
@@ -508,8 +539,13 @@ void MissionManager::handleReturnCrossRing() {
     }
     case SubState::CROSS_RING:
     default                  : {
+        if (!nav_goal_sent_) {
+            sendEgoGoal(init_pos_x_ + wp_ring_front_.x, init_pos_y_ + wp_ring_front_.y,
+                        init_pos_z_ + wp_ring_front_.z);
+        }
         if (moveTo(wp_ring_front_)) {
             current_state_      = RETURN;
+            nav_goal_sent_      = false;
             state_start_time_   = ros::Time::now();
             ROS_INFO_STREAM("已穿环，正在返回起飞点上方");
         }
@@ -521,6 +557,9 @@ void MissionManager::handleReturnCrossRing() {
 
 // 8.13 返回起飞点并降落
 void MissionManager::handleReturn() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(init_pos_x_, init_pos_y_, init_pos_z_ + cfg_.takeoff_height);
+    }
     if (moveTo(init_pos_x_, init_pos_y_, init_pos_z_ + cfg_.takeoff_height)) {
         nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
@@ -583,11 +622,15 @@ void MissionManager::handleTaskEnd() {
 
 // 穿环后飞到悬停扫描点（途中从起飞高度升到穿越定高）
 void MissionManager::handleTraverseToScan() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(hover_ox_, hover_oy_, cfg_.trav_flight_z);
+    }
     if (moveToAbs(hover_ox_, hover_oy_, cfg_.trav_flight_z)) {
         ROS_INFO("[穿越] ✓ 到达悬停扫描点 odom(%.2f, %.2f, %.2f)",
                  hover_ox_, hover_oy_, cfg_.trav_flight_z);
         current_state_    = TRAVERSE_SCAN;
         scan_sub_state_   = 0;
+        nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
     }
     else {
@@ -669,6 +712,9 @@ void MissionManager::handleTraverseScan() {
 
 // leg2 绕柱段轨迹跟踪（悬停扫描点 -> 投放区）
 void MissionManager::handleTraverseLeg2() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(end_x_, end_y_, cfg_.trav_flight_z);
+    }
     if (trackLeg(false, end_x_, end_y_, "去程leg2")) {
         ROS_INFO("[穿越] ✓ 到达投放区 (%.2f, %.2f, %.2f)，进入悬停投货流程",
                  end_x_, end_y_, cfg_.trav_flight_z);
@@ -688,9 +734,13 @@ void MissionManager::handleTraverseLeg2() {
 
 // 射击后先回投放区（leg2 轨迹终点），对准后再开始倒放返程
 void MissionManager::handleTraverseReadyReturn() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(end_x_, end_y_, cfg_.trav_flight_z);
+    }
     if (moveToAbs(end_x_, end_y_, cfg_.trav_flight_z)) {
         ROS_INFO("[穿越] 回到投放区 (%.2f, %.2f)，开始 leg2 倒放返程", end_x_, end_y_);
         current_state_    = TRAVERSE_RETURN_LEG2;
+        nav_goal_sent_    = false;
         leg_start_time_   = ros::Time::now();
         state_start_time_ = ros::Time::now();
     }
@@ -704,9 +754,13 @@ void MissionManager::handleTraverseReadyReturn() {
 
 // 返程 leg2 时间倒放（投放区 -> 悬停扫描点），完成后穿环返回
 void MissionManager::handleTraverseReturnLeg2() {
+    if (!nav_goal_sent_) {
+        sendEgoGoal(hover_ox_, hover_oy_, cfg_.trav_flight_z);
+    }
     if (trackLeg(true, hover_ox_, hover_oy_, "返程leg2")) {
         ROS_INFO("[穿越] ✓ 回到悬停扫描点，准备穿环返回");
         current_state_    = RETURN_CROSS_RING;
+        nav_goal_sent_    = false;
         state_start_time_ = ros::Time::now();
     }
 }

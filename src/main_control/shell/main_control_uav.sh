@@ -121,7 +121,7 @@ tmux split-window -h -t "$SESSION:2"
 CMD_NAV="sleep 16; \
 source '${WS}/devel/setup.${CURRENT_SHELL}'; \
 source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
-roslaunch uav_navigation ego_nav.launch"
+roslaunch uav_navigation ego_nav.launch shadow_mode:=true"
 tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
 
 tmux select-layout -t "$SESSION:2" tiled
