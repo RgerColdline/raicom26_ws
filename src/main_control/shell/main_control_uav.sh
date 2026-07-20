@@ -100,7 +100,7 @@ tmux send-keys -t "$SESSION:1" "sleep 16; source '${WS}/devel/setup.${CURRENT_SH
 
 tmux select-pane -L -t "$SESSION:1"
 tmux split-window -v -t "$SESSION:1"
-tmux send-keys -t "$SESSION:1" "sleep 18; rostopic echo /ego_controller/status" C-m
+tmux send-keys -t "$SESSION:1" "sleep 18; rostopic echo /mavros/state" C-m
 
 tmux select-layout -t "$SESSION:1" tiled
 
