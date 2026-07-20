@@ -15,7 +15,8 @@ align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
 shoot_delay: 2.0                    # 射击后等待确认时间（秒）
 use_ego_planner_for_drop_area : false # pcl-dev: 定点控制，不用EGO
 
-# 导航模式: "ego"=EGO-Planner路径规划  "pcl"=PCL柱子检测航点(需pcl_detection2)
+# 导航模式: "ego"=EGO-Planner路径规划  "pcl"=穿越平滑轨迹（悬停扫描选case+leg2样条跟踪+倒放返程，
+# 地图在 raicom_vision_laser/config/traverse_map.yaml，launch 已加载；pillar_nav.yaml 已废弃不再加载）
 pillar_nav_mode: "pcl"
 
 wait_for_vision_services: false        # 是否等待视觉服务(/switch_camera等)；false则跳过，方便单独测试PCL

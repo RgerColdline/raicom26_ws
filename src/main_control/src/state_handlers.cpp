@@ -159,10 +159,19 @@ void MissionManager::handleSetoutCrossRing() {
         ROS_INFO("[Ring] 记住环后方位置: (%.2f, %.2f, %.2f)", ring_back_memorized_.x(),
                  ring_back_memorized_.y(), ring_back_memorized_.z());
 
-        current_state_    = (pillar_nav_mode_ == "pcl") ? PILLAR_DETECT : NAV_TO_DROP_AREA;
+        // PCL模式=穿越平滑轨迹：穿环后先去悬停扫描点；地图没加载成功则回退 EGO 路径
+        if (pillar_nav_mode_ == "pcl" && traverse_cfg_ok_) {
+            current_state_ = TRAVERSE_TO_SCAN;
+            ROS_INFO("进入穿越赛段：飞向悬停扫描点");
+        }
+        else {
+            if (pillar_nav_mode_ == "pcl" && !traverse_cfg_ok_)
+                ROS_WARN("[穿越] 地图未加载成功，回退 EGO 路径");
+            current_state_ = NAV_TO_DROP_AREA;
+            ROS_INFO("准备穿随机障碍物");
+        }
         state_start_time_ = ros::Time::now();
         cross_wp_frozen   = false;
-        ROS_INFO("%s", (pillar_nav_mode_ == "pcl") ? "进入PCL柱子检测" : "准备穿随机障碍物");
     }
 }
 
@@ -427,8 +436,9 @@ void MissionManager::handleSimulateAttack() {
 void MissionManager::handleWaitHitConfirmation() {
     hover();
     if (timeout(5) || hit_confirmed_) {
-        // PCL模式下去反向柱子航点，EGO模式去环后方
-        current_state_ = (pillar_nav_mode_ == "pcl") ? RETURN_PILLAR_WAYPOINTS : READY_NAV_TO_RING_BACK;
+        // PCL模式=穿越平滑轨迹：先回投放区再 leg2 倒放；EGO模式去环后方
+        current_state_ = (pillar_nav_mode_ == "pcl" && traverse_cfg_ok_) ? TRAVERSE_READY_RETURN
+                                                                         : READY_NAV_TO_RING_BACK;
         // READY_NAV_TO_RING_BACK  // [注释] 原有EGO路径
         state_start_time_ = ros::Time::now();
         if (hit_confirmed_)
@@ -618,125 +628,136 @@ void MissionManager::handleTaskEnd() {
 }
 
 // ============================================================
-//  PCL 柱子检测导航状态
+//  穿越赛段状态（traverse_node 融合：悬停扫描选 case + leg2 平滑轨迹 + 倒放返程）
+//  全程定高 cfg_.trav_flight_z，轨迹跟踪用绝对 odom 坐标（起飞点=出生点=odom原点）
 // ============================================================
 
-void MissionManager::handlePillarDetect() {
-    // 进入状态时向PCL发送启动信号
-    static bool start_sent = false;
-    if (!start_sent) {
-        pillar_case_id_ = -1;  // 重置，等待新结果
-        pillar_start_pub_.publish(std_msgs::Empty());
-        start_sent = true;
-        ROS_INFO("[Pillar] 已发送启动信号给PCL，等待检测结果...");
+// 穿环后飞到悬停扫描点（途中从起飞高度升到穿越定高）
+void MissionManager::handleTraverseToScan() {
+    if (moveToAbs(hover_ox_, hover_oy_, cfg_.trav_flight_z)) {
+        ROS_INFO("[穿越] ✓ 到达悬停扫描点 odom(%.2f, %.2f, %.2f)",
+                 hover_ox_, hover_oy_, cfg_.trav_flight_z);
+        current_state_    = TRAVERSE_SCAN;
+        scan_sub_state_   = 0;
+        state_start_time_ = ros::Time::now();
     }
-
-    hover();
-
-    if (pillar_case_id_ >= 0) {
-        ROS_INFO("[Pillar] 收到PCL检测结果: case #%d", pillar_case_id_);
-
-        // 设置航点序列
-        pillar_wp_index_ = 0;
-        if (pillar_case_id_ < static_cast<int>(pillar_waypoints_.size())) {
-            pillar_wp_total_ = pillar_waypoints_[pillar_case_id_].size();
-        }
-        else { pillar_wp_total_ = 0; }
-
-        if (pillar_wp_total_ > 0) {
-            current_state_    = NAV_PILLAR_WAYPOINTS;
-            state_start_time_ = ros::Time::now();
-            start_sent        = false;
-            ROS_INFO("[Pillar] 开始导航，共 %zu 个航点", pillar_wp_total_);
-        }
-        else {
-            ROS_WARN("[Pillar] 无有效航点，回退EGO");
-            current_state_    = NAV_TO_DROP_AREA;
-            state_start_time_ = ros::Time::now();
-        }
-        return;
-    }
-
-    // 超时回退 (20s)
-    if (timeout(20.0f)) {
-        ROS_WARN("[Pillar] 检测超时(20s)，使用默认配置0");
-        pillar_case_id_ = 0;  // 触发上面逻辑
+    else {
+        ROS_INFO_THROTTLE(0.5, "[穿越] 飞向悬停扫描点 (%.2f, %.2f, %.2f)... 当前(%.2f,%.2f,%.2f)",
+                          hover_ox_, hover_oy_, cfg_.trav_flight_z,
+                          local_odom_.pose.pose.position.x, local_odom_.pose.pose.position.y,
+                          local_odom_.pose.pose.position.z);
     }
 }
 
-void MissionManager::handleNavPillarWaypoints() {
-    if (pillar_case_id_ < 0 || pillar_case_id_ >= static_cast<int>(pillar_waypoints_.size())) {
-        ROS_WARN("[Pillar] 无效配置ID，回退EGO");
-        current_state_    = NAV_TO_DROP_AREA;
-        state_start_time_ = ros::Time::now();
-        return;
+// 悬停扫描选 case（模板匹配 / force_case 旁路）+ 现场规划 leg2
+void MissionManager::handleTraverseScan() {
+    // 全程保持悬停扫描点
+    moveToAbs(hover_ox_, hover_oy_, cfg_.trav_flight_z);
+
+    // --- Sub 0: 入口（发触发 或 force_case 直接规划）---
+    if (scan_sub_state_ == 0) {
+        if (cfg_.force_case >= 0) {
+            ROS_WARN("[穿越] force_case=%d，跳过检测与悬停，直接规划 leg2", cfg_.force_case);
+            if (tryPlanLeg2(cfg_.force_case)) {
+                ROS_INFO("[穿越] ✓ leg2 规划完成 case%d，开始绕柱段", active_case_);
+                current_state_    = TRAVERSE_LEG2;
+                scan_sub_state_   = 0;
+                leg_start_time_   = ros::Time::now();
+                state_start_time_ = ros::Time::now();
+            }
+            else {
+                scan_sub_state_ = 9;   // 规划全失败：悬停等人工接管
+            }
+        }
+        else {
+            std_msgs::Empty trig;
+            pillar_start_pub_.publish(trig);
+            detected_case_    = -1;
+            scan_entry_time_  = ros::Time::now();
+            scan_sub_state_   = 1;
+            ROS_INFO("[穿越] 悬停扫描开始（%.1fs，超时 %.1fs 回退 case%d），已触发 pcl_detection2 模板匹配",
+                     cfg_.scan_hover_time, cfg_.scan_timeout, cfg_.default_case);
+        }
     }
+    // --- Sub 1: 悬停等待检测结果 ---
+    else if (scan_sub_state_ == 1) {
+        double elapsed = (ros::Time::now() - scan_entry_time_).toSec();
+        int decided = -1;
+        if (detected_case_ >= 0 && elapsed >= cfg_.scan_hover_time)
+            decided = detected_case_;                       // 正常：检测到 + 悬停满
+        else if (elapsed >= cfg_.scan_timeout)
+            decided = (detected_case_ >= 0) ? detected_case_ : cfg_.default_case;  // 超时兜底
 
-    const auto &waypoints = pillar_waypoints_[pillar_case_id_];
+        if (decided >= 0) {
+            if (detected_case_ >= 0)
+                ROS_INFO("[穿越] ✓ 采用检测结果 case%d（扫描耗时 %.1fs）", decided, elapsed);
+            else
+                ROS_WARN("[穿越] 扫描超时(%.1fs)未检测到，回退 default_case=%d", elapsed, decided);
 
-    if (pillar_wp_index_ >= waypoints.size()) {
-        // 正向航点完成 → 进入投货射击流程（mission_flow 融合：PCL柱子导航走完不再直接返程）
-        ROS_INFO("[Pillar] 正向航点全部完成，进入 mission_flow 投货射击流程");
+            if (tryPlanLeg2(decided)) {
+                ROS_INFO("[穿越] ✓ leg2 规划完成 case%d（%s），开始绕柱段",
+                         active_case_, TRAV_CASE_DESC[active_case_]);
+                current_state_    = TRAVERSE_LEG2;
+                scan_sub_state_   = 0;
+                leg_start_time_   = ros::Time::now();
+                state_start_time_ = ros::Time::now();
+            }
+            else {
+                scan_sub_state_ = 9;   // 规划全失败：悬停等人工接管
+            }
+        }
+        else {
+            ROS_INFO_THROTTLE(0.5, "[穿越] 悬停扫描中 %.1f/%.1fs（超时 %.1fs），detected=%d",
+                              elapsed, cfg_.scan_hover_time, cfg_.scan_timeout, detected_case_);
+        }
+    }
+    // --- Sub 9: 规划失败悬停（等人工接管）---
+    else {
+        ROS_ERROR_THROTTLE(2.0, "[穿越] leg2 规划净距不达标且未开 force_fly，"
+                                "原地悬停，请遥控器接管或检查 via_points！");
+    }
+}
+
+// leg2 绕柱段轨迹跟踪（悬停扫描点 -> 投放区）
+void MissionManager::handleTraverseLeg2() {
+    if (trackLeg(false, end_x_, end_y_, "去程leg2")) {
+        ROS_INFO("[穿越] ✓ 到达投放区 (%.2f, %.2f, %.2f)，进入悬停投货流程",
+                 end_x_, end_y_, cfg_.trav_flight_z);
         current_state_      = HOVER_RECOG_DROP;
         drop_sub_state_     = 0;
         drop_hover_start_   = ros::Time(0);
         last_drop_pub_time_ = ros::Time(0);
+        nav_goal_sent_      = false;
+        nav_status_         = 0;
         state_start_time_   = ros::Time::now();
-        return;
-    }
 
-    Waypoint wp = waypoints[pillar_wp_index_];
-    Waypoint abs_wp(init_pos_x_ + wp.x, init_pos_y_ + wp.y, init_pos_z_ + wp.z);
-
-    if (moveTo(abs_wp)) {
-        ROS_INFO("[Pillar] 航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)", pillar_wp_index_ + 1,
-                 waypoints.size(), abs_wp.x, abs_wp.y, abs_wp.z);
-        ++pillar_wp_index_;
-    }
-    else {
-        ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向航点 #%zu/%zu: (%.2f,%.2f,%.2f)", pillar_wp_index_ + 1,
-                          waypoints.size(), abs_wp.x, abs_wp.y, abs_wp.z);
+        down_vote_a_ = 0;
+        down_vote_b_ = 0;
+        down_voting_ = true;
     }
 }
 
-void MissionManager::handleReturnPillarWaypoints() {
-    if (pillar_case_id_ < 0 || pillar_case_id_ >= static_cast<int>(pillar_waypoints_.size())) {
-        ROS_WARN("[Pillar] 无效配置ID，回退EGO");
-        current_state_    = NAV_TO_RING_BACK;
+// 射击后先回投放区（leg2 轨迹终点），对准后再开始倒放返程
+void MissionManager::handleTraverseReadyReturn() {
+    if (moveToAbs(end_x_, end_y_, cfg_.trav_flight_z)) {
+        ROS_INFO("[穿越] 回到投放区 (%.2f, %.2f)，开始 leg2 倒放返程", end_x_, end_y_);
+        current_state_    = TRAVERSE_RETURN_LEG2;
+        leg_start_time_   = ros::Time::now();
         state_start_time_ = ros::Time::now();
-        return;
-    }
-
-    const auto &waypoints    = pillar_waypoints_[pillar_case_id_];
-    static bool init_reverse = true;
-
-    if (init_reverse) {
-        pillar_wp_index_ = waypoints.size();
-        init_reverse     = false;
-        ROS_INFO("[Pillar] 开始反向导航，共 %zu 个航点", waypoints.size());
-    }
-
-    if (pillar_wp_index_ == 0) {
-        // 反向航点全部完成 → 去穿环返回
-        init_reverse      = true;
-        current_state_    = RETURN_CROSS_RING;
-        state_start_time_ = ros::Time::now();
-        ROS_INFO("[Pillar] 反向航点全部完成，准备穿环返回");
-        return;
-    }
-
-    size_t cur_idx = pillar_wp_index_ - 1;
-    Waypoint wp    = waypoints[cur_idx];
-    Waypoint abs_wp(init_pos_x_ + wp.x, init_pos_y_ + wp.y, init_pos_z_ + wp.z);
-
-    if (moveTo(abs_wp)) {
-        ROS_INFO("[Pillar] 反向航点 #%zu/%zu 到达: (%.2f,%.2f,%.2f)", waypoints.size() - cur_idx,
-                 waypoints.size(), abs_wp.x, abs_wp.y, abs_wp.z);
-        --pillar_wp_index_;  // 到达后才递减
     }
     else {
-        ROS_INFO_THROTTLE(1.0, "[Pillar] 飞向反向航点 #%zu/%zu: (%.2f,%.2f,%.2f)",
-                          waypoints.size() - cur_idx, waypoints.size(), abs_wp.x, abs_wp.y,
-                          abs_wp.z);
+        ROS_INFO_THROTTLE(0.5, "[穿越] 返回投放区中 (%.2f, %.2f, %.2f)... 当前(%.2f,%.2f,%.2f)",
+                          end_x_, end_y_, cfg_.trav_flight_z,
+                          local_odom_.pose.pose.position.x, local_odom_.pose.pose.position.y,
+                          local_odom_.pose.pose.position.z);
+    }
+}
+
+// 返程 leg2 时间倒放（投放区 -> 悬停扫描点），完成后穿环返回
+void MissionManager::handleTraverseReturnLeg2() {
+    if (trackLeg(true, hover_ox_, hover_oy_, "返程leg2")) {
+        ROS_INFO("[穿越] ✓ 回到悬停扫描点，准备穿环返回");
+        current_state_    = RETURN_CROSS_RING;
+        state_start_time_ = ros::Time::now();
     }
 }

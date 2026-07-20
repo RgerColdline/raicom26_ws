@@ -1,7 +1,8 @@
 <launch>
-    <!-- 先加载参数到节点的私有命名空间 -->
+    <!-- 先加载穿越地图（与 traverse_node/pcl_detection2 模板共用同一份，勿另拷），
+         再加载主控参数（main_control.yaml 的 cargo 段覆盖 traverse_map 的同名键） -->
+    <rosparam file="$(find raicom_vision_laser)/config/traverse_map.yaml" command="load" ns="main_control"/>
     <rosparam file="$(find main_control)/config/main_control.yaml" command="load" ns="main_control"/>
-    <rosparam file="$(find main_control)/config/pillar_nav.yaml" command="load" ns="main_control"/>
 
     <!-- ==================== 运行模式参数（实机默认；虚拟机仿真传 use_stm32:=false yolo_device:=cpu 覆盖） ==================== -->
     <!-- use_stm32: 实机接STM32串口(true)。仿真无串口时stm32_shooter_node会退出，
