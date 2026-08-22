@@ -1,7 +1,7 @@
 # ==================== 控制参数 ====================
 
 takeoff_height: 1.0                 # 起飞高度（相对初始点，单位：米）
-max_speed: 0.8                      # 最大水平速度（m/s）
+max_speed: 1.12                     # 最大水平速度（m/s）（提速 1.4x：0.8→1.12）
 max_yaw_rate: 0.8                   # 最大偏航角速度（rad/s）
 err_max: 0.25                       # 位置误差容限（暂未使用）
 hover_vert_tolerance: 0.03          # 悬停垂直稳定容差（m）
@@ -21,21 +21,9 @@ pillar_nav_mode: "pcl"
 
 wait_for_vision_services: false        # 是否等待视觉服务(/switch_camera等)；false则跳过，方便单独测试PCL
 
-# ==================== 环穿越动态参数 ====================
-# 优先使用 pcl 实时检测到的环 3D 位姿计算穿越点。
-# 检测失败或超时(3s)时自动回退到硬编码航点 wp_ring_front/back_。
-ring_front_approach_offset: 0.8    # 环前方悬停距离 (m)
-ring_back_approach_offset:  1.2    # 环后方穿越目标距离 (m)
-
-# 环多假设追踪（类 PCL 强度机制）
-ring_track:
-  match_distance: 0.3           # 匹配距离阈值 (m)，以内认为是同一个环
-  confidence_boost: 0.15        # 每次匹配成功置信度增量
-  confidence_decay: 0.97        # 每帧衰减系数 (20Hz 运行)
-  confirm_threshold: 0.7        # 锁定确认阈值，达标后位置不再更新
-  min_confidence: 0.08          # 最低保留置信度，低于此值删除
-  max_candidates: 3             # 最大候选数
-  ema_alpha: 0.3                # EMA 平滑系数 (0~1, 越小越平滑)
+# ==================== 环穿越（固定航点，垂直穿环） ====================
+# 去程/返程均用硬编码航点 wp_ring_front/wp_ring_back 垂直穿过环，不做 pcl 环检测。
+# wp_ring_front/back 见下方"航点坐标"段。
 
 # ==================== 定点射击参数（2026-07-20 固定映射：投货识别字母 -> 对应射击点） ====================
 # 左射击点上方永远是 A 靶，右射击点上方永远是 B 靶；投货悬停下视识别字母后直接飞对应点，免前视识别。
@@ -70,10 +58,10 @@ PIX_FAR_NORM_DIST: 150.0            # 远距离归一化阈值（像素）
 # 环区
 wp_ring_front_x: -0.65
 wp_ring_front_y: 0.0
-wp_ring_front_z: 1.0               # 通常与 takeoff_height 一致
+wp_ring_front_z: 1.3               # 穿环高度：环孔 z∈[0.75,2.25]，1.3 距下沿 0.55m（与去程 flight_z 对齐，防返程卡下沿）
 wp_ring_back_x: -2.05
 wp_ring_back_y: 0.0
-wp_ring_back_z: 1.0            
+wp_ring_back_z: 1.3
 
 # 中间点
 wp_come_mid_x: -1.70
