@@ -265,6 +265,26 @@ grep -rl "ROI裁剪后无点" ~/.ros/log/ 2>/dev/null
 
 **待仿真验证**：提速后穿环/绕柱的过冲与磕碰、`v_max` 是否需要回调。
 
+### 10.6 实机降速 + 实机启动评估（2026-08-19）
+
+**改动：速度参数恢复原值**（实机上线前回退 10.5 的 1.4x）：
+
+| 文件 | 参数 | 值 |
+|------|------|-----|
+| `raicom_vision_laser/config/traverse_map.yaml` | `traverse/v_max / a_max / a_lat_max` | 0.5 / 0.4 / 0.6 |
+| `main_control/config/main_control.yaml` | `max_speed`（穿环定点控制） | 0.8 |
+
+纯 yaml 改动，重启 launch 生效。（返程穿环高度 1.3 属安全项，保留。）
+
+**实机启动评估（`main_control_uav.sh`）结论**：
+- ✅ 可跑通链路：uav shell 用 `mapping_mid360_fastlio.launch` 发布 `/fastlio_map`+`/Odometry`，与 pcl_detection2 `cloud_source: fastlio` 订阅匹配；EGO `shadow_mode:=true` 不抢飞控；`cloud_extruder` 随 ego_nav 启动消费投影点云
+- ⚠️ 上实机前必办：
+  1. pcl_detection2 用 `CMakeLists_uav.txt`（Jetson OpenCV 路径）替换 `CMakeLists.txt` 再编译
+  2. `export LIO_WS=<实机FAST-LIO工作空间>`（uav shell 默认 `~/fast_lio_ws`，目录校验不过会 exit 1）
+  3. 确认实机 FAST-LIO `laserMapping.cpp:935 if(1)` 已改，否则 `/fastlio_map` 空
+  4. 核对相机话题：usb_cam/astra 默认话题 vs yaml（`/camera/image_raw`、`/camera_front/image_raw`）是否有 remap
+  5. 场地坐标系：`traverse_map.yaml` origin/pillar_candidates、`pcl_detection2.yaml` pillar_pos 均为官方场地系，出生点不同需全改
+
 ## 11. TODO
 
 ### 主攻方向：提速 -- 缩短整个任务流程时间
