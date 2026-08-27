@@ -1,6 +1,6 @@
 # ==================== 控制参数 ====================
 
-takeoff_height: 1.0                 # 起飞高度（相对初始点，单位：米）
+takeoff_height: 1.1                 # 起飞高度（相对初始点，单位：米）
 max_speed: 0.8                      # 最大水平速度（m/s）（实机恢复原速）
 max_yaw_rate: 0.8                   # 最大偏航角速度（rad/s）
 err_max: 0.25                       # 位置误差容限（暂未使用）
@@ -58,33 +58,33 @@ PIX_FAR_NORM_DIST: 150.0            # 远距离归一化阈值（像素）
 # 环区
 wp_ring_front_x: -0.65
 wp_ring_front_y: 0.0
-wp_ring_front_z: 1.3               # 穿环高度：环孔 z∈[0.75,2.25]，1.3 距下沿 0.55m（与去程 flight_z 对齐，防返程卡下沿）
+wp_ring_front_z: 1.1               # 穿环高度：环孔 z∈[0.75,2.25]，1.1 距下沿 0.55m（与去程 flight_z 对齐，防返程卡下沿）
 wp_ring_back_x: -2.05
 wp_ring_back_y: 0.0
-wp_ring_back_z: 1.3
+wp_ring_back_z: 1.1
 
 # 中间点
 wp_come_mid_x: -1.70
 wp_come_mid_y: -2.90
-wp_come_mid_z: 1.2               # 通常与 takeoff_height 一致
+wp_come_mid_z: 1.1               # 通常与 takeoff_height 一致
 wp_back_mid_x: -2.6
 wp_back_mid_y: -2.80
-wp_back_mid_z: 1.2            
+wp_back_mid_z: 1.1            
 
 # 柱子中心点（两柱之间）
 wp_pillar_center_x: -2.35
 wp_pillar_center_y: -1.42
-wp_pillar_center_z: 1.2
+wp_pillar_center_z: 1.1
 
 # 物资投放区
 wp_drop_area_x: -0.45
 wp_drop_area_y: -2.0
-wp_drop_area_z: 1.5
+wp_drop_area_z: 1.1
 
 # 攻击目标识别区
 wp_attack_area_x: -0.45
 wp_attack_area_y: -2.0
-wp_attack_area_z: 1.5
+wp_attack_area_z: 1.1
 
 # 识别参数
 detection:
