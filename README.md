@@ -285,6 +285,24 @@ grep -rl "ROI裁剪后无点" ~/.ros/log/ 2>/dev/null
   4. 核对相机话题：usb_cam/astra 默认话题 vs yaml（`/camera/image_raw`、`/camera_front/image_raw`）是否有 remap
   5. 场地坐标系：`traverse_map.yaml` origin/pillar_candidates、`pcl_detection2.yaml` pillar_pos 均为官方场地系，出生点不同需全改
 
+### 10.7 camera_init z 偏移 & FAST-LIO IMU 初始化机制（2026-08-26）
+
+**现象**（WSL 仿真 + filter_size_map=0.2）：柱子真实位置 z∈[0,3]（map.world：radius 0.1 / length 3 / pose z=1.5），但 `/fastlio_map`（camera_init 系）里柱子点 z∈[-0.7,0.45]。pcl 的 ROI `z_min=0.3` 把柱子 90% 的点裁掉（日志 `ROI点=6~15 A左=0 A右=1 B左=3 B右=0`），导致检测失败；而 A右 0.3m 圈内实际有 16 点、B左 12 点，**xy 坐标与 pillar_pos 完全吻合**。
+
+**根因**：camera_init（FAST-LIO 世界系）原点 = **初始化完成那一刻 IMU 的位姿**。初始化时飞机已离地（连续多次任务），camera_init z=0 ≈ 场地 2.1m 空中 → 整张地图 z 下沉 ~2m。xy 因初始化时水平位置≈起飞点而重合，所以柱子 xy 判定不受影响。
+
+**FAST-LIO IMU 初始化机制**（`FAST_LIO/src/IMU_Processing.hpp`）：
+- 做的事：对初始一小段 IMU 数据求均值——加速度均值=重力方向（定初始 roll/pitch），陀螺均值=gyro 零偏
+- 完成条件：`init_iter_num > MAX_INI_COUNT(10)`，即 ~10+ 个 IMU 数据点 = 第 1~2 帧点云，毫秒级完成
+- **不是性能问题，也不依赖运动**——恰恰假设 IMU 静止（运动时均值混入运动加速度 → 初始姿态不准）
+- 代码**无静止检测**，运动中也能"初始化"成功但结果不可靠
+- 日志 `IMU Initial Done` 延迟（如 t=57s）是节点等第一帧点云+IMU 的数据流就绪时间，非算法耗时
+
+**影响与处理**：
+- 对 2D 柱子检测**无害**：xy 吻合，把 ROI `z_min` 调宽（如 -1.0）覆盖偏移后的点带即可
+- 对消费 3D z 的模块**有害**：方环反投影 z、EGO 投影平面（`plane_z=0.7`）都会带 ~2m 偏移
+- **根治**：让 FAST-LIO 在飞机静止于地面时完成初始化（重启后确认未起飞再启动建图）
+
 ## 11. TODO
 
 ### 主攻方向：提速 -- 缩短整个任务流程时间
