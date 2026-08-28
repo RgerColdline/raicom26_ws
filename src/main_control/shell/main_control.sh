@@ -109,12 +109,12 @@ tmux send-keys -t "$SESSION:2" "sleep 14; source '${LIO_WS}/devel/setup.${CURREN
 
 # 右：EGO-Planner 路径规划与避障
 # 注: EGO 影子模式：仅规划+RViz可视化，飞控由 main_control PCL/traverse 全权负责
-tmux split-window -h -t "$SESSION:2"
-CMD_NAV="sleep 16; \
-source '${WS}/devel/setup.${CURRENT_SHELL}'; \
-source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
-roslaunch uav_navigation ego_nav.launch shadow_mode:=true"
-tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
+# tmux split-window -h -t "$SESSION:2"
+# CMD_NAV="sleep 16; \
+# source '${WS}/devel/setup.${CURRENT_SHELL}'; \
+# source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
+# roslaunch uav_navigation ego_nav.launch shadow_mode:=true"
+# tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
 
 tmux select-layout -t "$SESSION:2" tiled
 

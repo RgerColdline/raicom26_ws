@@ -117,12 +117,12 @@ tmux split-window -v -t "$SESSION:2"
 tmux send-keys -t "$SESSION:2" "sleep 14; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch pcl_detection2 pcl_detection2.launch" C-m
 
 # 右：EGO-Planner 路径规划与避障
-tmux split-window -h -t "$SESSION:2"
-CMD_NAV="sleep 16; \
-source '${WS}/devel/setup.${CURRENT_SHELL}'; \
-source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
-roslaunch uav_navigation ego_nav.launch shadow_mode:=true"
-tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
+# tmux split-window -h -t "$SESSION:2"
+# CMD_NAV="sleep 16; \
+# source '${WS}/devel/setup.${CURRENT_SHELL}'; \
+# source '${EGO_WS}/devel/setup.${CURRENT_SHELL}' --extend; \
+# roslaunch uav_navigation ego_nav.launch shadow_mode:=true"
+# tmux send-keys -t "$SESSION:2" "$CMD_NAV" C-m
 
 tmux select-layout -t "$SESSION:2" tiled
 
