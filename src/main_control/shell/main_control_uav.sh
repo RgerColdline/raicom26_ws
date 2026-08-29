@@ -74,7 +74,7 @@ tmux split-window -h -t "$SESSION:0"
 # roslaunch tutorial_gazebo sim.launch"
 # tmux send-keys -t "$SESSION:0" "$CMD_SIM" C-m
 CMD_UAV="sleep 3; \
-roslaunch abot_bringup location.launch"
+roslaunch abot_bringup location_accumu.launch"
 tmux send-keys -t "$SESSION:0" "$CMD_UAV" C-m
 
 tmux split-window -v -t "$SESSION:0"
@@ -110,10 +110,10 @@ tmux select-layout -t "$SESSION:1" tiled
 tmux new-window -t "$SESSION" -n "Perception_Nav"
 
 # 左上：FAST-LIO2 (LiDAR-IMU紧耦合SLAM)
-tmux send-keys -t "$SESSION:2" "sleep 10; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; roslaunch fast_lio mapping_mid360_fastlio.launch rviz:=false" C-m
+# tmux send-keys -t "$SESSION:2" "sleep 10; source '${LIO_WS}/devel/setup.${CURRENT_SHELL}'; roslaunch fast_lio mapping_mid360_fastlio.launch rviz:=false" C-m
 
 # 左下：PCL点云感知 (方环检测 + 障碍物处理)
-tmux split-window -v -t "$SESSION:2"
+# tmux split-window -v -t "$SESSION:2"
 tmux send-keys -t "$SESSION:2" "sleep 14; source '${WS}/devel/setup.${CURRENT_SHELL}'; roslaunch pcl_detection2 pcl_detection2.launch" C-m
 
 # 右：EGO-Planner 路径规划与避障
