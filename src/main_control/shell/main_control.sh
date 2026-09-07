@@ -31,8 +31,10 @@ SESSION="mission"
 tmux kill-session -t "$SESSION" 2>/dev/null
 sleep 1
 
-# 清理上次残留的Gazebo进程（不杀roscore，不影响其他ROS使用）
-killall -9 gzclient gzserver gazebo 2>/dev/null || true
+# 清理上次残留的Gazebo/px4进程（不杀roscore，不影响其他ROS使用）
+# 注：px4 必须清，否则残留实例会占住 PX4 instance 0，导致新 sitl 报
+#    "PX4 server already running" 直接退出
+killall -9 gzclient gzserver gazebo px4 2>/dev/null || true
 sleep 1
 
 echo "======================================"
@@ -61,9 +63,13 @@ tmux send-keys -t "$SESSION:0" "roscore" C-m
 
 tmux split-window -h -t "$SESSION:0"
 CMD_SIM="sleep 3; \
+export PX4_SIM_MODEL=iris; \
 source '${SIM_WS}/devel/setup.${CURRENT_SHELL}'; \
-source '${PX4_PATH}/Tools/setup_gazebo.sh' '${PX4_PATH}' '${PX4_PATH}/build/px4_sitl_default'; \
-export ROS_PACKAGE_PATH=\"\$ROS_PACKAGE_PATH:${PX4_PATH}:${PX4_PATH}/Tools/sitl_gazebo\"; \
+source '${PX4_PATH}/Tools/simulation/gazebo-classic/setup_gazebo.bash' '${PX4_PATH}' '${PX4_PATH}/build/px4_sitl_default'; \
+export LD_LIBRARY_PATH=\"/usr/lib/x86_64-linux-gnu/gazebo-11/plugins:\${LD_LIBRARY_PATH}\"; \
+export GAZEBO_PLUGIN_PATH=\"/home/gutlord/livox_plugin_ws/devel/lib:\${GAZEBO_PLUGIN_PATH}\"; \
+export GAZEBO_MODEL_PATH=\"\${GAZEBO_MODEL_PATH}:${SIM_WS}/src/tutorial_gazebo/models\"; \
+export ROS_PACKAGE_PATH=\"\$ROS_PACKAGE_PATH:${PX4_PATH}:${PX4_PATH}/Tools/simulation/gazebo-classic/sitl_gazebo-classic\"; \
 roslaunch tutorial_gazebo sim.launch"
 tmux send-keys -t "$SESSION:0" "$CMD_SIM" C-m
 
