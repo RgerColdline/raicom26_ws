@@ -170,7 +170,7 @@ struct Config
     double trav_v_max          = 0.5;
     double trav_a_max          = 0.4;
     double trav_a_lat_max      = 0.6;
-    double trav_inflation      = 0.3;
+    double trav_inflation      = 0.33;   // 机架0.225+桨叶旋转半径（与traverse_map.yaml一致）
     double trav_sample_ds      = 0.01;
     int trav_force_fly         = 0;
     float trav_timeout_margin  = 15.0f;
@@ -892,7 +892,7 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<double>("traverse/v_max", cfg.trav_v_max, 0.5);
     nh.param<double>("traverse/a_max", cfg.trav_a_max, 0.4);
     nh.param<double>("traverse/a_lat_max", cfg.trav_a_lat_max, 0.6);
-    nh.param<double>("traverse/inflation", cfg.trav_inflation, 0.3);
+    nh.param<double>("traverse/inflation", cfg.trav_inflation, 0.33);
     nh.param<double>("traverse/sample_ds", cfg.trav_sample_ds, 0.01);
     nh.param<int>("traverse/force_fly", cfg.trav_force_fly, 0);
     nh.param<float>("traverse/traj_timeout_margin", cfg.trav_timeout_margin, 15.0f);
