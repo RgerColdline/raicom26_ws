@@ -265,20 +265,13 @@ int main(int argc, char **argv)
 
             if (drop_sub_state == 1)
             {
-                ROS_INFO_THROTTLE(0.5, "[投货-下降] 当前(%.2f,%.2f,%.2f) -> 目标z=%.2f",
-                                  local_odom.pose.pose.position.x, local_odom.pose.pose.position.y,
-                                  local_odom.pose.pose.position.z, cfg.drop_z);
+                // 【改 2026-09】悬停识别完成后直接在悬停高度(投放区 1.3m)投货，
+                // 不再下降到 cfg.drop_z。
+                bool at_drop = moveTo(wp_drop_area);
 
-                bool reached_drop        = moveTo(wp_drop_area.x, wp_drop_area.y, cfg.drop_z);
-                bool descent_timeout_hit = (now - state_start_time).toSec() > cfg.descent_timeout;
-
-                if (reached_drop || descent_timeout_hit)
+                if (at_drop)
                 {
-                    if (descent_timeout_hit && !reached_drop)
-                        ROS_WARN("[投货] 下降超时(%.1fs)，当前 z=%.2f 未到投货高度，在当前位置触发投货",
-                                 cfg.descent_timeout, local_odom.pose.pose.position.z);
-                    else
-                        ROS_INFO("[投货] 到达投货高度 %.2f，触发投货", cfg.drop_z);
+                    ROS_INFO("[投货] 在悬停高度(%.2f)直接触发投货", local_odom.pose.pose.position.z);
 
                     std_msgs::UInt8 servo_msg;
                     servo_msg.data = cfg.cargo_drop_angle;
@@ -294,7 +287,7 @@ int main(int argc, char **argv)
 
             if (drop_sub_state == 2)
             {
-                moveTo(wp_drop_area.x, wp_drop_area.y, cfg.drop_z);
+                moveTo(wp_drop_area);
 
                 if ((now - last_drop_pub_time).toSec() > 0.2)
                 {
