@@ -35,10 +35,7 @@ include_directories(
     ${CMAKE_BINARY_DIR}/../devel/include  # for pcl_detection2/SquareRing.h
 )
 
-# 收集所有源文件
-file(GLOB SOURCES "src/*.cpp")
-
-# cpp compile part
-add_executable(main_control ${SOURCES})
+# 单文件过程式主控
+add_executable(main_control src/main_control.cpp)
 target_link_libraries(main_control ${catkin_LIBRARIES})
 add_dependencies(main_control ${catkin_EXPORTED_TARGETS} pcl_detection2_generate_messages_cpp) 
