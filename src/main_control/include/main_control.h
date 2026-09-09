@@ -1267,12 +1267,26 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
 
     // z_end 有效（返程直通）时：过环前（场地 x>=2.05）保持 flight_z，
     // 过环后随水平进度从 flight_z 线性降到 z_end —— 边飞边降，缩短最后降落时间
+    //
+    // ⚠️ 2026-09-09 修复挂网：原来直接按“当前轨迹点的场地 x<2.05 就降”，但返程
+    // 起点在射击区（场地 x≈1.1，本来就 <2.05），导致刚射击完还没往环走就被拉到
+    // 低高度（~0.66m）撞到靶区侧网。现在必须先确认轨迹已真正越过环进入末段
+    // 回家走廊（从轨迹末端倒扫到“最后一个场地 x>=2.05 的点”即过环时刻），
+    // 时刻未到一律保持 flight_z，全程不会再提前降高。
     double z_cmd = cfg.trav_flight_z;
     if (!std::isnan(z_end) && z_end > 0.0) {
-        double fx = origin_fx - sx;                       // 采样点场地 x
-        double r  = (2.05 - fx) / (2.05 - origin_fx);     // 过环点 -> 起飞点 的进度 [0,1]
-        r = std::max(0.0, std::min(1.0, r));
-        z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
+        double t_ring = T;                              // 默认整段不降（安全兜底）
+        const std::vector<TrajPoint> &tr = plan.traj;
+        for (int k = (int)tr.size() - 1; k >= 0; --k) {
+            double fxk = origin_fx - tr[k].x;           // odom -> 场地 x
+            if (fxk >= 2.05) { t_ring = tr[k].t; break; }
+        }
+        if (qt > t_ring && t_ring < T) {
+            double fx = origin_fx - sx;                 // 采样点场地 x
+            double r  = (2.05 - fx) / (2.05 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
+            r = std::max(0.0, std::min(1.0, r));
+            z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
+        }
     }
 
     current_setpoint.type_mask        = TRAV_TYPE_MASK_POSITION_ONLY;
