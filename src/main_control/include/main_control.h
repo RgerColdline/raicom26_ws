@@ -82,6 +82,7 @@ enum MissionState {
     TRAVERSE_SCAN,
     TRAVERSE_LEG2,
     TRAVERSE_RETURN_LEG2,
+    TRAVERSE_RETURN_HOME,   // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿
 
     RETURN,
     LAND,
@@ -172,12 +173,15 @@ struct Config
     double trav_a_lat_max      = 0.6;
     double trav_inflation      = 0.33;   // 机架0.225+桨叶旋转半径（与traverse_map.yaml一致）
     double trav_sample_ds      = 0.01;
-    int trav_force_fly         = 0;
+    int   trav_force_fly         = 0;
     float trav_timeout_margin  = 15.0f;
     float scan_hover_time      = 3.0f;
     float scan_timeout         = 4.0f;
     int default_case           = 1;
     int force_case             = -1;
+    int trav_early_scan        = 1;   // 1=起飞后立刻触发柱子检测，边飞边扫，检出且过环后当前位置直接切入 leg2（跳过悬停点停留）；0=旧行为到悬停点才扫
+    int trav_return_smooth     = 1;   // 1=射击后从当前位置单条平滑轨迹返程（倒放绕柱+穿环+回起飞点，中途不停顿）；0=旧行为分段返程
+    float trav_return_land_z   = 0.45f; // 返程直通末段目标高度(m)：过环后从 flight_z 边飞边线性降到该高度，缩短最后降落；<=0 禁用降高全程平飞
 } cfg;
 
 // ==================== ROS 通信 ====================
@@ -204,6 +208,7 @@ MissionState current_state = TRAVERSE_TO_SCAN;
 ros::Time state_start_time;
 bool init_pos_received = false;
 bool mission_finished  = false;
+ros::Time mission_start_time;  // 任务计时起点：无人机 arm 解锁成功那一刻
 
 // ==================== 无人机状态 ====================
 mavros_msgs::State current_mav_state;
@@ -237,6 +242,7 @@ bool a_on_left    = true;
 
 // ==================== 投货子状态 ====================
 int       drop_sub_state   = 0;
+int       drop_pub_count   = 0;   // 开舱指令已发送次数（节奏：0s/0.2s/0.4s 共 3 次）
 ros::Time last_drop_pub_time;
 ros::Time drop_hover_start;
 
@@ -296,6 +302,8 @@ struct TraversePlanResult
 };
 
 TraversePlanResult planner_leg2;
+TraversePlanResult planner_return;   // 返程直通轨迹（当前位置 -> 倒放leg2绕柱 -> 穿环 -> 起飞点）
+bool scan_trigger_sent = false;      // 去程前移触发只发一次（多发会反复 reset 检测的连续确认计数）
 
 // ==================== 函数声明 ====================
 // 初始化
@@ -330,7 +338,12 @@ bool timeout(const float timeout_limit);
 std::vector<CircleObs> caseCircles(int cid);
 bool planLeg2ForCase(int cid);
 bool tryPlanLeg2(int cid);
+bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field);
+bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out);
+bool planReturnFromCurrent();
 void printLeg2Report(int cid);
+bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, double goal_y,
+               const char *label, double z_end = NAN);
 bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label);
 
 // ==================== 样条 / 规划器辅助函数实现 ====================
@@ -900,6 +913,9 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<float>("traverse/scan_timeout", cfg.scan_timeout, 4.0f);
     nh.param<int>("traverse/default_case", cfg.default_case, 1);
     nh.param<int>("traverse/force_case", cfg.force_case, -1);
+    nh.param<int>("traverse/early_scan", cfg.trav_early_scan, 1);
+    nh.param<int>("traverse/return_smooth", cfg.trav_return_smooth, 1);
+    nh.param<float>("traverse/return_land_z", cfg.trav_return_land_z, 0.45f);
     nh.param<double>("map/origin_x", origin_fx, 0.65);
     nh.param<double>("map/origin_y", origin_fy, 0.75);
     nh.param<double>("map/pillar_radius", pillar_radius, 0.1);
@@ -1050,6 +1066,26 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
         }
     }
 
+    // ---- 返程直通预检（return_smooth=1 时）：模拟射击点出发，倒放leg2+穿环走廊+起飞点 ----
+    // 预检起点取左射击点（场地系换算；南北两射击点中跨度更大更保守），运行时用实际位置重规划+校验
+    if (cfg.trav_return_smooth == 1) {
+        Vec2f shoot_start{origin_fx - cfg.shoot_left_x, origin_fy - cfg.shoot_left_y};
+        ROS_INFO("[穿越] 返程直通预检：4 套返程轨迹（射击点出发，倒放绕柱+穿环+回起点）净距一览");
+        for (int cid = 0; cid < 4; cid++) {
+            std::vector<Vec2f> via_ret;
+            TraversePlanResult tp;
+            if (!buildReturnVia(cid, shoot_start, via_ret)) {
+                ROS_WARN("[穿越]   case%d 返程途经点构造失败", cid);
+                continue;
+            }
+            traverse_plan(tp, via_ret, origin_fx, origin_fy, walls, caseCircles(cid),
+                          cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds);
+            ROS_INFO("[穿越]   case%d 返程：总长 %.2f m，时长 %.1f s，最小净距 %.3f m %s",
+                     cid, tp.total_length, traverse_duration(tp), tp.min_clearance,
+                     tp.min_clearance >= cfg.trav_inflation ? "✓" : "✗ 偏紧（运行时校验兜底）");
+        }
+    }
+
     traverse_cfg_ok = true;
     ROS_INFO("[穿越] 地图加载完成：悬停扫描点 odom(%.2f, %.2f)，投放区 odom(%.2f, %.2f)，定高 %.2f",
              hover_ox, hover_oy, end_x, end_y, cfg.trav_flight_z);
@@ -1118,20 +1154,102 @@ bool tryPlanLeg2(int cid) {
     return false;
 }
 
-bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label) {
+bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field) {
+    // 边飞边扫命中后：把 leg2 途经点首点（悬停点）替换为当前位置重新规划，
+    // 无人机无需到悬停点停稳，直接切入绕柱轨迹。净距校验与完整版一致。
+    if (cid < 0 || cid > 3 || via_leg2[cid].size() < 2) return false;
+
+    std::vector<Vec2f> via = via_leg2[cid];
+    via.front() = cur_field;
+
+    if (!traverse_plan(planner_leg2, via, origin_fx, origin_fy, walls, caseCircles(cid),
+                       cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds)) {
+        ROS_WARN("[穿越] 当前位置(场地 %.2f,%.2f)切入 case%d 规划失败", cur_field.x, cur_field.y, cid);
+        return false;
+    }
+    ROS_INFO("[穿越] 当前位置(场地 %.2f,%.2f)切入 case%d：总长 %.2f m，时长 %.1f s，最小净距 %.3f m %s",
+             cur_field.x, cur_field.y, cid, planner_leg2.total_length,
+             traverse_duration(planner_leg2), planner_leg2.min_clearance,
+             planner_leg2.min_clearance >= cfg.trav_inflation ? "✓" : "✗");
+    if (planner_leg2.min_clearance >= cfg.trav_inflation) {
+        active_case = cid;
+        return true;
+    }
+    return false;
+}
+
+bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out) {
+    // 返程直通途经点（场地系）：起点 -> 倒放 leg2（绕柱区入口 -> 悬停点）-> 穿环走廊 -> 起飞点
+    // 倒放跳过 leg2 末点（投放区），第一个途经点 = leg2 倒数第二点（投放/射击区与绕柱区之间），
+    // 射击点直连该点，不去投放区拐弯。穿环走廊：悬停点与孔之间拉直 -> 过孔中心 -> 孔与出生点之间拉直 -> 起飞点
+    if (cid < 0 || cid > 3 || via_leg2[cid].size() < 3) return false;
+    out.clear();
+    // 防重复点（重复点会让样条弦长参数 h=0 导致除零）：起点离倒放首点太近就不单独加起点
+    const Vec2f &entry = via_leg2[cid][via_leg2[cid].size() - 2];   // 绕柱区入口（leg2 倒数第二点）
+    if (std::hypot(start_field.x - entry.x, start_field.y - entry.y) > 0.1)
+        out.push_back(start_field);                            // 起点（射击点/当前位置）
+    for (int i = (int)via_leg2[cid].size() - 2; i >= 0; --i)   // 倒放绕柱：绕柱区入口 -> ... -> 悬停点（跳过投放区）
+        out.push_back(via_leg2[cid][i]);
+    Vec2f mid1{0.5 * (scan_hover_fx + 2.0), scan_hover_fy};    // 悬停点与孔之间拉直（抑制拐弯外凸）
+    Vec2f hole{2.0, scan_hover_fy};                            // 过孔中心（x=2，孔 y 中心=出生点 y）
+    Vec2f mid2{0.5 * (origin_fx + 2.0), origin_fy};            // 孔与出生点之间拉直
+    Vec2f home{origin_fx, origin_fy};                          // 起飞点
+    out.push_back(mid1);
+    out.push_back(hole);
+    out.push_back(mid2);
+    out.push_back(home);
+    return true;
+}
+
+bool planReturnFromCurrent() {
+    // 射击完成后：以当前位置为首点规划单条返程直通轨迹（中途不停顿）。
+    // 净距不达标返回 false，由调用方回退分段返程（TRAVERSE_RETURN_LEG2）。
+    if (active_case < 0 || active_case > 3) return false;
+
+    Vec2f cur_field;
+    cur_field.x = origin_fx - local_odom.pose.pose.position.x;   // odom -> 场地 反变换
+    cur_field.y = origin_fy - local_odom.pose.pose.position.y;
+
+    std::vector<Vec2f> via;
+    if (!buildReturnVia(active_case, cur_field, via)) return false;
+
+    if (!traverse_plan(planner_return, via, origin_fx, origin_fy, walls, caseCircles(active_case),
+                       cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds)) {
+        ROS_ERROR("[返程] 直通轨迹规划失败（途经点异常）");
+        return false;
+    }
+    ROS_INFO("[返程] 直通轨迹：起点场地(%.2f,%.2f)，总长 %.2f m，时长 %.1f s，最小净距 %.3f m %s",
+             cur_field.x, cur_field.y, planner_return.total_length,
+             traverse_duration(planner_return), planner_return.min_clearance,
+             planner_return.min_clearance >= cfg.trav_inflation ? "✓" : "✗ 回退分段返程");
+    return planner_return.min_clearance >= cfg.trav_inflation || cfg.trav_force_fly == 1;
+}
+
+bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, double goal_y,
+               const char *label, double z_end) {
     double t  = (ros::Time::now() - leg_start_time).toSec();
-    double T  = traverse_duration(planner_leg2);
+    double T  = traverse_duration(plan);
     double qt = reverse ? (T - t) : t;
     if (qt < 0.0) qt = 0.0;
 
     double sx, sy;
-    traverse_sample(planner_leg2, qt, sx, sy);
+    traverse_sample(plan, qt, sx, sy);
+
+    // z_end 有效（返程直通）时：过环前（场地 x>=2.05）保持 flight_z，
+    // 过环后随水平进度从 flight_z 线性降到 z_end —— 边飞边降，缩短最后降落时间
+    double z_cmd = cfg.trav_flight_z;
+    if (!std::isnan(z_end) && z_end > 0.0) {
+        double fx = origin_fx - sx;                       // 采样点场地 x
+        double r  = (2.05 - fx) / (2.05 - origin_fx);     // 过环点 -> 起飞点 的进度 [0,1]
+        r = std::max(0.0, std::min(1.0, r));
+        z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
+    }
 
     current_setpoint.type_mask        = TRAV_TYPE_MASK_POSITION_ONLY;
     current_setpoint.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     current_setpoint.position.x       = sx;
     current_setpoint.position.y       = sy;
-    current_setpoint.position.z       = cfg.trav_flight_z;
+    current_setpoint.position.z       = z_cmd;
     current_setpoint.yaw              = init_yaw;
 
     double cx = local_odom.pose.pose.position.x;
@@ -1140,10 +1258,10 @@ bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label) {
 
     bool arrived = (fabs(cx - goal_x) < cfg.trav_err_max &&
                     fabs(cy - goal_y) < cfg.trav_err_max &&
-                    fabs(cz - cfg.trav_flight_z) < cfg.trav_err_max);
+                    fabs(cz - z_cmd) < cfg.trav_err_max);
 
-    ROS_INFO_THROTTLE(0.5, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f) 当前(%.2f,%.2f,%.2f)",
-                      label, t, T, sx, sy, cx, cy, cz);
+    ROS_INFO_THROTTLE(0.5, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f,%.2f) 当前(%.2f,%.2f,%.2f)",
+                      label, t, T, sx, sy, z_cmd, cx, cy, cz);
 
     if (t >= T && arrived) return true;
 
@@ -1153,6 +1271,10 @@ bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label) {
         return true;
     }
     return false;
+}
+
+bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label) {
+    return trackPlan(planner_leg2, reverse, goal_x, goal_y, label);
 }
 
 #endif // MAIN_CONTROL_H

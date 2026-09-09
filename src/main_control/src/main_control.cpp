@@ -125,6 +125,7 @@ int main(int argc, char **argv)
                 if (arming_client.call(arm_cmd) && arm_cmd.response.success)
                 {
                     ROS_INFO("✓ 无人机已解锁");
+                    mission_start_time = ros::Time::now();   // 任务计时起点（arm 成功）
                 }
                 last_request = ros::Time::now();
             }
@@ -273,10 +274,13 @@ int main(int argc, char **argv)
                 {
                     ROS_INFO("[投货] 在悬停高度(%.2f)直接触发投货", local_odom.pose.pose.position.z);
 
+                    // 开舱指令第 1/3 次（t=0s），后续 0.2s/0.4s 各补发一次
                     std_msgs::UInt8 servo_msg;
                     servo_msg.data = cfg.cargo_drop_angle;
                     servo_control_pub.publish(servo_msg);
-                    ROS_INFO("[投货] 已发送投货指令(角度 %d -> 0x03 -> 货舱打开)", cfg.cargo_drop_angle);
+                    drop_pub_count = 1;
+                    ROS_INFO("[投货] 开舱指令 1/3 (角度 %d -> 0x03 -> 货舱打开)",
+                             cfg.cargo_drop_angle);
 
                     drop_sub_state     = 2;
                     state_start_time   = now;
@@ -289,23 +293,28 @@ int main(int argc, char **argv)
             {
                 moveTo(wp_drop_area);
 
-                if ((now - last_drop_pub_time).toSec() > 0.2)
+                // 开舱指令第 2/3 次（t=0.2s）、第 3/3 次（t=0.4s）：固定节奏共发 3 次
+                double t_drop = (now - state_start_time).toSec();
+                if (drop_pub_count < 3 && t_drop >= 0.2 * drop_pub_count)
                 {
                     std_msgs::UInt8 servo_msg;
                     servo_msg.data = cfg.cargo_drop_angle;
                     servo_control_pub.publish(servo_msg);
-                    ROS_INFO_THROTTLE(0.5, "[投货] 持续发送投货指令(角度 %d -> 0x03 -> 货舱打开)",
-                                      cfg.cargo_drop_angle);
+                    ++drop_pub_count;
+                    ROS_INFO("[投货] 开舱指令 %d/3 (t=%.1fs, 角度 %d -> 0x03)",
+                             drop_pub_count, t_drop, cfg.cargo_drop_angle);
                     last_drop_pub_time = now;
                 }
 
-                if ((now - state_start_time).toSec() > cfg.cargo_hold_time)
+                // 3 次开舱发完即关舱，直接进入射击流程（不再等 cargo_hold_time）
+                if (drop_pub_count >= 3 && t_drop >= 0.5)
                 {
                     std_msgs::UInt8 reset_msg;
                     reset_msg.data = cfg.cargo_reset_angle;
                     for (int i = 0; i < 3; ++i)
                         servo_control_pub.publish(reset_msg);
-                    ROS_INFO("[投货] 投货完成，货舱复位(角度 %d -> 0x04 -> 货舱关闭) x3",
+                    ROS_INFO("[投货] 3 次开舱完成(0/0.2/0.4s)，货舱复位(角度 %d -> 0x04 -> 关闭) x3，"
+                             "直接进入射击流程",
                              cfg.cargo_reset_angle);
 
                     drop_sub_state   = 0;
@@ -437,14 +446,22 @@ int main(int argc, char **argv)
 
             if ((ros::Time::now() - shoot_time).toSec() > cfg.shoot_duration)
             {
-                if (pillar_nav_mode == "pcl" && traverse_cfg_ok) {
-                    current_state  = TRAVERSE_RETURN_LEG2;  // 射击后直接倒放返程，不回投放区
+                if (pillar_nav_mode == "pcl" && traverse_cfg_ok && cfg.trav_return_smooth == 1 &&
+                    planReturnFromCurrent())
+                {
+                    // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条平滑轨迹中途不停顿
+                    current_state  = TRAVERSE_RETURN_HOME;
+                    leg_start_time = ros::Time::now();
+                    ROS_INFO("[射击] 射击完成，返程直通轨迹已规划（不回悬停点、穿环不停顿）");
+                }
+                else if (pillar_nav_mode == "pcl" && traverse_cfg_ok) {
+                    current_state  = TRAVERSE_RETURN_LEG2;  // 回退：分段返程（倒放leg2停悬停点再穿环）
                     leg_start_time = ros::Time::now();
                 } else {
                     current_state = READY_NAV_TO_RING_BACK;
                 }
                 state_start_time = ros::Time::now();
-                ROS_INFO("[射击] 射击完成，直接返程");
+                ROS_INFO("[射击] 射击完成，开始返程");
             }
         }
         break;
@@ -546,6 +563,40 @@ int main(int argc, char **argv)
         // ========== 状态: 穿环后飞到悬停扫描点 ==========
         case TRAVERSE_TO_SCAN:
         {
+            // 【边飞边扫】起飞进入本状态即触发柱子检测（只发一次，多发会反复 reset 连续确认计数），
+            // 无人机边穿环边扫，无需到悬停点才开始
+            if (cfg.trav_early_scan == 1 && !scan_trigger_sent && cfg.force_case < 0)
+            {
+                std_msgs::Empty trig;
+                pillar_start_pub.publish(trig);
+                scan_trigger_sent = true;
+                ROS_INFO("[穿越] 前移触发柱子检测：边飞边扫，扫到即切（不再等悬停点）");
+            }
+
+            // 【扫到即切】已检出 case 且已穿环（场地 x>2.05）：
+            // 用当前位置替换 leg2 首点重规划，直接切入绕柱段，跳过悬停点
+            if (cfg.trav_early_scan == 1 && detected_case >= 0)
+            {
+                double cur_fx = origin_fx - local_odom.pose.pose.position.x;
+                double cur_fy = origin_fy - local_odom.pose.pose.position.y;
+                if (cur_fx > 2.05)
+                {
+                    Vec2f cur_field{cur_fx, cur_fy};
+                    if (tryPlanLeg2FromCurrent(detected_case, cur_field))
+                    {
+                        ROS_INFO("[穿越] ✓ 边飞边扫命中 case%d（%s），当前位置切入 leg2，跳过悬停点",
+                                 active_case, TRAV_CASE_DESC[active_case]);
+                        current_state    = TRAVERSE_LEG2;
+                        nav_goal_sent    = false;
+                        leg_start_time   = ros::Time::now();
+                        state_start_time = ros::Time::now();
+                        break;
+                    }
+                    ROS_WARN_THROTTLE(1.0, "[穿越] 当前位置切入 case%d 净距不达标，继续飞悬停点用完整途经点兜底",
+                                      detected_case);
+                }
+            }
+
             if (!nav_goal_sent)
             {
                 sendEgoGoal(hover_ox, hover_oy, cfg.trav_flight_z);
@@ -673,7 +724,7 @@ int main(int argc, char **argv)
         }
         break;
 
-        // ========== 状态: 返程 leg2 时间倒放（投放区 -> 悬停扫描点） ==========
+        // ========== 状态: 返程 leg2 时间倒放（投放区 -> 悬停扫描点）【旧回退路径】 ==========
         case TRAVERSE_RETURN_LEG2:
         {
             if (!nav_goal_sent)
@@ -684,6 +735,25 @@ int main(int argc, char **argv)
             {
                 ROS_INFO("[穿越] ✓ 回到悬停扫描点，准备穿环返回");
                 current_state    = RETURN_CROSS_RING;
+                nav_goal_sent    = false;
+                state_start_time = ros::Time::now();
+            }
+        }
+        break;
+
+        // ========== 状态: 返程直通（当前位置 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿） ==========
+        case TRAVERSE_RETURN_HOME:
+        {
+            if (!nav_goal_sent)
+            {
+                sendEgoGoal(init_pos_x, init_pos_y, init_pos_z + cfg.takeoff_height);
+            }
+            // z_end=return_land_z：过环后边飞边降到低高度，到起飞点时已接近落地高度
+            if (trackPlan(planner_return, false, init_pos_x, init_pos_y, "返程直通",
+                          cfg.trav_return_land_z))
+            {
+                ROS_INFO("[穿越] ✓ 返程直通完成（穿环不停顿+末段降高），已到起飞点，直接降落");
+                current_state    = LAND;   // 轨迹终点即起飞点（无需 RETURN 精修），直接进降落
                 nav_goal_sent    = false;
                 state_start_time = ros::Time::now();
             }
@@ -757,6 +827,14 @@ int main(int argc, char **argv)
             current_setpoint.position.z       = init_pos_z;
             current_setpoint.yaw              = init_yaw;
             mission_finished                  = true;
+
+            // 任务计时：arm 解锁成功 -> 降落完毕，目标 50s 内
+            double t_mission = (ros::Time::now() - mission_start_time).toSec();
+            ROS_INFO("╔══════════════════════════════════════╗");
+            ROS_INFO("║          ★ 任务计时 ★");
+            ROS_INFO("║  任务时长（arm→降落完成）: %.1f s", t_mission);
+            ROS_INFO("║  50s 目标: %s", (t_mission <= 50.0) ? "✓ 达标" : "✗ 未达标");
+            ROS_INFO("╚══════════════════════════════════════╝");
             ROS_INFO("任务完成，节点退出");
         }
         break;
