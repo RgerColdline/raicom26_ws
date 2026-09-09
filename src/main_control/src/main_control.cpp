@@ -179,387 +179,6 @@ int main(int argc, char **argv)
         switch (current_state)
         {
 
-        // ========== 状态: 导航至物资投放区（EGO 回退路径） ==========
-        case NAV_TO_DROP_AREA:
-        {
-            static bool come_mid_reached = false;
-
-            Waypoint mid_target(init_pos_x + wp_come_mid.x, init_pos_y + wp_come_mid.y,
-                                init_pos_z + wp_come_mid.z);
-            Waypoint drop_target(init_pos_x + wp_drop_area.x, init_pos_y + wp_drop_area.y,
-                                 init_pos_z + wp_drop_area.z);
-
-            if (!come_mid_reached)
-            {
-                bool mid_arrived = (pillar_nav_mode == "pcl") ? moveTo(mid_target) : navTo(mid_target);
-                if (mid_arrived)
-                {
-                    come_mid_reached = true;
-                    ROS_INFO_STREAM("到达中途点，继续前往投放区");
-                    nav_goal_sent = false;
-                    nav_status    = 0;
-                }
-                break;
-            }
-            bool drop_arrived = (pillar_nav_mode == "pcl") ? moveTo(drop_target) : navTo(drop_target);
-            if (drop_arrived)
-            {
-                current_state      = HOVER_RECOG_DROP;
-                drop_sub_state     = 0;
-                drop_hover_start   = ros::Time(0);
-                last_drop_pub_time = ros::Time(0);
-                nav_goal_sent      = false;
-                nav_status         = 0;
-                state_start_time   = ros::Time::now();
-
-                down_vote_a = 0;
-                down_vote_b = 0;
-                down_voting = true;
-                ROS_INFO("到达投放区，开始悬停投货流程 + 下视字母识别投票");
-            }
-        }
-        break;
-
-        // ========== 状态: 悬停识别投放区标识（下视字母投票） ==========
-        case HOVER_RECOG_DROP:
-        {
-            moveTo(wp_drop_area);
-
-            if (drop_hover_start.isZero())
-            {
-                drop_hover_start = ros::Time::now();
-            }
-
-            ROS_INFO_THROTTLE(0.5, "[投货-悬停] 当前(%.2f,%.2f,%.2f) 保持投放区, 剩余 %.1fs",
-                              local_odom.pose.pose.position.x, local_odom.pose.pose.position.y,
-                              local_odom.pose.pose.position.z,
-                              cfg.drop_hover_time - (ros::Time::now() - drop_hover_start).toSec());
-
-            if ((ros::Time::now() - drop_hover_start).toSec() > cfg.drop_hover_time)
-            {
-                down_voting = false;
-                if (down_vote_a >= cfg.down_min_votes || down_vote_b >= cfg.down_min_votes)
-                {
-                    shoot_letter = (down_vote_a >= down_vote_b) ? "A" : "B";
-                    ROS_INFO("[投货] ✓ 下视字母识别完成：%s（A=%d 票 B=%d 票）-> 射击 %s 靶",
-                             shoot_letter.c_str(), down_vote_a, down_vote_b, shoot_letter.c_str());
-                }
-                else
-                {
-                    shoot_letter = cfg.attack_real_target;
-                    ROS_WARN("[投货] ⚠ 下视字母票数不足（A=%d B=%d，需≥%d），回退兜底字母 %s",
-                             down_vote_a, down_vote_b, cfg.down_min_votes, shoot_letter.c_str());
-                }
-
-                ROS_INFO("[投货] 悬停 %.1fs 完成，开始下降投货", cfg.drop_hover_time);
-                drop_sub_state   = 1;
-                state_start_time = ros::Time::now();
-                current_state    = DROP_SUPPLY;
-            }
-        }
-        break;
-
-        // ========== 状态: 投放物资箱 ==========
-        case DROP_SUPPLY:
-        {
-            const ros::Time now = ros::Time::now();
-
-            if (drop_sub_state == 1)
-            {
-                // 【改 2026-09】悬停识别完成后直接在悬停高度(投放区 1.3m)投货，
-                // 不再下降到 cfg.drop_z。
-                bool at_drop = moveTo(wp_drop_area);
-
-                if (at_drop)
-                {
-                    ROS_INFO("[投货] 在悬停高度(%.2f)直接触发投货", local_odom.pose.pose.position.z);
-
-                    // 开舱指令第 1/3 次（t=0s），后续 0.2s/0.4s 各补发一次
-                    std_msgs::UInt8 servo_msg;
-                    servo_msg.data = cfg.cargo_drop_angle;
-                    servo_control_pub.publish(servo_msg);
-                    drop_pub_count = 1;
-                    ROS_INFO("[投货] 开舱指令 1/3 (角度 %d -> 0x03 -> 货舱打开)",
-                             cfg.cargo_drop_angle);
-
-                    drop_sub_state     = 2;
-                    state_start_time   = now;
-                    last_drop_pub_time = now;
-                }
-                break;
-            }
-
-            if (drop_sub_state == 2)
-            {
-                moveTo(wp_drop_area);
-
-                // 开舱指令第 2/3 次（t=0.2s）、第 3/3 次（t=0.4s）：固定节奏共发 3 次
-                double t_drop = (now - state_start_time).toSec();
-                if (drop_pub_count < 3 && t_drop >= 0.2 * drop_pub_count)
-                {
-                    std_msgs::UInt8 servo_msg;
-                    servo_msg.data = cfg.cargo_drop_angle;
-                    servo_control_pub.publish(servo_msg);
-                    ++drop_pub_count;
-                    ROS_INFO("[投货] 开舱指令 %d/3 (t=%.1fs, 角度 %d -> 0x03)",
-                             drop_pub_count, t_drop, cfg.cargo_drop_angle);
-                    last_drop_pub_time = now;
-                }
-
-                // 3 次开舱发完即关舱，直接进入射击流程（不再等 cargo_hold_time）
-                if (drop_pub_count >= 3 && t_drop >= 0.5)
-                {
-                    std_msgs::UInt8 reset_msg;
-                    reset_msg.data = cfg.cargo_reset_angle;
-                    for (int i = 0; i < 3; ++i)
-                        servo_control_pub.publish(reset_msg);
-                    ROS_INFO("[投货] 3 次开舱完成(0/0.2/0.4s)，货舱复位(角度 %d -> 0x04 -> 关闭) x3，"
-                             "直接进入射击流程",
-                             cfg.cargo_reset_angle);
-
-                    drop_sub_state   = 0;
-                    current_state    = RECOG_ATTACK_TARGET;
-                    nav_goal_sent    = false;
-                    state_start_time = now;
-                }
-            }
-        }
-        break;
-
-        // ========== 状态: 移动至攻击目标识别区（已弃用，正常流程不会进入） ==========
-        case MOVE_TO_ATTACK_AREA:
-        {
-            if (moveTo(wp_attack_area))
-            {
-                current_state    = RECOG_ATTACK_TARGET;
-                nav_goal_sent    = false;
-                state_start_time = ros::Time::now();
-                front_target_matched = false;
-                matched_target.clear();
-                matched_center_x = 0.0f;
-                matched_center_y = 0.0f;
-                last_matched_time = ros::Time(0);
-                ROS_INFO("升回攻击区高度(%.2f)，按投货识别字母 %s 选择射击点", cfg.shoot_z,
-                         shoot_letter.c_str());
-            }
-            else
-            {
-                ROS_INFO_THROTTLE(0.5, "[攻击] 升回攻击区高度中... 当前 z=%.2f",
-                                  local_odom.pose.pose.position.z);
-            }
-        }
-        break;
-
-        // ========== 状态: 识别正确攻击目标（固定映射选射击点） ==========
-        case RECOG_ATTACK_TARGET:
-        {
-            bool letter_is_a = (shoot_letter != "B");
-            bool go_left     = (letter_is_a == a_on_left);
-
-            shoot_target_x = go_left ? cfg.shoot_left_x : cfg.shoot_right_x;
-            shoot_target_y = go_left ? cfg.shoot_left_y : cfg.shoot_right_y;
-
-            ROS_INFO("[识别] 投货识别字母 = %s -> 射击 %s 靶（%s射击点 %.2f, %.2f）",
-                     shoot_letter.c_str(), letter_is_a ? "A" : "B",
-                     go_left ? "左" : "右", shoot_target_x, shoot_target_y);
-
-            current_state    = ALIGN_ATTACK_TARGET;
-            state_start_time = ros::Time::now();
-        }
-        break;
-
-        // ========== 状态: 移动到目标正前方（已弃用） ==========
-        case MOVE_TO_FRONT_OF_TARGET:
-        {
-            Eigen::Vector3f front_pos =
-                attack_target_world +
-                Eigen::Vector3f(cfg.target_front_offset_x, cfg.target_front_offset_y, 0.0f);
-            if (moveTo(front_pos.x(), front_pos.y(), front_pos.z()))
-            {
-                current_state         = ALIGN_ATTACK_TARGET;
-                nav_goal_sent         = false;
-                state_start_time      = ros::Time::now();
-                last_pid_control_time = ros::Time(0);
-                ROS_INFO("已到达攻击位置，开始前视像素对准");
-            }
-        }
-        break;
-
-        // ========== 状态: 前视像素对准目标 ==========
-        case ALIGN_ATTACK_TARGET:
-        {
-            static bool arrived = false;
-
-            if (moveTo(shoot_target_x, shoot_target_y, cfg.shoot_z))
-            {
-                if (!arrived)
-                {
-                    arrived           = true;
-                    state_start_time  = ros::Time::now();
-                    ROS_INFO("[射击] 到达射击点(%.2f, %.2f, %.2f)，稳定 %.1fs 后射击",
-                             shoot_target_x, shoot_target_y, cfg.shoot_z, cfg.shoot_stable_time);
-                }
-
-                if (timeout(cfg.shoot_stable_time))
-                {
-                    arrived           = false;
-                    shoot_triggered   = false;
-                    current_state     = SIMULATE_ATTACK;
-                    state_start_time  = ros::Time::now();
-                }
-            }
-            else
-            {
-                arrived = false;
-                ROS_INFO_THROTTLE(0.5, "[射击] 飞向射击点(%.2f, %.2f, %.2f)...",
-                                  shoot_target_x, shoot_target_y, cfg.shoot_z);
-            }
-        }
-        break;
-
-        // ========== 状态: 激光指示攻击 ==========
-        case SIMULATE_ATTACK:
-        {
-            hover();
-
-            if (!shoot_triggered)
-            {
-                std_msgs::Bool laser_off;
-                laser_off.data = false;
-                laser_control_pub.publish(laser_off);
-
-                std_msgs::Empty shoot_msg;
-                shoot_pub.publish(shoot_msg);
-
-                ROS_INFO("╔════════════════════════════════════════╗");
-                ROS_INFO("║          ★★★ 射击！ ★★★            ║");
-                ROS_INFO("║  射击坐标: (%.3f, %.3f, %.3f)",
-                         local_odom.pose.pose.position.x, local_odom.pose.pose.position.y,
-                         local_odom.pose.pose.position.z);
-                ROS_INFO("║  投货识别字母: %s -> 射击 %s 靶", shoot_letter.c_str(),
-                         (shoot_letter != "B") ? "A" : "B");
-                ROS_INFO("╚════════════════════════════════════════╝");
-
-                shoot_triggered = true;
-                shoot_time      = ros::Time::now();
-            }
-
-            if ((ros::Time::now() - shoot_time).toSec() > cfg.shoot_duration)
-            {
-                if (pillar_nav_mode == "pcl" && traverse_cfg_ok && cfg.trav_return_smooth == 1 &&
-                    planReturnFromCurrent())
-                {
-                    // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条平滑轨迹中途不停顿
-                    current_state  = TRAVERSE_RETURN_HOME;
-                    leg_start_time = ros::Time::now();
-                    ROS_INFO("[射击] 射击完成，返程直通轨迹已规划（不回悬停点、穿环不停顿）");
-                }
-                else if (pillar_nav_mode == "pcl" && traverse_cfg_ok) {
-                    current_state  = TRAVERSE_RETURN_LEG2;  // 回退：分段返程（倒放leg2停悬停点再穿环）
-                    leg_start_time = ros::Time::now();
-                } else {
-                    current_state = READY_NAV_TO_RING_BACK;
-                }
-                state_start_time = ros::Time::now();
-                ROS_INFO("[射击] 射击完成，开始返程");
-            }
-        }
-        break;
-
-        // ========== 状态: 返程导航（EGO 回退路径） ==========
-        case NAV_TO_RING_BACK:
-        {
-            static bool back_mid_reached = false;
-
-            Waypoint mid_target(init_pos_x + wp_back_mid.x, init_pos_y + wp_back_mid.y,
-                                init_pos_z + wp_come_mid.z);
-
-            Waypoint ring_back(init_pos_x + wp_ring_back.x, init_pos_y + wp_ring_back.y,
-                               init_pos_z + wp_ring_back.z);
-
-            if (!back_mid_reached)
-            {
-                if (navTo(mid_target))
-                {
-                    back_mid_reached  = true;
-                    nav_goal_sent     = false;
-                    state_start_time  = ros::Time::now();
-                    nav_status        = 0;
-                    ROS_INFO_STREAM("到达中途点，继续返程");
-                }
-                break;
-            }
-            if (navTo(ring_back))
-            {
-                current_state    = RETURN_CROSS_RING;
-                nav_goal_sent    = false;
-                state_start_time = ros::Time::now();
-                ROS_INFO_STREAM("已通过ego_planner穿过随机障碍物，准备返回穿环");
-            }
-        }
-        break;
-
-        // ========== 状态: 返程前先回到投放区 ==========
-        case READY_NAV_TO_RING_BACK:
-        {
-            Waypoint forward_target(init_pos_x + wp_drop_area.x, init_pos_y + wp_drop_area.y,
-                                    init_pos_z + wp_drop_area.z);
-            if (moveTo(forward_target.x, forward_target.y, forward_target.z))
-            {
-                current_state    = NAV_TO_RING_BACK;
-                nav_goal_sent    = false;
-                state_start_time = ros::Time::now();
-                ROS_INFO("到达投放区，开始返程");
-            }
-        }
-        break;
-
-        // ========== 状态: 返回穿环（固定航点，垂直穿过环） ==========
-        case RETURN_CROSS_RING:
-        {
-            static RingReturnSubState sub_state = RR_MOVE_TO_RING_FRONT;
-
-            switch (sub_state)
-            {
-            case RR_MOVE_TO_RING_FRONT:
-            {
-                // Phase1: 先飞到环后方（y=0 中心线，正对环孔，给垂直穿环留出对位余量）
-                if (!nav_goal_sent)
-                {
-                    sendEgoGoal(init_pos_x + wp_ring_back.x, init_pos_y + wp_ring_back.y,
-                                init_pos_z + wp_ring_back.z);
-                }
-                if (moveTo(wp_ring_back))
-                {
-                    sub_state         = RR_CROSS_RING;
-                    nav_goal_sent     = false;
-                    state_start_time  = ros::Time::now();
-                    ROS_INFO_STREAM("到达环后方，准备垂直穿环");
-                }
-                break;
-            }
-            case RR_CROSS_RING:
-            default:
-            {
-                // Phase2: 沿 y=0 直线垂直穿过环孔，到环前方
-                if (!nav_goal_sent)
-                {
-                    sendEgoGoal(init_pos_x + wp_ring_front.x, init_pos_y + wp_ring_front.y,
-                                init_pos_z + wp_ring_front.z);
-                }
-                if (moveTo(wp_ring_front))
-                {
-                    current_state      = RETURN;
-                    nav_goal_sent      = false;
-                    state_start_time   = ros::Time::now();
-                    ROS_INFO_STREAM("已垂直穿环，正在返回起飞点上方");
-                }
-                break;
-            }
-            }
-        }
-        break;
-
         // ========== 状态: 穿环后飞到悬停扫描点 ==========
         case TRAVERSE_TO_SCAN:
         {
@@ -724,19 +343,249 @@ int main(int argc, char **argv)
         }
         break;
 
-        // ========== 状态: 返程 leg2 时间倒放（投放区 -> 悬停扫描点）【旧回退路径】 ==========
-        case TRAVERSE_RETURN_LEG2:
+        // ========== 状态: 导航至物资投放区（EGO 回退路径） ==========
+        case NAV_TO_DROP_AREA:
         {
-            if (!nav_goal_sent)
+            static bool come_mid_reached = false;
+
+            Waypoint mid_target(init_pos_x + wp_come_mid.x, init_pos_y + wp_come_mid.y,
+                                init_pos_z + wp_come_mid.z);
+            Waypoint drop_target(init_pos_x + wp_drop_area.x, init_pos_y + wp_drop_area.y,
+                                 init_pos_z + wp_drop_area.z);
+
+            if (!come_mid_reached)
             {
-                sendEgoGoal(hover_ox, hover_oy, cfg.trav_flight_z);
+                bool mid_arrived = (pillar_nav_mode == "pcl") ? moveTo(mid_target) : navTo(mid_target);
+                if (mid_arrived)
+                {
+                    come_mid_reached = true;
+                    ROS_INFO_STREAM("到达中途点，继续前往投放区");
+                    nav_goal_sent = false;
+                    nav_status    = 0;
+                }
+                break;
             }
-            if (trackLeg(true, hover_ox, hover_oy, "返程leg2"))
+            bool drop_arrived = (pillar_nav_mode == "pcl") ? moveTo(drop_target) : navTo(drop_target);
+            if (drop_arrived)
             {
-                ROS_INFO("[穿越] ✓ 回到悬停扫描点，准备穿环返回");
-                current_state    = RETURN_CROSS_RING;
-                nav_goal_sent    = false;
+                current_state      = HOVER_RECOG_DROP;
+                drop_sub_state     = 0;
+                drop_hover_start   = ros::Time(0);
+                last_drop_pub_time = ros::Time(0);
+                nav_goal_sent      = false;
+                nav_status         = 0;
+                state_start_time   = ros::Time::now();
+
+                down_vote_a = 0;
+                down_vote_b = 0;
+                down_voting = true;
+                ROS_INFO("到达投放区，开始悬停投货流程 + 下视字母识别投票");
+            }
+        }
+        break;
+
+        // ========== 状态: 悬停识别投放区标识（下视字母投票） ==========
+        case HOVER_RECOG_DROP:
+        {
+            moveToPositionVelocity(wp_drop_area);
+
+            if (drop_hover_start.isZero())
+            {
+                drop_hover_start = ros::Time::now();
+            }
+
+            ROS_INFO_THROTTLE(0.5, "[投货-悬停] 当前(%.2f,%.2f,%.2f) 保持投放区, 剩余 %.1fs",
+                              local_odom.pose.pose.position.x, local_odom.pose.pose.position.y,
+                              local_odom.pose.pose.position.z,
+                              cfg.drop_hover_time - (ros::Time::now() - drop_hover_start).toSec());
+
+            if ((ros::Time::now() - drop_hover_start).toSec() > cfg.drop_hover_time)
+            {
+                down_voting = false;
+                if (down_vote_a >= cfg.down_min_votes || down_vote_b >= cfg.down_min_votes)
+                {
+                    shoot_letter = (down_vote_a >= down_vote_b) ? "A" : "B";
+                    ROS_INFO("[投货] ✓ 下视字母识别完成：%s（A=%d 票 B=%d 票）-> 射击 %s 靶",
+                             shoot_letter.c_str(), down_vote_a, down_vote_b, shoot_letter.c_str());
+                }
+                else
+                {
+                    shoot_letter = cfg.attack_real_target;
+                    ROS_WARN("[投货] ⚠ 下视字母票数不足（A=%d B=%d，需≥%d），回退兜底字母 %s",
+                             down_vote_a, down_vote_b, cfg.down_min_votes, shoot_letter.c_str());
+                }
+
+                ROS_INFO("[投货] 悬停 %.1fs 完成，开始下降投货", cfg.drop_hover_time);
+                drop_sub_state   = 1;
                 state_start_time = ros::Time::now();
+                current_state    = DROP_SUPPLY;
+            }
+        }
+        break;
+
+        // ========== 状态: 投放物资箱 ==========
+        case DROP_SUPPLY:
+        {
+            const ros::Time now = ros::Time::now();
+
+            if (drop_sub_state == 1)
+            {
+                // 【改 2026-09】悬停识别完成后直接在悬停高度(投放区 1.3m)投货，
+                // 不再下降到 cfg.drop_z。
+                bool at_drop = moveToPositionVelocity(wp_drop_area);
+
+                if (at_drop)
+                {
+                    ROS_INFO("[投货] 在悬停高度(%.2f)直接触发投货", local_odom.pose.pose.position.z);
+
+                    // 开舱指令第 1/3 次（t=0s），后续 0.2s/0.4s 各补发一次
+                    std_msgs::UInt8 servo_msg;
+                    servo_msg.data = cfg.cargo_drop_angle;
+                    servo_control_pub.publish(servo_msg);
+                    drop_pub_count = 1;
+                    ROS_INFO("[投货] 开舱指令 1/3 (角度 %d -> 0x03 -> 货舱打开)",
+                             cfg.cargo_drop_angle);
+
+                    drop_sub_state     = 2;
+                    state_start_time   = now;
+                    last_drop_pub_time = now;
+                }
+                break;
+            }
+
+            if (drop_sub_state == 2)
+            {
+                moveToPositionVelocity(wp_drop_area);
+
+                // 开舱指令第 2/3 次（t=0.2s）、第 3/3 次（t=0.4s）：固定节奏共发 3 次
+                double t_drop = (now - state_start_time).toSec();
+                if (drop_pub_count < 3 && t_drop >= 0.2 * drop_pub_count)
+                {
+                    std_msgs::UInt8 servo_msg;
+                    servo_msg.data = cfg.cargo_drop_angle;
+                    servo_control_pub.publish(servo_msg);
+                    ++drop_pub_count;
+                    ROS_INFO("[投货] 开舱指令 %d/3 (t=%.1fs, 角度 %d -> 0x03)",
+                             drop_pub_count, t_drop, cfg.cargo_drop_angle);
+                    last_drop_pub_time = now;
+                }
+
+                // 3 次开舱发完即关舱，直接进入射击流程（不再等 cargo_hold_time）
+                if (drop_pub_count >= 3 && t_drop >= 0.5)
+                {
+                    std_msgs::UInt8 reset_msg;
+                    reset_msg.data = cfg.cargo_reset_angle;
+                    for (int i = 0; i < 3; ++i)
+                        servo_control_pub.publish(reset_msg);
+                    ROS_INFO("[投货] 3 次开舱完成(0/0.2/0.4s)，货舱复位(角度 %d -> 0x04 -> 关闭) x3，"
+                             "直接进入射击流程",
+                             cfg.cargo_reset_angle);
+
+                    drop_sub_state   = 0;
+                    current_state    = RECOG_ATTACK_TARGET;
+                    nav_goal_sent    = false;
+                    state_start_time = now;
+                }
+            }
+        }
+        break;
+
+        // ========== 状态: 识别正确攻击目标（固定映射选射击点） ==========
+        case RECOG_ATTACK_TARGET:
+        {
+            bool letter_is_a = (shoot_letter != "B");
+            bool go_left     = (letter_is_a == a_on_left);
+
+            shoot_target_x = go_left ? cfg.shoot_left_x : cfg.shoot_right_x;
+            shoot_target_y = go_left ? cfg.shoot_left_y : cfg.shoot_right_y;
+
+            ROS_INFO("[识别] 投货识别字母 = %s -> 射击 %s 靶（%s射击点 %.2f, %.2f）",
+                     shoot_letter.c_str(), letter_is_a ? "A" : "B",
+                     go_left ? "左" : "右", shoot_target_x, shoot_target_y);
+
+            current_state    = ALIGN_ATTACK_TARGET;
+            state_start_time = ros::Time::now();
+        }
+        break;
+
+
+        // ========== 状态: 前视像素对准目标 ==========
+        case ALIGN_ATTACK_TARGET:
+        {
+            static bool arrived = false;
+
+            if (moveToPositionVelocity(shoot_target_x, shoot_target_y, cfg.shoot_z))
+            {
+                if (!arrived)
+                {
+                    arrived           = true;
+                    state_start_time  = ros::Time::now();
+                    ROS_INFO("[射击] 到达射击点(%.2f, %.2f, %.2f)，稳定 %.1fs 后射击",
+                             shoot_target_x, shoot_target_y, cfg.shoot_z, cfg.shoot_stable_time);
+                }
+
+                if (timeout(cfg.shoot_stable_time))
+                {
+                    arrived           = false;
+                    shoot_triggered   = false;
+                    current_state     = SIMULATE_ATTACK;
+                    state_start_time  = ros::Time::now();
+                }
+            }
+            else
+            {
+                arrived = false;
+                ROS_INFO_THROTTLE(0.5, "[射击] 飞向射击点(%.2f, %.2f, %.2f)...",
+                                  shoot_target_x, shoot_target_y, cfg.shoot_z);
+            }
+        }
+        break;
+
+        // ========== 状态: 激光指示攻击 ==========
+        case SIMULATE_ATTACK:
+        {
+            moveToPositionVelocity(shoot_target_x, shoot_target_y, cfg.shoot_z);
+
+            if (!shoot_triggered)
+            {
+                std_msgs::Bool laser_off;
+                laser_off.data = false;
+                laser_control_pub.publish(laser_off);
+
+                std_msgs::Empty shoot_msg;
+                shoot_pub.publish(shoot_msg);
+
+                ROS_INFO("╔════════════════════════════════════════╗");
+                ROS_INFO("║          ★★★ 射击！ ★★★            ║");
+                ROS_INFO("║  射击坐标: (%.3f, %.3f, %.3f)",
+                         local_odom.pose.pose.position.x, local_odom.pose.pose.position.y,
+                         local_odom.pose.pose.position.z);
+                ROS_INFO("║  投货识别字母: %s -> 射击 %s 靶", shoot_letter.c_str(),
+                         (shoot_letter != "B") ? "A" : "B");
+                ROS_INFO("╚════════════════════════════════════════╝");
+
+                shoot_triggered = true;
+                shoot_time      = ros::Time::now();
+            }
+
+            if ((ros::Time::now() - shoot_time).toSec() > cfg.shoot_duration)
+            {
+                if (pillar_nav_mode == "pcl" && traverse_cfg_ok && cfg.trav_return_smooth == 1 &&
+                    planReturnFromCurrent())
+                {
+                    // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条平滑轨迹中途不停顿
+                    current_state  = TRAVERSE_RETURN_HOME;
+                    leg_start_time = ros::Time::now();
+                    ROS_INFO("[射击] 射击完成，返程直通轨迹已规划（不回悬停点、穿环不停顿）");
+                }
+                else if (pillar_nav_mode == "pcl" && traverse_cfg_ok) {
+                    current_state  = TRAVERSE_RETURN_LEG2;  // 回退：分段返程（倒放leg2停悬停点再穿环）
+                    leg_start_time = ros::Time::now();
+                } else {
+                    current_state = READY_NAV_TO_RING_BACK;
+                }
+                state_start_time = ros::Time::now();
+                ROS_INFO("[射击] 射击完成，开始返程");
             }
         }
         break;
@@ -756,6 +605,117 @@ int main(int argc, char **argv)
                 current_state    = LAND;   // 轨迹终点即起飞点（无需 RETURN 精修），直接进降落
                 nav_goal_sent    = false;
                 state_start_time = ros::Time::now();
+            }
+        }
+        break;
+
+        // ========== 状态: 返程 leg2 时间倒放（投放区 -> 悬停扫描点）【旧回退路径】 ==========
+        case TRAVERSE_RETURN_LEG2:
+        {
+            if (!nav_goal_sent)
+            {
+                sendEgoGoal(hover_ox, hover_oy, cfg.trav_flight_z);
+            }
+            if (trackLeg(true, hover_ox, hover_oy, "返程leg2"))
+            {
+                ROS_INFO("[穿越] ✓ 回到悬停扫描点，准备穿环返回");
+                current_state    = RETURN_CROSS_RING;
+                nav_goal_sent    = false;
+                state_start_time = ros::Time::now();
+            }
+        }
+        break;
+
+        // ========== 状态: 返程前先回到投放区 ==========
+        case READY_NAV_TO_RING_BACK:
+        {
+            Waypoint forward_target(init_pos_x + wp_drop_area.x, init_pos_y + wp_drop_area.y,
+                                    init_pos_z + wp_drop_area.z);
+            if (moveTo(forward_target.x, forward_target.y, forward_target.z))
+            {
+                current_state    = NAV_TO_RING_BACK;
+                nav_goal_sent    = false;
+                state_start_time = ros::Time::now();
+                ROS_INFO("到达投放区，开始返程");
+            }
+        }
+        break;
+
+        // ========== 状态: 返程导航（EGO 回退路径） ==========
+        case NAV_TO_RING_BACK:
+        {
+            static bool back_mid_reached = false;
+
+            Waypoint mid_target(init_pos_x + wp_back_mid.x, init_pos_y + wp_back_mid.y,
+                                init_pos_z + wp_come_mid.z);
+
+            Waypoint ring_back(init_pos_x + wp_ring_back.x, init_pos_y + wp_ring_back.y,
+                               init_pos_z + wp_ring_back.z);
+
+            if (!back_mid_reached)
+            {
+                if (navTo(mid_target))
+                {
+                    back_mid_reached  = true;
+                    nav_goal_sent     = false;
+                    state_start_time  = ros::Time::now();
+                    nav_status        = 0;
+                    ROS_INFO_STREAM("到达中途点，继续返程");
+                }
+                break;
+            }
+            if (navTo(ring_back))
+            {
+                current_state    = RETURN_CROSS_RING;
+                nav_goal_sent    = false;
+                state_start_time = ros::Time::now();
+                ROS_INFO_STREAM("已通过ego_planner穿过随机障碍物，准备返回穿环");
+            }
+        }
+        break;
+
+        // ========== 状态: 返回穿环（固定航点，垂直穿过环） ==========
+        case RETURN_CROSS_RING:
+        {
+            static RingReturnSubState sub_state = RR_MOVE_TO_RING_FRONT;
+
+            switch (sub_state)
+            {
+            case RR_MOVE_TO_RING_FRONT:
+            {
+                // Phase1: 先飞到环后方（y=0 中心线，正对环孔，给垂直穿环留出对位余量）
+                if (!nav_goal_sent)
+                {
+                    sendEgoGoal(init_pos_x + wp_ring_back.x, init_pos_y + wp_ring_back.y,
+                                init_pos_z + wp_ring_back.z);
+                }
+                if (moveTo(wp_ring_back))
+                {
+                    sub_state         = RR_CROSS_RING;
+                    nav_goal_sent     = false;
+                    state_start_time  = ros::Time::now();
+                    ROS_INFO_STREAM("到达环后方，准备垂直穿环");
+                }
+                break;
+            }
+            case RR_CROSS_RING:
+            default:
+            {
+                // Phase2: 沿 y=0 直线垂直穿过环孔，到环前方
+                if (!nav_goal_sent)
+                {
+                    sendEgoGoal(init_pos_x + wp_ring_front.x, init_pos_y + wp_ring_front.y,
+                                init_pos_z + wp_ring_front.z);
+                }
+                if (moveTo(wp_ring_front))
+                {
+                    current_state      = RETURN;
+                    nav_goal_sent      = false;
+                    state_start_time   = ros::Time::now();
+                    ROS_INFO_STREAM("已垂直穿环，正在返回起飞点上方");
+                }
+                break;
+            }
             }
         }
         break;

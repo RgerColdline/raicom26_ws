@@ -59,31 +59,34 @@ const char* TRAV_CASE_DESC[4] = {
 const uint16_t TYPE_MASK_VELOCITY_ONLY = 0b100111000111;
 // 起飞位置控制掩码：忽略 vx/vy/vz + 加速度 + FORCE + yaw_rate，用 x/y/z + yaw
 const uint16_t TYPE_MASK_TAKEOFF_POS = 0b101111111000;
+// 定点加速控制掩码：忽略加速度 + yaw_rate，同时使用 x/y/z + vx/vy/vz + yaw
+const uint16_t TYPE_MASK_POSITION_VELOCITY = 2496;
 // 穿越段轨迹跟踪位置控制掩码：忽略 vx/vy/vz/afx/afy/afz + IGNORE_YAW_RATE=2048（不带 512）
 const uint16_t TRAV_TYPE_MASK_POSITION_ONLY = 8 + 16 + 32 + 64 + 128 + 256 + 2048;
 
 // ==================== 状态机枚举 ====================
 enum MissionState {
-    NAV_TO_DROP_AREA,
-    HOVER_RECOG_DROP,
-    DROP_SUPPLY,
-    MOVE_TO_ATTACK_AREA,
-    RECOG_ATTACK_TARGET,
-    MOVE_TO_FRONT_OF_TARGET,
-    ALIGN_ATTACK_TARGET,
-    SIMULATE_ATTACK,
-
-    NAV_TO_RING_BACK,
-    READY_NAV_TO_RING_BACK,
-    RETURN_CROSS_RING,
-
-    // === 穿越赛段（pillar_nav_mode="pcl" 时替换 EGO 路径） ===
+    // === 穿越赛段（pillar_nav_mode="pcl" 时使用） ===
     TRAVERSE_TO_SCAN,
     TRAVERSE_SCAN,
     TRAVERSE_LEG2,
-    TRAVERSE_RETURN_LEG2,
-    TRAVERSE_RETURN_HOME,   // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿
 
+    // === EGO 去程回退路径 ===
+    NAV_TO_DROP_AREA,
+
+    // === 投货与射击公共流程 ===
+    HOVER_RECOG_DROP,
+    DROP_SUPPLY,
+    RECOG_ATTACK_TARGET,
+    ALIGN_ATTACK_TARGET,
+    SIMULATE_ATTACK,
+
+    // === 返程路径 ===
+    TRAVERSE_RETURN_HOME,   // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿
+    TRAVERSE_RETURN_LEG2,
+    READY_NAV_TO_RING_BACK,
+    NAV_TO_RING_BACK,
+    RETURN_CROSS_RING,
     RETURN,
     LAND,
     TASK_END
@@ -325,11 +328,15 @@ void sendSetpoint(const mavros_msgs::PositionTarget &sp);
 void sendEgoGoal(float x, float y, float z, float yaw = NAN);
 bool waitForNavArrival();
 void positionControl(const Eigen::Vector3f &target_pos, mavros_msgs::PositionTarget &sp);
+void positionVelocityControl(const Eigen::Vector3f &target_pos,
+                             mavros_msgs::PositionTarget &sp);
 bool reachedTarget(const Eigen::Vector3f &target, float dist_thresh);
 bool navTo(const float x, const float y, const float z);
 bool navTo(const Waypoint wp);
 bool moveTo(const float x, const float y, const float z);
 bool moveTo(const Waypoint wp);
+bool moveToPositionVelocity(const float x, const float y, const float z);
+bool moveToPositionVelocity(const Waypoint wp);
 bool moveToAbs(double x, double y, double z);
 void hover();
 bool timeout(const float timeout_limit);
@@ -621,8 +628,7 @@ void detectedTargetCallback(const std_msgs::String::ConstPtr &msg) {
 }
 
 void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg) {
-    bool is_attack_state = (current_state == MOVE_TO_ATTACK_AREA ||
-                            current_state == RECOG_ATTACK_TARGET ||
+    bool is_attack_state = (current_state == RECOG_ATTACK_TARGET ||
                             current_state == ALIGN_ATTACK_TARGET ||
                             current_state == SIMULATE_ATTACK);
     if (!is_attack_state) return;
@@ -751,6 +757,17 @@ void positionControl(const Eigen::Vector3f &target_pos,
     sp.yaw              = current_yaw;
 }
 
+void positionVelocityControl(const Eigen::Vector3f &target_pos,
+                             mavros_msgs::PositionTarget &sp) {
+    // 复用原位置误差 -> 速度指令，额外向 PX4 提供最终位置目标：
+    // 位置闭环保证收敛，速度前馈加快进点，并在误差缩小时自然降速。
+    positionControl(target_pos, sp);
+    sp.type_mask  = TYPE_MASK_POSITION_VELOCITY;
+    sp.position.x = target_pos.x();
+    sp.position.y = target_pos.y();
+    sp.position.z = target_pos.z();
+}
+
 bool reachedTarget(const Eigen::Vector3f &target, float dist_thresh) {
     float dx = target.x() - local_odom.pose.pose.position.x;
     float dy = target.y() - local_odom.pose.pose.position.y;
@@ -782,6 +799,19 @@ bool moveTo(const float x, const float y, const float z) {
 }
 
 bool moveTo(const Waypoint wp) { return moveTo(wp.x, wp.y, wp.z); }
+
+bool moveToPositionVelocity(const float x, const float y, const float z) {
+    const Eigen::Vector3f target(init_pos_x + x, init_pos_y + y, init_pos_z + z);
+
+    positionVelocityControl(target, current_setpoint);
+    current_setpoint.yaw = init_yaw;
+
+    return reachedTarget(target, cfg.err_max);
+}
+
+bool moveToPositionVelocity(const Waypoint wp) {
+    return moveToPositionVelocity(wp.x, wp.y, wp.z);
+}
 
 bool moveToAbs(double x, double y, double z) {
     positionControl(Eigen::Vector3f(x, y, z), current_setpoint);
