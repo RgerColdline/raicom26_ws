@@ -9,7 +9,7 @@
 
 ```
 起飞 → 穿方环 → 穿越绕柱(平滑样条轨迹) → 悬停下视识别字母(A/B) →
-下降投货 → 固定映射飞射击点 → 激光射击 → 原路返程 → 降落
+悬停投货 → 保持投放点原地旋转 yaw → 激光射击 → 原路返程 → 降落
 ```
 
 核心设计思路是 **“定点 + 平滑”**：不依赖在线避障/复杂规划，用固定航点 + 离线平滑轨迹换取可复现的稳定性。
@@ -20,9 +20,9 @@
 raicom26_ws/
 ├── src/
 │   ├── main_control/          # 主控状态机（本包，见第 6 节）
-│   ├── raicom_vision_laser/   # 视觉 + 定点射击 + 穿越规划 + STM32 串口
+│   ├── raicom_vision_laser/   # 视觉 + 激光射击 + 穿越规划 + STM32 串口
 │   ├── pcl_detection2/        # 点云感知：方环检测 + 柱子布局检测(case)
-│   ├── uav_navigation/        # EGO-Planner 路径规划（影子模式 / 备选）
+│   ├── uav_navigation/        # 历史 EGO-Planner 子模块（main_control 不再使用）
 │   └── utils/                 # 依赖工具（decomp / pose_utils / quadrotor_msgs 等）
 ├── devel/                     # catkin 编译产物
 └── build/                     # catkin 构建中间文件
@@ -32,10 +32,10 @@ raicom26_ws/
 
 | 包 | 作用 | 关键内容 |
 |----|------|----------|
-| `main_control` | **主控状态机**：起飞、穿环、穿越绕柱、投货、定点射击、返航降落 | `src/main_control.cpp` + `include/main_control.h` |
+| `main_control` | **主控状态机**：起飞、穿环、穿越绕柱、投货、原地旋转射击、返航降落 | `src/main_control.cpp` + `include/main_control.h` |
 | `raicom_vision_laser` | 视觉 + 射击/投货串口 + 穿越规划 + 精简版流程 | `mission_flow` / `traverse_node` / `stm32_shooter_node` / YOLO 节点 |
 | `pcl_detection2` | Livox 点云感知 | 方环 `square_ring`、柱子布局 `pillar_case_id` |
-| `uav_navigation` | EGO-Planner | 仅影子模式可视化，不参与实际控制 |
+| `uav_navigation` | 历史 EGO-Planner | 当前主控和启动脚本均不使用 |
 | `utils` | 三方依赖 | decomp 凸分解、quadrotor_msgs、pose_utils 等 |
 
 ## 4. 完整任务流程
@@ -43,17 +43,17 @@ raicom26_ws/
 `main_control` 是总控，负责把下面这些阶段串起来：
 
 1. **起飞**：发送设定点 → 切 OFFBOARD → 解锁 → 爬升到 `takeoff_height`。
-2. **穿方环**：飞往环前方 → 穿越 → 记住环前/环后记忆点（返程用）。
-3. **穿越绕柱**（`pillar_nav_mode = "pcl"`）：
+2. **穿方环**：沿固定走廊飞往扫描点，途中穿过方环。
+3. **穿越绕柱**：
    - 飞到悬停扫描点，触发 `pcl_detection2` 检测柱子布局 `case`；
    - 现场规划 `leg2` 绕柱平滑轨迹（自然三次样条 + 碰撞检测 + 时间参数化）；
    - 按时间插值跟踪轨迹，飞到投放区。
 4. **悬停识别**：在投放区上方悬停，下视 YOLO 对字母 A/B 投票，决定射击靶标。
-5. **投货**：下降到 `drop_z` → 开舱（`/servo_control`）→ 保持 → 关舱。
-6. **定点射击**：按识别字母固定映射飞左/右射击点 → 稳定 → 发 `/shoot`。
+5. **投货**：保持投放区高度 → 三次开舱指令（`/servo_control`）→ 关舱。
+6. **原地旋转射击**：保持投放点，按 A/B 配置旋转 yaw → 位置和角度连续稳定 → 发 `/shoot`。
 7. **返航降落**：倒放 `leg2` 原路返回 → 穿环返回 → 回起飞点 → 定点下降 → `AUTO.LAND`。
 
-> `pillar_nav_mode = "ego"` 时，绕柱段走 EGO-Planner 路径（`navTo` / `sendEgoGoal`），作为回退方案。
+> 主控已移除 EGO 回退；穿越地图或轨迹安全预检失败时，会在进入 OFFBOARD/解锁前退出。
 
 ## 5. 关键话题 / 服务
 
@@ -64,17 +64,13 @@ raicom26_ws/
 | `/mavros/state` | `mavros_msgs/State` | 飞控连接/模式/解锁状态 |
 | `/mavros/local_position/odom` | `nav_msgs/Odometry` | FAST-LIO 里程计 |
 | `/yolo_down_detect` | `raicom_vision_laser/DetectionInfo` | 下视字母检测（投货投票） |
-| `/yolo_front_detect` | `raicom_vision_laser/DetectionInfo` | 前视检测（仅日志/画面） |
-| `/pcl_detection2/square_ring` | `pcl_detection2/SquareRing` | 方环位姿 |
 | `/pcl_detection2/pillar_case_id` | `std_msgs/Int32` | 柱子布局 case |
-| `/ego_controller/status` | `std_msgs/Int8` | EGO 导航状态 |
 
 ### 发布
 
 | 话题 | 类型 | 说明 |
 |------|------|------|
 | `/mavros/setpoint_raw/local` | `mavros_msgs/PositionTarget` | OFFBOARD 设定点 |
-| `/fsm/ego_goal` | `geometry_msgs/PoseStamped` | EGO 导航目标 |
 | `/servo_control` | `std_msgs/UInt8` | 投货舵机 |
 | `/shoot` | `std_msgs/Empty` | 一键激光射击 |
 | `/laser_control` | `std_msgs/Bool` | 激光开关（安全保险） |
@@ -82,7 +78,7 @@ raicom26_ws/
 
 ### 服务客户端
 
-`/mavros/set_mode`（OFFBOARD / AUTO.LAND）、`/mavros/cmd/arming`、`/switch_camera`、`/reset_target`。
+`/mavros/set_mode`（OFFBOARD / AUTO.LAND）、`/mavros/cmd/arming`。
 
 ## 6. main_control 包结构（已重构）
 
@@ -96,8 +92,7 @@ main_control/
 ├── src/
 │   └── main_control.cpp  # main()：起飞前 OFFBOARD/解锁 + 展开后的完整状态机
 ├── config/
-│   ├── main_control.yaml # 主控参数
-│   └── pillar_nav.yaml   # （已废弃，参数已并入 traverse_map.yaml）
+│   └── main_control.yaml # 主控、投货、yaw 射击参数
 ├── launch/
 │   └── main_control.launch
 ├── shell/
@@ -129,6 +124,19 @@ source devel/setup.bash
 - 改 `.yaml` / `.launch` 无需重新编译；改 `.cpp` / `.h` 需 `catkin build`。
 - 主控参数在 `config/main_control.yaml`，穿越地图在 `raicom_vision_laser/config/traverse_map.yaml`（由 launch 加载到 `main_control` 命名空间）。
 - 坐标系约定、STM32 串口协议、case 编号等细节见 `raicom_vision_laser/CLAUDE.md`。
+
+原地旋转射击参数均在 `main_control.yaml` 的 `shoot` 段，修改后需重启节点：
+
+| 参数 | 含义 | 建议调试顺序 |
+|------|------|--------------|
+| `yaw_a_offset_deg` / `yaw_b_offset_deg` | A/B 靶相对起飞朝向的角度；正值逆时针、负值顺时针 | 先低功率点射标定这两个角度 |
+| `yaw_rate_max` | 最大旋转速度，单位 rad/s | 再逐步加快，先观察是否过冲 |
+| `yaw_kp` | yaw 误差到 yaw-rate 的比例增益 | 有振荡则减小，收敛慢则小幅增大 |
+| `yaw_tolerance_deg` | 允许发射的最大角度误差 | 角度标定稳定后再收紧 |
+| `stable_time` | 位置和 yaw 连续满足容差的等待时间 | 抖动时增大 |
+| `duration` | 发出 `/shoot` 后保持瞄准的时间 | 至少覆盖 STM32 的完整射击周期 |
+
+旋转和射击状态会持续保持 `wp_drop_area`，只有位置误差小于 `err_max` 且 yaw 误差连续满足容差后才会发射。
 
 ## 9. 查看 ROS 日志
 

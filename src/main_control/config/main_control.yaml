@@ -1,149 +1,60 @@
-# ==================== 控制参数 ====================
+# ==================== 基础控制参数 ====================
 
-takeoff_height: 1.1                 # 起飞高度（相对初始点，单位：米）
-max_speed: 0.8                      # 最大水平速度（m/s）（实机恢复原速）
-max_yaw_rate: 0.8                   # 最大偏航角速度（rad/s）
-err_max: 0.25                       # 位置误差容限（暂未使用）
-hover_vert_tolerance: 0.03          # 悬停垂直稳定容差（m）
-p_xy: 0.4                           # 水平位置控制 P 增益
-p_z: 0.4                            # 垂直位置控制 P 增益
-hover_time_needed: 3.0              # 悬停稳定所需时间（秒）
-target_front_offset_x: -1.0          # 无人机要去的相对于目标靶子x方向偏移量
-target_front_offset_y: 0.0          # 无人机要去的相对于目标靶子y方向偏移量
-nav_goal_timeout: 60.0              # 导航到达超时时间（秒）
-align_pixel_threshold: 25.0         # 像素对准误差阈值（像素）
-shoot_delay: 2.0                    # 射击后等待确认时间（秒）
-use_ego_planner_for_drop_area : false # pcl-dev: 定点控制，不用EGO
+takeoff_height: 1.1                 # 起飞高度（相对初始点，m）
+max_speed: 0.8                      # 定点控制最大单轴速度（m/s）
+err_max: 0.25                       # 定点控制到位距离（m）
+p_xy: 0.4                           # 水平位置误差 -> 速度增益
+p_z: 0.4                            # 垂直位置误差 -> 速度增益
 
-# 导航模式: "ego"=EGO-Planner路径规划  "pcl"=穿越平滑轨迹（悬停扫描选case+leg2样条跟踪+倒放返程，
-# 地图在 raicom_vision_laser/config/traverse_map.yaml，launch 已加载；pillar_nav.yaml 已废弃不再加载）
-pillar_nav_mode: "pcl"
+# 主控仅使用 PCL 检测 + 本地平滑轨迹；穿越参数和地图由 traverse_map.yaml 提供。
 
-wait_for_vision_services: false        # 是否等待视觉服务(/switch_camera等)；false则跳过，方便单独测试PCL
-
-# ==================== 环穿越（固定航点，垂直穿环） ====================
-# 去程/返程均用硬编码航点 wp_ring_front/wp_ring_back 垂直穿过环，不做 pcl 环检测。
-# wp_ring_front/back 见下方"航点坐标"段。
-
-# ==================== 定点射击参数（2026-07-20 固定映射：投货识别字母 -> 对应射击点） ====================
-# 左射击点上方永远是 A 靶，右射击点上方永远是 B 靶；投货悬停下视识别字母后直接飞对应点，免前视识别。
+# ==================== 原地旋转射击 ====================
+# 投货结束后保持 wp_drop_area 不移动，只旋转机头瞄准目标。
+# A/B 角度均相对起飞时记录的 init_yaw：正值逆时针，负值顺时针。
+# 当前场地 A 在右、B 在左，默认 A=-90°、B=+90°；实机以激光安装方向为准微调。
 shoot:
-  left_x: -0.45                  # 左射击点X（相对起飞点）：用户指定(-0.45,-1.5)
-  left_y: -1.5                   # 左射击点Y（+Y侧），上方永远是 A 靶
-  right_x: -0.45                 # 右射击点X：用户指定(-0.45,-2.5)
-  right_y: -2.5                  # 右射击点Y（-Y侧），上方永远是 B 靶
-  a_side: "right"                 # A 靶固定在哪侧："left"=左A右B（默认）；"right"=左B右A（赛场镜像时改这里，免重编译）
-  default_x: -0.45               # 【已废弃】固定映射流程不再使用（旧前视识别超时的兜底点）
-  default_y: -2.0                # 【已废弃】
-  left_right_threshold: 20.0     # 【已废弃】固定映射流程不再做前视左右判决
-  detect_timeout: 60.0           # 【已废弃】
-  stable_time: 0.5               # 射击前稳定时间 (s)
-  duration: 1.5                  # 激光射击后等待时间(s)（stm32_shooter 开->1s->关+余量）
-  z: 1.0                         # 射击高度（相对init_pos）；2026-07-21 定为1.0：投货(0.8m)后直接升到1.0去射击点
+  yaw_a_offset_deg: -90.0           # 识别为 A 时的 yaw 偏移（deg）
+  yaw_b_offset_deg: 90.0            # 识别为 B 时的 yaw 偏移（deg）
+  yaw_kp: 1.5                       # yaw 误差 -> yaw_rate 前馈增益
+  yaw_rate_max: 0.8                 # 最大 yaw_rate 指令（rad/s）
+  yaw_tolerance_deg: 3.0            # 允许射击的 yaw 误差（deg）
+  stable_time: 0.5                  # 位置和 yaw 连续稳定时间（s）
+  duration: 1.5                     # /shoot 发出后的等待时间（s）
 
-# ==================== 下视字母识别（投货悬停时投票 A/B，决定射击哪个靶标） ====================
-# 每帧最多投一票（取该帧置信度最高的 A/B 检测），悬停结束按多数票定 shoot_letter。
+# ==================== 下视字母识别 ====================
 down:
-  min_votes: 3                   # 某字母得票 >= 该值才采用，否则回退 detection/attack_real_target 兜底字母
+  min_votes: 3                      # A/B 至少达到该票数才采用识别结果
 
-# ==================== 像素PID参数 ====================
-PIX_VEL_P: 0.003                    # 像素误差比例系数
-PIX_VEL_I: 0.0001                   # 像素误差积分系数
-PIX_VEL_D: 0.001                    # 像素误差微分系数
-PIX_VEL_MAX: 0.4                    # 像素导出的最大速度指令（m/s）
-PIX_INTEGRAL_MAX : 1000             # 积分限制
-PIX_FAR_NORM_DIST: 150.0            # 远距离归一化阈值（像素）
+detection:
+  attack_real_target: "A"           # 票数不足时的兜底目标（A 或 B）
 
-# ==================== 航点坐标（相对起飞点） ====================
-# 环区
+# ==================== 固定航点（相对起飞点） ====================
 wp_ring_front_x: -0.65
 wp_ring_front_y: 0.0
-wp_ring_front_z: 1.1               # 穿环高度：环孔 z∈[0.75,2.25]，1.1 距下沿 0.55m（与去程 flight_z 对齐，防返程卡下沿）
+wp_ring_front_z: 1.1
 wp_ring_back_x: -2.05
 wp_ring_back_y: 0.0
 wp_ring_back_z: 1.1
 
-# 中间点
-wp_come_mid_x: -1.70
-wp_come_mid_y: -2.90
-wp_come_mid_z: 1.1               # 通常与 takeoff_height 一致
-wp_back_mid_x: -2.6
-wp_back_mid_y: -2.80
-wp_back_mid_z: 1.1            
-
-# 柱子中心点（两柱之间）
-wp_pillar_center_x: -2.35
-wp_pillar_center_y: -1.42
-wp_pillar_center_z: 1.1
-
-# 物资投放区
 wp_drop_area_x: -0.45
 wp_drop_area_y: -2.0
 wp_drop_area_z: 1.1
 
-# 攻击目标识别区
-wp_attack_area_x: -0.45
-wp_attack_area_y: -2.0
-wp_attack_area_z: 1.1
-
-# 识别参数
-detection:
-  min_confidence: 0.4           # 目标检测最小置信度阈值（前视YOLO，与yolo_front_detector.confidence一致）
-  attack_real_target: "A"       # 兜底字母（A或B）：投货悬停下视识别票数不足时按此字母射击
-
-drop:
-  # 投放阶段调参
-  arrive_threshold: 0.35
-  detect_timeout: 10.0
-  align_hold_time: 0.35
-
-  # 经验像素偏置：先从 0 开始，实飞后慢慢调
-  camera_bias_x_px: 0.0
-  camera_bias_y_px: 0.0
-  release_bias_x_px: 0.0
-  release_bias_y_px: 0.0
-
-  fine_pixel_radius: 35.0
-  fine_vel_scale: 0.45
-  descend_distance: 0.6
-
-# 定点降落（无视觉：起飞点上方限速下降，<0.3m切AUTO.LAND）
-land:
-  descend_speed: 0.2            # 定点下降速度 (m/s)
-# ==================== mission_flow 融合：投货参数（/servo_control -> stm32_shooter） ====================
-# 固件: 0°=货舱开(投货), 160°=货舱关(复位); stm32_shooter: 发<135->0x03(开), 发>=135->0x04(关)
+# ==================== 投货与降落 ====================
 cargo:
-  drop_angle: 0               # 投货(开舱): 发0(<135) -> 0x03 -> 固件舵机0°
-  reset_angle: 180            # 复位(关舱): 发180(>=135) -> 0x04 -> 固件舵机160°
-  hold_time: 1.0              # 【已废弃】开舱保持时间；2026-09-09 起改为固定节奏：
-                              #   0s/0.2s/0.4s 共发 3 次开舱，0.5s 关舱直接进射击流程
-  descent_timeout: 10.0       # 下降到投货高度超时(s); 超时未到也在当前位置投货
-  drop_hover_time: 2.0        # 投货前在投放点上方1.5m悬停时间(s)（悬停期间下视投票A/B决定射击靶标）
-  drop_z: 0.8                 # 投货下降高度(相对init_pos)（2026-07-21 由0.3改为0.8）
+  drop_angle: 0                     # <135 -> STM32 开舱
+  reset_angle: 180                  # >=135 -> STM32 关舱
+  drop_hover_time: 2.0              # 投货前悬停投票时间（s）
 
-# ==================== mission_flow 融合：前视YOLO识别参数（/yolo_front_detect, 320x240） ====================
-# 【2026-07-20 注】固定映射射击后前视不再参与射击点判决，以下参数仅遗留兼容，不再影响流程
-yolo:
-  img_center_x: 160.0         # 前视YOLO图像中心X(图像320x240)
-  target_timeout: 0.5         # 检测结果有效期(s), 超过算目标丢失
-  detect_timeout: 60.0        # 前视识别总超时(s), 超时走默认射击点
+land:
+  descend_speed: 0.2                # 定点下降速度（m/s）
 
-# ==================== 前视 YOLO 检测节点私有参数（Python 节点 yolo_front_detector 使用） ====================
-# weights_path 不在此处（YAML 不支持 $(find)），在 main_control.launch 里用 $(find) 设置
-yolo_front_detector:
-  device: "cuda:0"            # 推理设备：jetson 用 cuda:0（无 GPU 改 cpu）
-  confidence: 0.4             # 置信度阈值
-  imgsz: 320                  # 模型输入尺寸（与压缩图 320x240 一致）
-  show_image: true            # 是否显示检测结果图像
-  image_topic: "/camera/color/image_raw"  # 前视摄像头话题（astra相机）
-  window_name: "YOLO Front Detection"
-
-# ==================== 下视 YOLO 检测节点私有参数（Python 节点 yolo_down_detector 使用） ====================
-# 投货悬停时识别投放区字母 A/B（投票决定射击靶标）；weights_path 在 main_control.launch 里设置
+# ==================== 下视 YOLO 节点参数 ====================
+# weights_path 由 main_control.launch 设置。
 yolo_down_detector:
-  device: "cuda:0"            # 推理设备：jetson 用 cuda:0（无 GPU 改 cpu）
-  confidence: 0.4             # 置信度阈值
-  imgsz: 320                  # 模型输入尺寸（与压缩图 320x240 一致）
-  show_image: true            # 是否显示检测结果图像
-  image_topic: "/usb_cam/image_raw"       # 下视摄像头话题（usb_cam，main_control_uav.sh 已启动）
+  device: "cuda:0"
+  confidence: 0.4
+  imgsz: 320
+  show_image: true
+  image_topic: "/usb_cam/image_raw"
   window_name: "YOLO Down Detection"
