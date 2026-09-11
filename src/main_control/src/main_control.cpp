@@ -193,6 +193,7 @@ int main(int argc, char **argv)
                         ROS_INFO("[穿越] ✓ 边飞边扫命中 case%d（%s），当前位置切入 leg2，跳过悬停点",
                                  active_case, TRAV_CASE_DESC[active_case]);
                         current_state    = TRAVERSE_LEG2;
+                        leg2_sub_state   = 0;
                         leg_start_time   = ros::Time::now();
                         state_start_time = ros::Time::now();
                         break;
@@ -235,6 +236,7 @@ int main(int argc, char **argv)
                         ROS_INFO("[穿越] ✓ leg2 规划完成 case%d，开始绕柱段", active_case);
                         current_state    = TRAVERSE_LEG2;
                         scan_sub_state   = 0;
+                        leg2_sub_state   = 0;
                         leg_start_time   = ros::Time::now();
                         state_start_time = ros::Time::now();
                     }
@@ -276,6 +278,7 @@ int main(int argc, char **argv)
                                  active_case, TRAV_CASE_DESC[active_case]);
                         current_state    = TRAVERSE_LEG2;
                         scan_sub_state   = 0;
+                        leg2_sub_state   = 0;
                         leg_start_time   = ros::Time::now();
                         state_start_time = ros::Time::now();
                     }
@@ -301,18 +304,60 @@ int main(int argc, char **argv)
         // ========== 状态: leg2 绕柱段轨迹跟踪（悬停点 -> 投放区） ==========
         case TRAVERSE_LEG2:
         {
-            if (trackLeg(false, end_x, end_y, "去程leg2"))
+            if (leg2_straight)
             {
-                ROS_INFO("[穿越] ✓ 到达投放区 (%.2f, %.2f, %.2f)，进入悬停投货流程",
-                         end_x, end_y, cfg.trav_flight_z);
-                current_state      = HOVER_RECOG_DROP;
-                drop_sub_state     = 0;
-                drop_hover_start   = ros::Time(0);
-                state_start_time   = ros::Time::now();
+                // 斜摆 case 两段平滑：段1(出发点->空柱A) -> 停顿0.3s -> 段2(空柱A->空柱B->投货区)
+                switch (leg2_sub_state)
+                {
+                case 0:   // 去程段1 -> 停顿点（空柱A）
+                    if (trackPlan(planner_go_a, false, go_pause_ox, go_pause_oy, "去程段1"))
+                    {
+                        leg2_sub_state = 1;
+                        state_start_time = ros::Time::now();
+                    }
+                    break;
+                case 1:   // 停顿点稳定 0.3s
+                    moveToAbs(go_pause_ox, go_pause_oy, cfg.trav_flight_z);
+                    if ((ros::Time::now() - state_start_time).toSec() > 0.3)
+                    {
+                        leg2_sub_state = 2;
+                        leg_start_time = ros::Time::now();
+                        state_start_time = ros::Time::now();
+                    }
+                    break;
+                case 2:   // 去程段2 -> 投货区
+                    if (trackPlan(planner_go_b, false, end_x, end_y, "去程段2"))
+                    {
+                        ROS_INFO("[穿越] ✓ 到达投放区 (%.2f, %.2f, %.2f)，进入悬停投货流程",
+                                 end_x, end_y, cfg.trav_flight_z);
+                        current_state      = HOVER_RECOG_DROP;
+                        drop_sub_state     = 0;
+                        drop_hover_start   = ros::Time(0);
+                        state_start_time   = ros::Time::now();
 
-                down_vote_a = 0;
-                down_vote_b = 0;
-                down_voting = true;
+                        down_vote_a = 0;
+                        down_vote_b = 0;
+                        down_voting = true;
+                    }
+                    break;
+                }
+            }
+            else
+            {
+                // case0/case3（或斜摆 case 回退整段样条）
+                if (trackLeg(false, end_x, end_y, "去程leg2"))
+                {
+                    ROS_INFO("[穿越] ✓ 到达投放区 (%.2f, %.2f, %.2f)，进入悬停投货流程",
+                             end_x, end_y, cfg.trav_flight_z);
+                    current_state      = HOVER_RECOG_DROP;
+                    drop_sub_state     = 0;
+                    drop_hover_start   = ros::Time(0);
+                    state_start_time   = ros::Time::now();
+
+                    down_vote_a = 0;
+                    down_vote_b = 0;
+                    down_voting = true;
+                }
             }
         }
         break;
@@ -495,7 +540,15 @@ int main(int argc, char **argv)
 
             if ((ros::Time::now() - shoot_time).toSec() > cfg.shoot_duration)
             {
-                if (cfg.trav_return_smooth == 1 && planReturnFromCurrent())
+                if (leg2_straight)
+                {
+                    // case1/case2：两段平滑返程（段1->停顿->段2含穿环降高）
+                    current_state  = TRAVERSE_RETURN_HOME;
+                    leg2_sub_state = 0;
+                    leg_start_time = ros::Time::now();
+                    ROS_INFO("[射击] 射击完成，两段平滑返程（含穿环降高）");
+                }
+                else if (cfg.trav_return_smooth == 1 && planReturnFromCurrent())
                 {
                     // 返程直通：投放/射击点 -> 倒放绕柱 -> 穿环 -> 起飞点
                     current_state  = TRAVERSE_RETURN_HOME;
@@ -504,6 +557,7 @@ int main(int argc, char **argv)
                 }
                 else {
                     current_state  = TRAVERSE_RETURN_LEG2;  // 回退：分段返程（倒放leg2停悬停点再穿环）
+                    leg2_sub_state = 0;
                     leg_start_time = ros::Time::now();
                 }
                 state_start_time = ros::Time::now();
@@ -515,18 +569,53 @@ int main(int argc, char **argv)
         // ========== 状态: 返程直通（当前位置 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿） ==========
         case TRAVERSE_RETURN_HOME:
         {
-            // z_end=return_land_z：过环后边飞边降到低高度，到起飞点时已接近落地高度
-            if (trackPlan(planner_return, false, init_pos_x, init_pos_y, "返程直通",
-                          cfg.trav_return_land_z))
+            if (leg2_straight)
             {
-                ROS_INFO("[穿越] ✓ 返程直通完成（穿环不停顿+末段降高），已到起飞点，直接降落");
-                current_state    = LAND;   // 轨迹终点即起飞点（无需 RETURN 精修），直接进降落
-                state_start_time = ros::Time::now();
+                // 斜摆 case 两段平滑返程：段1(投货区->空柱B) -> 停顿0.3s -> 段2(空柱B->空柱A->悬停点->穿环->出发点，含降高)
+                switch (leg2_sub_state)
+                {
+                case 0:   // 返程段1 -> 停顿点（空柱B）
+                    if (trackPlan(planner_ret_a, false, ret_pause_ox, ret_pause_oy, "返程段1"))
+                    {
+                        leg2_sub_state = 1;
+                        state_start_time = ros::Time::now();
+                    }
+                    break;
+                case 1:   // 停顿点稳定 0.3s
+                    moveToAbs(ret_pause_ox, ret_pause_oy, cfg.trav_flight_z);
+                    if ((ros::Time::now() - state_start_time).toSec() > 0.3)
+                    {
+                        leg2_sub_state = 2;
+                        leg_start_time = ros::Time::now();
+                        state_start_time = ros::Time::now();
+                    }
+                    break;
+                case 2:   // 返程段2 -> 出发点（含穿环降高）
+                    if (trackPlan(planner_ret_b, false, init_pos_x, init_pos_y, "返程段2",
+                                  cfg.trav_return_land_z))
+                    {
+                        ROS_INFO("[穿越] ✓ 两段平滑返程完成（穿环+末段降高），已到起飞点，直接降落");
+                        current_state    = LAND;
+                        state_start_time = ros::Time::now();
+                    }
+                    break;
+                }
+            }
+            else
+            {
+                // z_end=return_land_z：过环后边飞边降到低高度，到起飞点时已接近落地高度
+                if (trackPlan(planner_return, false, init_pos_x, init_pos_y, "返程直通",
+                              cfg.trav_return_land_z))
+                {
+                    ROS_INFO("[穿越] ✓ 返程直通完成（穿环不停顿+末段降高），已到起飞点，直接降落");
+                    current_state    = LAND;   // 轨迹终点即起飞点（无需 RETURN 精修），直接进降落
+                    state_start_time = ros::Time::now();
+                }
             }
         }
         break;
 
-        // ========== 状态: 返程 leg2 时间倒放（投放区 -> 悬停扫描点）【旧回退路径】 ==========
+        // ========== 状态: 返程 leg2 时间倒放（投放区 -> 悬停扫描点）【旧回退路径，case0/case3 用】 ==========
         case TRAVERSE_RETURN_LEG2:
         {
             if (trackLeg(true, hover_ox, hover_oy, "返程leg2"))

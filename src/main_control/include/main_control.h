@@ -202,6 +202,18 @@ std::vector<Vec2f> pillar_cand;
 std::vector<Vec2f> via_leg2[4];
 std::vector<SegObs> walls;
 
+// ==== 斜摆 case（case1/case2）两段平滑 ====
+// 去程：段1(出发点->空柱A，停顿0.3s) -> 段2(空柱A->空柱B[两点直线]->投货区)
+// 返程：段1(投货区->空柱B，停顿0.3s) -> 段2(空柱B->空柱A[两点直线]->悬停点->穿环->出发点)
+std::vector<Vec2f> via_go_a[4];         // 去程段1途经点
+std::vector<Vec2f> via_go_b[4];         // 去程段2途经点
+std::vector<Vec2f> via_ret_a[4];        // 返程段1途经点
+std::vector<Vec2f> via_ret_b[4];        // 返程段2途经点（含穿环+降高）
+int leg2_sub_state = 0;                 // leg2 两段平滑子状态（去程/返程共用）
+bool leg2_straight = false;             // true=当前 active_case 用两段平滑；false=整段样条
+double go_pause_ox = 0, go_pause_oy = 0;    // 去程停顿点（空柱A，odom 系）
+double ret_pause_ox = 0, ret_pause_oy = 0;  // 返程停顿点（空柱B，odom 系）
+
 // ==================== 控制 ====================
 mavros_msgs::PositionTarget current_setpoint;
 
@@ -229,6 +241,10 @@ struct TraversePlanResult
 
 TraversePlanResult planner_leg2;
 TraversePlanResult planner_return;   // 返程直通轨迹（当前位置 -> 倒放leg2绕柱 -> 穿环 -> 起飞点）
+TraversePlanResult planner_go_a;     // 斜摆 case 去程段1（出发点 -> 空柱A）
+TraversePlanResult planner_go_b;     // 斜摆 case 去程段2（空柱A -> 空柱B -> 投货区）
+TraversePlanResult planner_ret_a;    // 斜摆 case 返程段1（投货区 -> 空柱B）
+TraversePlanResult planner_ret_b;    // 斜摆 case 返程段2（空柱B -> 空柱A -> 悬停点 -> 穿环 -> 出发点）
 bool scan_trigger_sent = false;      // 去程前移触发只发一次（多发会反复 reset 检测的连续确认计数）
 
 // ==================== 函数声明 ====================
@@ -268,6 +284,10 @@ void printLeg2Report(int cid);
 bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, double goal_y,
                const char *label, double z_end = NAN);
 bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label);
+
+// 斜摆 case（case1/case2）两段平滑
+bool isStraightCase(int cid);
+bool planLeg2Segments(int cid, const Vec2f *cur_field = nullptr);
 
 // ==================== 样条 / 规划器辅助函数实现 ====================
 inline Vec2f field_to_odom(double fx, double fy, double origin_fx, double origin_fy)
@@ -807,6 +827,19 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
     }
     loadPointList(nh, "map/pillar_candidates", pillar_cand);
 
+    // 斜摆 case（case1/case2）两段平滑的 4 组途经点
+    for (int cid = 1; cid <= 2; cid++) {
+        char key[64];
+        snprintf(key, sizeof(key), "map/via_go_a_case%d", cid);
+        loadPointList(nh, key, via_go_a[cid]);
+        snprintf(key, sizeof(key), "map/via_go_b_case%d", cid);
+        loadPointList(nh, key, via_go_b[cid]);
+        snprintf(key, sizeof(key), "map/via_ret_a_case%d", cid);
+        loadPointList(nh, key, via_ret_a[cid]);
+        snprintf(key, sizeof(key), "map/via_ret_b_case%d", cid);
+        loadPointList(nh, key, via_ret_b[cid]);
+    }
+
     {
         XmlRpc::XmlRpcValue sh;
         if (nh.getParam("map/scan_hover", sh) && sh.size() >= 2) {
@@ -936,10 +969,16 @@ bool planLeg2ForCase(int cid) {
         return false;
     }
     printLeg2Report(cid);
+    leg2_straight = false;   // 整段样条模式
     return planner_leg2.min_clearance >= cfg.trav_inflation;
 }
 
 bool tryPlanLeg2(int cid) {
+    // 斜摆 case（case1/case2）优先直线穿缝，失败回退整段样条
+    if (isStraightCase(cid) && planLeg2Segments(cid)) {
+        active_case = cid;
+        return true;
+    }
     if (planLeg2ForCase(cid)) {
         active_case = cid;
         return true;
@@ -964,8 +1003,15 @@ bool tryPlanLeg2(int cid) {
 bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field) {
     // 边飞边扫命中后：把 leg2 途经点首点（悬停点）替换为当前位置重新规划，
     // 无人机无需到悬停点停稳，直接切入绕柱轨迹。净距校验与完整版一致。
-    if (cid < 0 || cid > 3 || via_leg2[cid].size() < 2) return false;
+    if (cid < 0 || cid > 3) return false;
 
+    // 斜摆 case 优先两段平滑（从当前位置切入）
+    if (isStraightCase(cid) && planLeg2Segments(cid, &cur_field)) {
+        active_case = cid;
+        return true;
+    }
+
+    if (via_leg2[cid].size() < 2) return false;
     std::vector<Vec2f> via = via_leg2[cid];
     via.front() = cur_field;
 
@@ -978,11 +1024,60 @@ bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field) {
              cur_field.x, cur_field.y, cid, planner_leg2.total_length,
              traverse_duration(planner_leg2), planner_leg2.min_clearance,
              planner_leg2.min_clearance >= cfg.trav_inflation ? "✓" : "✗");
+    leg2_straight = false;   // 整段样条模式
     if (planner_leg2.min_clearance >= cfg.trav_inflation) {
         active_case = cid;
         return true;
     }
     return false;
+}
+
+// ==================== 斜摆 case（case1/case2）两段平滑 ====================
+bool isStraightCase(int cid) {
+    return cid == 1 || cid == 2;
+}
+
+bool planLeg2Segments(int cid, const Vec2f *cur_field) {
+    // 斜摆 case 专用：规划去程两段 + 返程两段样条（共 4 段）。
+    // 去程段1首点可替换为当前位置（边飞边扫）；空柱之间两点直线由 yaml 途经点保证。
+    if (!isStraightCase(cid)) return false;
+    if (via_go_a[cid].size() < 2 || via_go_b[cid].size() < 2 ||
+        via_ret_a[cid].size() < 2 || via_ret_b[cid].size() < 2) {
+        ROS_ERROR("[穿越] case%d 两段平滑途经点不足，回退整段样条", cid);
+        return false;
+    }
+
+    std::vector<Vec2f> go_a = via_go_a[cid];
+    if (cur_field) go_a.front() = *cur_field;   // 边飞边扫：首点换成当前位置
+
+    if (!traverse_plan(planner_go_a, go_a, origin_fx, origin_fy, walls, caseCircles(cid),
+                       cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds) ||
+        !traverse_plan(planner_go_b, via_go_b[cid], origin_fx, origin_fy, walls, caseCircles(cid),
+                       cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds) ||
+        !traverse_plan(planner_ret_a, via_ret_a[cid], origin_fx, origin_fy, walls, caseCircles(cid),
+                       cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds) ||
+        !traverse_plan(planner_ret_b, via_ret_b[cid], origin_fx, origin_fy, walls, caseCircles(cid),
+                       cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds)) {
+        ROS_ERROR("[穿越] case%d 两段平滑规划失败，回退整段样条", cid);
+        return false;
+    }
+
+    // 停顿点 odom 坐标：去程=去程段1末点，返程=返程段1末点
+    Vec2f go_p  = field_to_odom(via_go_a[cid].back().x, via_go_a[cid].back().y, origin_fx, origin_fy);
+    Vec2f ret_p = field_to_odom(via_ret_a[cid].back().x, via_ret_a[cid].back().y, origin_fx, origin_fy);
+    go_pause_ox  = go_p.x;  go_pause_oy  = go_p.y;
+    ret_pause_ox = ret_p.x; ret_pause_oy = ret_p.y;
+
+    double min_clear = std::min(std::min(planner_go_a.min_clearance, planner_go_b.min_clearance),
+                                std::min(planner_ret_a.min_clearance, planner_ret_b.min_clearance));
+
+    ROS_INFO("[穿越] case%d 两段平滑：去程段1净距%.3f 段2净距%.3f，返程段1净距%.3f 段2净距%.3f %s",
+             cid, planner_go_a.min_clearance, planner_go_b.min_clearance,
+             planner_ret_a.min_clearance, planner_ret_b.min_clearance,
+             min_clear >= cfg.trav_inflation ? "✓" : "✗ 不达标");
+
+    leg2_straight = (min_clear >= cfg.trav_inflation);
+    return leg2_straight;
 }
 
 bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out) {
@@ -1042,30 +1137,24 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     double sx, sy;
     traverse_sample(plan, qt, sx, sy);
 
-    // z_end 有效（返程直通）时：过环前（场地 x>=2.05）保持 flight_z，
-    // 过环后随水平进度从 flight_z 线性降到 z_end —— 边飞边降，缩短最后降落时间
-    //
-    // ⚠️ 2026-09-09 修复挂网：原来直接按“当前轨迹点的场地 x<2.05 就降”，但返程
-    // 起点在射击区（场地 x≈1.1，本来就 <2.05），导致刚射击完还没往环走就被拉到
-    // 低高度（~0.66m）撞到靶区侧网。现在必须先确认轨迹已真正越过环进入末段
-    // 回家走廊（从轨迹末端倒扫到“最后一个场地 x>=2.05 的点”即过环时刻），
-    // 时刻未到一律保持 flight_z，全程不会再提前降高。
+    // z 高度（返程直通降高，复用原逻辑，用当前进度 qt 判断过环时刻）
     double z_cmd = cfg.trav_flight_z;
     if (!std::isnan(z_end) && z_end > 0.0) {
-        double t_ring = T;                              // 默认整段不降（安全兜底）
+        double t_ring = T;
         const std::vector<TrajPoint> &tr = plan.traj;
         for (int k = (int)tr.size() - 1; k >= 0; --k) {
-            double fxk = origin_fx - tr[k].x;           // odom -> 场地 x
+            double fxk = origin_fx - tr[k].x;
             if (fxk >= 2.05) { t_ring = tr[k].t; break; }
         }
         if (qt > t_ring && t_ring < T) {
-            double fx = origin_fx - sx;                 // 采样点场地 x
-            double r  = (2.05 - fx) / (2.05 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
+            double fx = origin_fx - sx;
+            double r  = (2.05 - fx) / (2.05 - origin_fx);
             r = std::max(0.0, std::min(1.0, r));
             z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
         }
     }
 
+    // 纯位置控制（不用速度前馈：飞机重约 3kg，不接受过大速度，稳健优先）
     current_setpoint.type_mask        = TRAV_TYPE_MASK_POSITION_ONLY;
     current_setpoint.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     current_setpoint.position.x       = sx;
