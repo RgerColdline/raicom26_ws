@@ -15,18 +15,9 @@
     <!-- ==================== 主控状态机节点 ==================== -->
     <node name="main_control" pkg="main_control" type="main_control" output="screen"/>
 
-    <!-- ==================== 前视 YOLO 检测节点 (raicom_vision_laser, mission_flow融合) ==================== -->
-    <!-- 发布全局话题 /yolo_front_detect (DetectionInfo)，图像压缩为 320x240，中心 (160,120) -->
-    <!-- weights_path/device 由上面的 yolo_weights/yolo_device arg 设置（实机engine+cuda，仿真pt+cpu）；
-         confidence/imgsz/image_topic 等从 main_control.yaml 的 yolo_front_detector 段读取（私有参数 ~xxx） -->
-    <node name="yolo_front_detector" pkg="raicom_vision_laser" type="yolo_front_detector.py" output="screen" ns="main_control">
-        <param name="weights_path" value="$(arg yolo_weights)"/>
-        <param name="device" value="$(arg yolo_device)"/>
-    </node>
-
     <!-- ==================== 下视 YOLO 检测节点 (raicom_vision_laser, 投货字母识别) ==================== -->
     <!-- 发布全局话题 /yolo_down_detect (DetectionInfo)。投货悬停时对字母 A/B 投票，
-         决定射击 A 靶(左射击点)还是 B 靶(右射击点)。下视相机 usb_cam 由 main_control_uav.sh 启动 -->
+         决定原地旋转到 A/B 对应 yaw。下视相机 usb_cam 由 main_control_uav.sh 启动 -->
     <node name="yolo_down_detector" pkg="raicom_vision_laser" type="yolo_down_detector.py" output="screen" ns="main_control">
         <param name="weights_path" value="$(arg yolo_weights)"/>
         <param name="device" value="$(arg yolo_device)"/>

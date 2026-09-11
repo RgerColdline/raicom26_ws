@@ -13,19 +13,15 @@
 
 // ==================== 依赖头文件 ====================
 #include <ros/ros.h>
-#include <geometry_msgs/PoseStamped.h>
 #include <mavros_msgs/CommandBool.h>
 #include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/SetMode.h>
 #include <mavros_msgs/State.h>
 #include <nav_msgs/Odometry.h>
 #include <std_msgs/Bool.h>
-#include <std_msgs/Int8.h>
 #include <std_msgs/Int32.h>
 #include <std_msgs/UInt8.h>
 #include <std_msgs/Empty.h>
-#include <std_msgs/String.h>
-#include <std_srvs/Empty.h>
 #include <tf/tf.h>
 #include <XmlRpcValue.h>
 
@@ -61,31 +57,27 @@ const uint16_t TYPE_MASK_VELOCITY_ONLY = 0b100111000111;
 const uint16_t TYPE_MASK_TAKEOFF_POS = 0b101111111000;
 // 定点加速控制掩码：忽略加速度 + yaw_rate，同时使用 x/y/z + vx/vy/vz + yaw
 const uint16_t TYPE_MASK_POSITION_VELOCITY = 2496;
+// 投放点原地瞄准：位置/速度与 yaw/yaw_rate 同时生效，仅忽略加速度
+const uint16_t TYPE_MASK_POSITION_VELOCITY_YAW_RATE = 64 + 128 + 256;
 // 穿越段轨迹跟踪位置控制掩码：忽略 vx/vy/vz/afx/afy/afz + IGNORE_YAW_RATE=2048（不带 512）
 const uint16_t TRAV_TYPE_MASK_POSITION_ONLY = 8 + 16 + 32 + 64 + 128 + 256 + 2048;
 
 // ==================== 状态机枚举 ====================
 enum MissionState {
-    // === 穿越赛段（pillar_nav_mode="pcl" 时使用） ===
+    // === 穿越赛段 ===
     TRAVERSE_TO_SCAN,
     TRAVERSE_SCAN,
     TRAVERSE_LEG2,
 
-    // === EGO 去程回退路径 ===
-    NAV_TO_DROP_AREA,
-
-    // === 投货与射击公共流程 ===
+    // === 投货与原地旋转射击 ===
     HOVER_RECOG_DROP,
     DROP_SUPPLY,
-    RECOG_ATTACK_TARGET,
-    ALIGN_ATTACK_TARGET,
-    SIMULATE_ATTACK,
+    ROTATE_TO_ATTACK_YAW,
+    SHOOT_TARGET,
 
     // === 返程路径 ===
-    TRAVERSE_RETURN_HOME,   // 返程直通：射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿
+    TRAVERSE_RETURN_HOME,   // 返程直通：投放/射击点 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿
     TRAVERSE_RETURN_LEG2,
-    READY_NAV_TO_RING_BACK,
-    NAV_TO_RING_BACK,
     RETURN_CROSS_RING,
     RETURN,
     LAND,
@@ -109,65 +101,26 @@ struct Config
 {
     float takeoff_height;
     float max_speed;
-    float max_yaw_rate;
     float err_max;
-    float hover_vert_tolerance;
     float p_xy, p_z;
-    float hover_time_needed;
-    float target_front_offset_x;
-    float target_front_offset_y;
-    float nav_goal_timeout;
-    float align_pixel_threshold;
-    float shoot_delay;
 
-    float PIX_VEL_P, PIX_VEL_I, PIX_VEL_D;
-    float PIX_VEL_MAX;
-    float PIX_INTEGRAL_MAX;
-    float PIX_FAR_NORM_DIST;
-
-    float detection_min_confidence;
     std::string attack_real_target;
-    bool wait_for_vision_services = true;
-
-    float drop_arrive_threshold;
-    float drop_detect_timeout;
-    float drop_align_hold_time;
-    float drop_camera_bias_x_px;
-    float drop_camera_bias_y_px;
-    float drop_release_bias_x_px;
-    float drop_release_bias_y_px;
-    float drop_fine_pixel_radius;
-    float drop_fine_vel_scale;
-    float drop_descend_distance;
 
     float land_descend_speed         = 0.3f;
-    bool use_ego_planner_for_drop_area;
 
-    float shoot_left_x      = -0.60f;
-    float shoot_left_y      = -2.5f;
-    float shoot_right_x     = -0.60f;
-    float shoot_right_y     = -1.8f;
-    float shoot_default_x   = -0.60f;
-    float shoot_default_y   = -2.15f;
-    float shoot_left_right_threshold = 20.0f;
-    float shoot_detect_timeout       = 60.0f;
-    float shoot_stable_time          = 0.5f;
-    float shoot_duration             = 1.5f;
-    float shoot_z                    = 1.0f;
+    float shoot_yaw_a_offset_deg = -90.0f;
+    float shoot_yaw_b_offset_deg = 90.0f;
+    float shoot_yaw_kp           = 1.5f;
+    float shoot_yaw_rate_max     = 0.8f;
+    float shoot_yaw_tolerance_deg = 3.0f;
+    float shoot_stable_time       = 0.5f;
+    float shoot_duration          = 1.5f;
 
     int   cargo_drop_angle           = 0;
     int   cargo_reset_angle          = 180;
-    float cargo_hold_time            = 2.0f;
-    float descent_timeout            = 10.0f;
     float drop_hover_time            = 2.0f;
-    float drop_z                     = 0.8f;
-
-    float yolo_img_center_x          = 160.0f;
-    float yolo_target_timeout        = 0.5f;
-    float yolo_detect_timeout        = 60.0f;
 
     int   down_min_votes             = 3;
-    std::string shoot_a_side         = "left";
 
     float trav_flight_z        = 1.3f;
     float trav_err_max         = 0.15f;
@@ -178,7 +131,6 @@ struct Config
     double trav_sample_ds      = 0.01;
     int   trav_force_fly         = 0;
     float trav_timeout_margin  = 15.0f;
-    float scan_hover_time      = 3.0f;
     float scan_timeout         = 4.0f;
     int default_case           = 1;
     int force_case             = -1;
@@ -189,20 +141,14 @@ struct Config
 
 // ==================== ROS 通信 ====================
 ros::Publisher setpoint_pub;
-ros::Publisher ego_goal_pub;
 ros::Publisher servo_control_pub;
 ros::Publisher shoot_pub;
 ros::Publisher laser_control_pub;
 ros::Subscriber state_sub, odom_sub;
-ros::Subscriber nav_status_sub;
-ros::Subscriber detected_target_sub;
-ros::Subscriber yolo_detect_sub;
 ros::Subscriber yolo_down_detect_sub;
 ros::Subscriber pillar_sub;
 ros::Publisher pillar_start_pub;
 
-ros::ServiceClient switch_camera_client;
-ros::ServiceClient reset_target_client;
 ros::ServiceClient set_mode_client;
 ros::ServiceClient arming_client;
 
@@ -211,52 +157,34 @@ MissionState current_state = TRAVERSE_TO_SCAN;
 ros::Time state_start_time;
 bool init_pos_received = false;
 bool mission_finished  = false;
+bool control_cfg_ok    = true;
 ros::Time mission_start_time;  // 任务计时起点：无人机 arm 解锁成功那一刻
 
 // ==================== 无人机状态 ====================
 mavros_msgs::State current_mav_state;
 nav_msgs::Odometry local_odom;
 double current_yaw   = 0.0;
-double current_roll  = 0.0;
-double current_pitch = 0.0;
 float init_pos_x = 0.0f, init_pos_y = 0.0f, init_pos_z = 0.0f;
 double init_yaw = 0.0;
-
-// ==================== 导航状态 ====================
-int8_t nav_status            = 0;
-bool nav_goal_sent           = false;
-bool nav_seen_executing      = false;
-
-// ==================== 视觉识别数据 ====================
-std::string confirmed_target;
-bool target_confirmed    = false;
-bool front_target_matched = false;
-std::string matched_target;
-float matched_center_x = 0.0f;
-float matched_center_y = 0.0f;
-ros::Time last_matched_time;
 
 // ==================== 下视字母识别（投货悬停投票） ====================
 std::string shoot_letter = "A";
 bool down_voting  = false;
 int  down_vote_a  = 0;
 int  down_vote_b  = 0;
-bool a_on_left    = true;
 
 // ==================== 投货子状态 ====================
 int       drop_sub_state   = 0;
 int       drop_pub_count   = 0;   // 开舱指令已发送次数（节奏：0s/0.2s/0.4s 共 3 次）
-ros::Time last_drop_pub_time;
 ros::Time drop_hover_start;
 
 // ==================== 射击状态 ====================
 bool      shoot_triggered = false;
 ros::Time shoot_time;
-float     shoot_target_x = 0.0f;
-float     shoot_target_y = 0.0f;
+double    shoot_target_yaw = 0.0;
+ros::Time yaw_aligned_since;
 
 // ==================== 穿越赛段 ====================
-std::string pillar_nav_mode;
 int detected_case   = -1;
 int active_case     = -1;
 int scan_sub_state  = 0;
@@ -273,18 +201,12 @@ std::vector<Vec2f> pillar_cand;
 std::vector<Vec2f> via_leg2[4];
 std::vector<SegObs> walls;
 
-// ==================== PID / 控制 ====================
-ros::Time last_pid_control_time;
-Eigen::Vector3f attack_target_world;
+// ==================== 控制 ====================
 mavros_msgs::PositionTarget current_setpoint;
 
 Waypoint wp_ring_front;
 Waypoint wp_ring_back;
-Waypoint wp_come_mid;
-Waypoint wp_back_mid;
-Waypoint wp_pillar_center;
 Waypoint wp_drop_area;
-Waypoint wp_attack_area;
 
 // ==================== 自然三次样条（二维，参数=累积弦长） ====================
 struct Spline2D
@@ -317,29 +239,22 @@ void initROSCommunication(ros::NodeHandle &nh);
 // 回调
 void stateCallback(const mavros_msgs::State::ConstPtr &msg);
 void odomCallback(const nav_msgs::Odometry::ConstPtr &msg);
-void navStatusCallback(const std_msgs::Int8::ConstPtr &msg);
-void detectedTargetCallback(const std_msgs::String::ConstPtr &msg);
-void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
 void yoloDownDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg);
 void pillarDetectCallback(const std_msgs::Int32::ConstPtr &msg);
 
 // 控制辅助
 void sendSetpoint(const mavros_msgs::PositionTarget &sp);
-void sendEgoGoal(float x, float y, float z, float yaw = NAN);
-bool waitForNavArrival();
 void positionControl(const Eigen::Vector3f &target_pos, mavros_msgs::PositionTarget &sp);
 void positionVelocityControl(const Eigen::Vector3f &target_pos,
                              mavros_msgs::PositionTarget &sp);
 bool reachedTarget(const Eigen::Vector3f &target, float dist_thresh);
-bool navTo(const float x, const float y, const float z);
-bool navTo(const Waypoint wp);
 bool moveTo(const float x, const float y, const float z);
 bool moveTo(const Waypoint wp);
 bool moveToPositionVelocity(const float x, const float y, const float z);
 bool moveToPositionVelocity(const Waypoint wp);
 bool moveToAbs(double x, double y, double z);
-void hover();
-bool timeout(const float timeout_limit);
+double normalizeAngle(double angle);
+bool holdPositionAndAim(const Waypoint &wp, double target_yaw, double *yaw_error = nullptr);
 
 // 穿越赛段
 std::vector<CircleObs> caseCircles(int cid);
@@ -603,7 +518,8 @@ void odomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
     local_odom = *msg;
     tf::Quaternion q;
     tf::quaternionMsgToTF(local_odom.pose.pose.orientation, q);
-    tf::Matrix3x3(q).getRPY(current_roll, current_pitch, current_yaw);
+    double roll = 0.0, pitch = 0.0;
+    tf::Matrix3x3(q).getRPY(roll, pitch, current_yaw);
 
     if (!init_pos_received && local_odom.pose.pose.position.z > -0.5) {
         init_pos_x        = local_odom.pose.pose.position.x;
@@ -613,57 +529,6 @@ void odomCallback(const nav_msgs::Odometry::ConstPtr &msg) {
         init_pos_received = true;
         ROS_INFO("初始位置记录: (%.2f, %.2f, %.2f), 偏航: %.2f°", init_pos_x, init_pos_y,
                  init_pos_z, init_yaw * 180 / M_PI);
-    }
-}
-
-void navStatusCallback(const std_msgs::Int8::ConstPtr &msg) {
-    nav_status = msg->data;
-    if (msg->data == 1) nav_seen_executing = true;
-}
-
-void detectedTargetCallback(const std_msgs::String::ConstPtr &msg) {
-    confirmed_target = msg->data;
-    target_confirmed = true;
-    ROS_INFO("★★★ 目标确认: %s ★★★", confirmed_target.c_str());
-}
-
-void yoloDetectCallback(const raicom_vision_laser::DetectionInfo::ConstPtr &msg) {
-    bool is_attack_state = (current_state == RECOG_ATTACK_TARGET ||
-                            current_state == ALIGN_ATTACK_TARGET ||
-                            current_state == SIMULATE_ATTACK);
-    if (!is_attack_state) return;
-
-    const std::string &match_target =
-        shoot_letter.empty() ? cfg.attack_real_target : shoot_letter;
-    if (match_target.empty()) return;
-
-    bool  found          = false;
-    float best_center_x   = 0.0f;
-    float best_center_y   = 0.0f;
-    float best_confidence = 0.0f;
-    std::string best_class;
-
-    for (int i = 0; i < msg->num_detections; ++i) {
-        if (msg->class_names[i] == match_target) {
-            if (!found || msg->confidences[i] > best_confidence) {
-                best_center_x   = msg->center_x[i];
-                best_center_y   = msg->center_y[i];
-                best_confidence = msg->confidences[i];
-                best_class      = msg->class_names[i];
-                found           = true;
-            }
-        }
-    }
-
-    if (found && best_confidence >= cfg.detection_min_confidence) {
-        front_target_matched = true;
-        matched_target       = best_class;
-        matched_center_x     = best_center_x;
-        matched_center_y     = best_center_y;
-        last_matched_time    = ros::Time::now();
-        ROS_INFO_THROTTLE(1.0, "★★★ [前视] 找到目标 %s, 像素(%.1f, %.1f) conf=%.2f ★★★",
-                          matched_target.c_str(), matched_center_x, matched_center_y,
-                          best_confidence);
     }
 }
 
@@ -705,38 +570,6 @@ void sendSetpoint(const mavros_msgs::PositionTarget &sp) {
     setpoint_pub.publish(sp);
 }
 
-void sendEgoGoal(float x, float y, float z, float yaw) {
-    geometry_msgs::PoseStamped goal;
-    goal.header.stamp    = ros::Time::now();
-    goal.header.frame_id = "world";
-    goal.pose.position.x = x;
-    goal.pose.position.y = y;
-    goal.pose.position.z = z;
-    if (!std::isnan(yaw)) {
-        tf::Quaternion q        = tf::createQuaternionFromYaw(yaw);
-        goal.pose.orientation.x = q.x();
-        goal.pose.orientation.y = q.y();
-        goal.pose.orientation.z = q.z();
-        goal.pose.orientation.w = q.w();
-    }
-    else {
-        goal.pose.orientation.w = 1.0;
-    }
-    ego_goal_pub.publish(goal);
-    nav_goal_sent      = true;
-    nav_seen_executing = false;
-    ROS_INFO("导航目标点: (%.2f, %.2f, %.2f)", x, y, z);
-}
-
-bool waitForNavArrival() {
-    if ((ros::Time::now() - state_start_time).toSec() > cfg.nav_goal_timeout) {
-        ROS_WARN("等待导航到达超时！");
-        current_state = TASK_END;
-        return false;
-    }
-    return nav_seen_executing && (nav_status == 2);
-}
-
 void positionControl(const Eigen::Vector3f &target_pos,
                      mavros_msgs::PositionTarget &sp) {
     Eigen::Vector3f err = target_pos - Eigen::Vector3f(local_odom.pose.pose.position.x,
@@ -775,18 +608,6 @@ bool reachedTarget(const Eigen::Vector3f &target, float dist_thresh) {
     return (dx * dx + dy * dy + dz * dz) < (dist_thresh * dist_thresh);
 }
 
-bool navTo(const float x, const float y, const float z) {
-    if (!nav_goal_sent) {
-        float target_x = init_pos_x + x;
-        float target_y = init_pos_y + y;
-        float target_z = init_pos_z + z;
-        sendEgoGoal(target_x, target_y, target_z);
-    }
-    return waitForNavArrival();
-}
-
-bool navTo(const Waypoint wp) { return navTo(wp.x, wp.y, wp.z); }
-
 bool moveTo(const float x, const float y, const float z) {
     float target_x = init_pos_x + x;
     float target_y = init_pos_y + y;
@@ -819,117 +640,64 @@ bool moveToAbs(double x, double y, double z) {
     return reachedTarget(Eigen::Vector3f(x, y, z), cfg.err_max);
 }
 
-void hover() {
-    static float local_x             = local_odom.pose.pose.position.x;
-    static float local_y             = local_odom.pose.pose.position.y;
-    static float local_z             = local_odom.pose.pose.position.z;
-    static ros::Time last_hover_time = ros::Time::now();
-    if (ros::Time::now() - last_hover_time > ros::Duration(3.0)) {
-        local_x = local_odom.pose.pose.position.x;
-        local_y = local_odom.pose.pose.position.y;
-        local_z = local_odom.pose.pose.position.z;
-    }
-    moveTo(local_x, local_y, local_z);
-    last_hover_time = ros::Time::now();
+double normalizeAngle(double angle) {
+    while (angle > M_PI) angle -= 2.0 * M_PI;
+    while (angle < -M_PI) angle += 2.0 * M_PI;
+    return angle;
 }
 
-bool timeout(const float timeout_limit) {
-    ros::Duration delta = ros::Time::now() - state_start_time;
-    return delta > ros::Duration(timeout_limit);
+bool holdPositionAndAim(const Waypoint &wp, double target_yaw, double *yaw_error) {
+    const bool position_ok = moveToPositionVelocity(wp);
+    const double error = normalizeAngle(target_yaw - current_yaw);
+    const double yaw_rate = std::clamp(cfg.shoot_yaw_kp * error,
+                                       -(double)cfg.shoot_yaw_rate_max,
+                                       (double)cfg.shoot_yaw_rate_max);
+
+    current_setpoint.type_mask = TYPE_MASK_POSITION_VELOCITY_YAW_RATE;
+    current_setpoint.yaw       = target_yaw;
+    current_setpoint.yaw_rate  = yaw_rate;
+
+    if (yaw_error != nullptr) *yaw_error = error;
+    return position_ok && fabs(error) <= cfg.shoot_yaw_tolerance_deg * M_PI / 180.0;
 }
 
 // ==================== 参数加载 ====================
 void loadParameters(ros::NodeHandle &nh) {
     nh.param<float>("takeoff_height", cfg.takeoff_height, 1.2f);
     nh.param<float>("max_speed", cfg.max_speed, 0.8f);
-    nh.param<float>("max_yaw_rate", cfg.max_yaw_rate, 0.8f);
     nh.param<float>("err_max", cfg.err_max, 0.25f);
-    nh.param<float>("hover_vert_tolerance", cfg.hover_vert_tolerance, 0.03f);
     nh.param<float>("p_xy", cfg.p_xy, 0.4f);
     nh.param<float>("p_z", cfg.p_z, 0.3f);
-    nh.param<float>("hover_time_needed", cfg.hover_time_needed, 3.0f);
-    nh.param<float>("target_front_offset_x", cfg.target_front_offset_x, -1.0f);
-    nh.param<float>("target_front_offset_y", cfg.target_front_offset_y, 0.0f);
-    nh.param<float>("nav_goal_timeout", cfg.nav_goal_timeout, 60.0f);
-    nh.param<float>("align_pixel_threshold", cfg.align_pixel_threshold, 15.0f);
-    nh.param<float>("shoot_delay", cfg.shoot_delay, 2.0f);
 
-    nh.param<float>("PIX_VEL_P", cfg.PIX_VEL_P, 0.003f);
-    nh.param<float>("PIX_VEL_I", cfg.PIX_VEL_I, 0.0001f);
-    nh.param<float>("PIX_VEL_D", cfg.PIX_VEL_D, 0.001f);
-    nh.param<float>("PIX_VEL_MAX", cfg.PIX_VEL_MAX, 0.4f);
-    nh.param<float>("PIX_FAR_NORM_DIST", cfg.PIX_FAR_NORM_DIST, 150.0f);
-    nh.param<float>("PIX_INTEGRAL_MAX", cfg.PIX_INTEGRAL_MAX, 100.0f);
-
-    nh.param<float>("wp_ring_front_x", wp_ring_front.x, 0.65f);
+    nh.param<float>("wp_ring_front_x", wp_ring_front.x, -0.65f);
     nh.param<float>("wp_ring_front_y", wp_ring_front.y, 0.0f);
     nh.param<float>("wp_ring_front_z", wp_ring_front.z, cfg.takeoff_height);
-    nh.param<float>("wp_ring_back_x", wp_ring_back.x, 2.05f);
+    nh.param<float>("wp_ring_back_x", wp_ring_back.x, -2.05f);
     nh.param<float>("wp_ring_back_y", wp_ring_back.y, 0.0f);
     nh.param<float>("wp_ring_back_z", wp_ring_back.z, cfg.takeoff_height);
-    nh.param<float>("wp_come_mid_x", wp_come_mid.x, -2.35f);
-    nh.param<float>("wp_come_mid_y", wp_come_mid.y, -2.48f);
-    nh.param<float>("wp_come_mid_z", wp_come_mid.z, cfg.takeoff_height);
-    nh.param<float>("wp_back_mid_x", wp_back_mid.x, -2.35f);
-    nh.param<float>("wp_back_mid_y", wp_back_mid.y, -2.48f);
-    nh.param<float>("wp_back_mid_z", wp_back_mid.z, cfg.takeoff_height);
-    nh.param<float>("wp_pillar_center_x", wp_pillar_center.x, -2.35f);
-    nh.param<float>("wp_pillar_center_y", wp_pillar_center.y, -1.43f);
-    nh.param<float>("wp_pillar_center_z", wp_pillar_center.z, cfg.takeoff_height);
-    nh.param<float>("wp_drop_area_x", wp_drop_area.x, 0.45f);
-    nh.param<float>("wp_drop_area_y", wp_drop_area.y, 2.0f);
+    nh.param<float>("wp_drop_area_x", wp_drop_area.x, -0.45f);
+    nh.param<float>("wp_drop_area_y", wp_drop_area.y, -2.0f);
     nh.param<float>("wp_drop_area_z", wp_drop_area.z, cfg.takeoff_height);
-    nh.param<float>("wp_attack_area_x", wp_attack_area.x, 0.45f);
-    nh.param<float>("wp_attack_area_y", wp_attack_area.y, 2.0f);
-    nh.param<float>("wp_attack_area_z", wp_attack_area.z, cfg.takeoff_height);
 
-    nh.param<float>("detection/min_confidence", cfg.detection_min_confidence, 0.5f);
     nh.param<std::string>("detection/attack_real_target", cfg.attack_real_target, "A");
-    nh.param<bool>("wait_for_vision_services", cfg.wait_for_vision_services, true);
-
-    nh.param<float>("drop_arrive_threshold", cfg.drop_arrive_threshold, 0.35f);
-    nh.param<float>("drop/detect_timeout", cfg.drop_detect_timeout, 5.0f);
-    nh.param<float>("drop_align_hold_time", cfg.drop_align_hold_time, 0.35f);
-    nh.param<float>("drop_camera_bias_x_px", cfg.drop_camera_bias_x_px, 0.0f);
-    nh.param<float>("drop_camera_bias_y_px", cfg.drop_camera_bias_y_px, 0.0f);
-    nh.param<float>("drop_release_bias_x_px", cfg.drop_release_bias_x_px, 0.0f);
-    nh.param<float>("drop_release_bias_y_px", cfg.drop_release_bias_y_px, 0.0f);
-    nh.param<float>("drop_fine_pixel_radius", cfg.drop_fine_pixel_radius, 35.0f);
-    nh.param<float>("drop_fine_vel_scale", cfg.drop_fine_vel_scale, 0.45f);
-    nh.param<float>("drop_descend_distance", cfg.drop_descend_distance, 0.0f);
 
     nh.param<float>("land/descend_speed", cfg.land_descend_speed, 0.3f);
-    nh.param<bool>("use_ego_planner_for_drop_area", cfg.use_ego_planner_for_drop_area, true);
 
-    nh.param<float>("shoot/left_x", cfg.shoot_left_x, -0.60f);
-    nh.param<float>("shoot/left_y", cfg.shoot_left_y, -2.5f);
-    nh.param<float>("shoot/right_x", cfg.shoot_right_x, -0.60f);
-    nh.param<float>("shoot/right_y", cfg.shoot_right_y, -1.8f);
-    nh.param<float>("shoot/default_x", cfg.shoot_default_x, -0.60f);
-    nh.param<float>("shoot/default_y", cfg.shoot_default_y, -2.15f);
-    nh.param<float>("shoot/left_right_threshold", cfg.shoot_left_right_threshold, 20.0f);
-    nh.param<float>("shoot/detect_timeout", cfg.shoot_detect_timeout, 60.0f);
+    nh.param<float>("shoot/yaw_a_offset_deg", cfg.shoot_yaw_a_offset_deg, -90.0f);
+    nh.param<float>("shoot/yaw_b_offset_deg", cfg.shoot_yaw_b_offset_deg, 90.0f);
+    nh.param<float>("shoot/yaw_kp", cfg.shoot_yaw_kp, 1.5f);
+    nh.param<float>("shoot/yaw_rate_max", cfg.shoot_yaw_rate_max, 0.8f);
+    nh.param<float>("shoot/yaw_tolerance_deg", cfg.shoot_yaw_tolerance_deg, 3.0f);
     nh.param<float>("shoot/stable_time", cfg.shoot_stable_time, 0.5f);
     nh.param<float>("shoot/duration", cfg.shoot_duration, 1.5f);
-    nh.param<float>("shoot/z", cfg.shoot_z, 1.0f);
 
     nh.param<int>("cargo/drop_angle", cfg.cargo_drop_angle, 0);
     nh.param<int>("cargo/reset_angle", cfg.cargo_reset_angle, 180);
-    nh.param<float>("cargo/hold_time", cfg.cargo_hold_time, 2.0f);
-    nh.param<float>("cargo/descent_timeout", cfg.descent_timeout, 10.0f);
     nh.param<float>("cargo/drop_hover_time", cfg.drop_hover_time, 2.0f);
-    nh.param<float>("cargo/drop_z", cfg.drop_z, 0.8f);
-
-    nh.param<float>("yolo/img_center_x", cfg.yolo_img_center_x, 160.0f);
-    nh.param<float>("yolo/target_timeout", cfg.yolo_target_timeout, 0.5f);
-    nh.param<float>("yolo/detect_timeout", cfg.yolo_detect_timeout, 60.0f);
 
     nh.param<int>("down/min_votes", cfg.down_min_votes, 3);
-    nh.param<std::string>("shoot/a_side", cfg.shoot_a_side, "left");
-    a_on_left    = (cfg.shoot_a_side != "right");
     shoot_letter = cfg.attack_real_target;
 
-    nh.param<std::string>("pillar_nav_mode", pillar_nav_mode, "ego");
     nh.param<float>("traverse/flight_z", cfg.trav_flight_z, 1.3f);
     nh.param<float>("traverse/err_max", cfg.trav_err_max, 0.15f);
     nh.param<double>("traverse/v_max", cfg.trav_v_max, 0.5);
@@ -939,7 +707,6 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<double>("traverse/sample_ds", cfg.trav_sample_ds, 0.01);
     nh.param<int>("traverse/force_fly", cfg.trav_force_fly, 0);
     nh.param<float>("traverse/traj_timeout_margin", cfg.trav_timeout_margin, 15.0f);
-    nh.param<float>("traverse/scan_hover_time", cfg.scan_hover_time, 3.0f);
     nh.param<float>("traverse/scan_timeout", cfg.scan_timeout, 4.0f);
     nh.param<int>("traverse/default_case", cfg.default_case, 1);
     nh.param<int>("traverse/force_case", cfg.force_case, -1);
@@ -950,27 +717,39 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<double>("map/origin_y", origin_fy, 0.75);
     nh.param<double>("map/pillar_radius", pillar_radius, 0.1);
 
-    ROS_INFO("参数加载完成。");
+    if (cfg.max_speed <= 0.0f || cfg.err_max <= 0.0f || cfg.p_xy <= 0.0f || cfg.p_z <= 0.0f ||
+        cfg.land_descend_speed <= 0.0f || cfg.drop_hover_time < 0.0f || cfg.down_min_votes < 1 ||
+        cfg.cargo_drop_angle < 0 || cfg.cargo_drop_angle > 255 ||
+        cfg.cargo_reset_angle < 0 || cfg.cargo_reset_angle > 255 ||
+        (cfg.attack_real_target != "A" && cfg.attack_real_target != "B") ||
+        !std::isfinite(cfg.shoot_yaw_a_offset_deg) || !std::isfinite(cfg.shoot_yaw_b_offset_deg) ||
+        cfg.shoot_yaw_kp <= 0.0f || cfg.shoot_yaw_rate_max <= 0.0f ||
+        cfg.shoot_yaw_tolerance_deg <= 0.0f || cfg.shoot_yaw_tolerance_deg > 180.0f ||
+        cfg.shoot_stable_time < 0.0f || cfg.shoot_duration <= 0.0f) {
+        ROS_FATAL("主控参数非法：控制速度/误差/增益和降落速度须 > 0；投票数须 >= 1；"
+                  "舵机角度须在 0~255；兜底目标须为 A/B；yaw 偏移须为有限值；"
+                  "yaw kp/rate/duration 须 > 0，tolerance 须在 (0,180]，等待时间须 >= 0");
+        control_cfg_ok = false;
+        return;
+    }
+
+    ROS_INFO("参数加载完成：A/B yaw 偏移 %.1f°/%.1f°，kp=%.2f，rate_max=%.2f rad/s，容差 %.1f°",
+             cfg.shoot_yaw_a_offset_deg, cfg.shoot_yaw_b_offset_deg, cfg.shoot_yaw_kp,
+             cfg.shoot_yaw_rate_max, cfg.shoot_yaw_tolerance_deg);
 }
 
 void initROSCommunication(ros::NodeHandle &nh) {
     setpoint_pub       = nh.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local", 10);
-    ego_goal_pub       = nh.advertise<geometry_msgs::PoseStamped>("/fsm/ego_goal", 1);
     servo_control_pub  = nh.advertise<std_msgs::UInt8>("/servo_control", 1);
     shoot_pub          = nh.advertise<std_msgs::Empty>("/shoot", 1);
     laser_control_pub  = nh.advertise<std_msgs::Bool>("/laser_control", 1);
 
     state_sub          = nh.subscribe("/mavros/state", 10, &stateCallback);
     odom_sub           = nh.subscribe("/mavros/local_position/odom", 10, &odomCallback);
-    nav_status_sub     = nh.subscribe("/ego_controller/status", 10, &navStatusCallback);
-    detected_target_sub = nh.subscribe("/detected_target", 10, &detectedTargetCallback);
-    yolo_detect_sub    = nh.subscribe("/yolo_front_detect", 10, &yoloDetectCallback);
     yolo_down_detect_sub = nh.subscribe("/yolo_down_detect", 10, &yoloDownDetectCallback);
     pillar_sub         = nh.subscribe("/pcl_detection2/pillar_case_id", 10, &pillarDetectCallback);
     pillar_start_pub   = nh.advertise<std_msgs::Empty>("/pcl_detection2/start_pillar_detect", 1);
 
-    switch_camera_client = nh.serviceClient<std_srvs::Empty>("/switch_camera");
-    reset_target_client  = nh.serviceClient<std_srvs::Empty>("/reset_target");
     set_mode_client      = nh.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
     arming_client        = nh.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
 }
@@ -995,17 +774,12 @@ static bool loadPointList(ros::NodeHandle &nh, const std::string &key, std::vect
 }
 
 void loadTraverseConfig(ros::NodeHandle &nh) {
-    if (pillar_nav_mode != "pcl") {
-        ROS_INFO("[穿越] pillar_nav_mode=%s，不加载穿越地图", pillar_nav_mode.c_str());
-        return;
-    }
-
     if (cfg.default_case < 0 || cfg.default_case > 3) {
-        ROS_ERROR("[穿越] traverse/default_case=%d 非法（必须 0~3），回退 EGO 路径", cfg.default_case);
+        ROS_ERROR("[穿越] traverse/default_case=%d 非法（必须 0~3）", cfg.default_case);
         return;
     }
     if (cfg.force_case < -1 || cfg.force_case > 3) {
-        ROS_ERROR("[穿越] traverse/force_case=%d 非法（必须 -1 或 0~3），回退 EGO 路径", cfg.force_case);
+        ROS_ERROR("[穿越] traverse/force_case=%d 非法（必须 -1 或 0~3）", cfg.force_case);
         return;
     }
 
@@ -1043,12 +817,12 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
 
     for (int cid = 0; cid < 4; cid++) {
         if (via_leg2[cid].size() < 2) {
-            ROS_ERROR("[穿越] map/via_points_leg2_case%d 为空或点数不足，回退 EGO 路径", cid);
+            ROS_ERROR("[穿越] map/via_points_leg2_case%d 为空或点数不足", cid);
             return;
         }
     }
     if (pillar_cand.size() != 4) {
-        ROS_ERROR("[穿越] map/pillar_candidates 必须是 4 个候选柱位（当前 %zu 个），回退 EGO 路径",
+        ROS_ERROR("[穿越] map/pillar_candidates 必须是 4 个候选柱位（当前 %zu 个）",
                   pillar_cand.size());
         return;
     }
@@ -1085,22 +859,21 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
                      tp.min_clearance, case_ok[cid] ? "✓" : "✗ 不达标！");
         }
         if (!case_ok[cfg.default_case] && cfg.trav_force_fly != 1) {
-            ROS_ERROR("[穿越] default_case=%d 净距不达标，回退链失效，回退 EGO 路径！"
+            ROS_ERROR("[穿越] default_case=%d 净距不达标，无法安全执行任务！"
                       "请调整 map/via_points_leg2_case%d", cfg.default_case, cfg.default_case);
             return;
         }
         if (cfg.force_case >= 0 && !case_ok[cfg.force_case] && cfg.trav_force_fly != 1) {
-            ROS_ERROR("[穿越] force_case=%d 净距不达标，回退 EGO 路径！"
+            ROS_ERROR("[穿越] force_case=%d 净距不达标，无法安全执行任务！"
                       "请调整对应 via_points 或改 force_case", cfg.force_case);
             return;
         }
     }
 
-    // ---- 返程直通预检（return_smooth=1 时）：模拟射击点出发，倒放leg2+穿环走廊+起飞点 ----
-    // 预检起点取左射击点（场地系换算；南北两射击点中跨度更大更保守），运行时用实际位置重规划+校验
+    // ---- 返程直通预检（return_smooth=1 时）：投放/射击点出发，倒放leg2+穿环走廊+起飞点 ----
     if (cfg.trav_return_smooth == 1) {
-        Vec2f shoot_start{origin_fx - cfg.shoot_left_x, origin_fy - cfg.shoot_left_y};
-        ROS_INFO("[穿越] 返程直通预检：4 套返程轨迹（射击点出发，倒放绕柱+穿环+回起点）净距一览");
+        const Vec2f shoot_start = via_leg2[0].back();
+        ROS_INFO("[穿越] 返程直通预检：4 套返程轨迹（投放点原地射击后，倒放绕柱+穿环+回起点）净距一览");
         for (int cid = 0; cid < 4; cid++) {
             std::vector<Vec2f> via_ret;
             TraversePlanResult tp;
@@ -1211,13 +984,13 @@ bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field) {
 bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out) {
     // 返程直通途经点（场地系）：起点 -> 倒放 leg2（绕柱区入口 -> 悬停点）-> 穿环走廊 -> 起飞点
     // 倒放跳过 leg2 末点（投放区），第一个途经点 = leg2 倒数第二点（投放/射击区与绕柱区之间），
-    // 射击点直连该点，不去投放区拐弯。穿环走廊：悬停点与孔之间拉直 -> 过孔中心 -> 孔与出生点之间拉直 -> 起飞点
+    // 从投放/射击点直连该点。穿环走廊：悬停点与孔之间拉直 -> 过孔中心 -> 孔与出生点之间拉直 -> 起飞点
     if (cid < 0 || cid > 3 || via_leg2[cid].size() < 3) return false;
     out.clear();
     // 防重复点（重复点会让样条弦长参数 h=0 导致除零）：起点离倒放首点太近就不单独加起点
     const Vec2f &entry = via_leg2[cid][via_leg2[cid].size() - 2];   // 绕柱区入口（leg2 倒数第二点）
     if (std::hypot(start_field.x - entry.x, start_field.y - entry.y) > 0.1)
-        out.push_back(start_field);                            // 起点（射击点/当前位置）
+        out.push_back(start_field);                            // 起点（投放/射击点或当前位置）
     for (int i = (int)via_leg2[cid].size() - 2; i >= 0; --i)   // 倒放绕柱：绕柱区入口 -> ... -> 悬停点（跳过投放区）
         out.push_back(via_leg2[cid][i]);
     Vec2f mid1{0.5 * (scan_hover_fx + 2.0), scan_hover_fy};    // 悬停点与孔之间拉直（抑制拐弯外凸）
