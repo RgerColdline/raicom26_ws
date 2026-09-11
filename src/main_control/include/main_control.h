@@ -100,6 +100,7 @@ struct Waypoint
 struct Config
 {
     float takeoff_height;
+    float takeoff_transition_z       = 0.7f;  // 起飞过渡高度（离地）：爬到此即切入穿越，边爬升边水平穿环
     float max_speed;
     float err_max;
     float p_xy, p_z;
@@ -664,6 +665,9 @@ bool holdPositionAndAim(const Waypoint &wp, double target_yaw, double *yaw_error
 // ==================== 参数加载 ====================
 void loadParameters(ros::NodeHandle &nh) {
     nh.param<float>("takeoff_height", cfg.takeoff_height, 1.2f);
+    nh.param<float>("takeoff_transition_z", cfg.takeoff_transition_z, 0.7f);
+    if (cfg.takeoff_transition_z <= 0.0f || cfg.takeoff_transition_z >= cfg.takeoff_height)
+        cfg.takeoff_transition_z = cfg.takeoff_height * 0.6f;  // 兜底：必须在 (0, takeoff_height) 内
     nh.param<float>("max_speed", cfg.max_speed, 0.8f);
     nh.param<float>("err_max", cfg.err_max, 0.25f);
     nh.param<float>("p_xy", cfg.p_xy, 0.4f);

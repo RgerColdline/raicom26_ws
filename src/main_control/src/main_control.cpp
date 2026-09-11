@@ -123,14 +123,16 @@ int main(int argc, char **argv)
             }
         }
 
-        // 稳定悬停在 (init_pos_x, init_pos_y, init_pos_z+takeoff_height) 后进入任务
-        if (fabs(local_odom.pose.pose.position.z - target_z) < 0.2)
+        // 起飞到过渡高度即切入穿越（边爬升边水平穿环，参考返程边飞边降），
+        // 不再等爬到 takeoff_height 再稳定 1s
+        if (local_odom.pose.pose.position.z - init_pos_z >= cfg.takeoff_transition_z)
         {
-            if (ros::Time::now() - last_request > ros::Duration(1.0))
+            if (ros::Time::now() - last_request > ros::Duration(0.3))
             {
                 current_state    = TRAVERSE_TO_SCAN;
                 state_start_time = ros::Time::now();
-                ROS_INFO("进入穿越赛段：直接飞向悬停扫描点（途中穿环）");
+                ROS_INFO("进入穿越赛段：起飞到过渡高度 %.2fm，边爬升边水平穿环（途中穿环）",
+                         cfg.takeoff_transition_z);
                 ROS_INFO("\n========================================");
                 ROS_INFO("=== 任务流程正式开始 ===");
                 ROS_INFO("========================================\n");

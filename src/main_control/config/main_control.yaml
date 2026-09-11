@@ -1,10 +1,11 @@
 # ==================== 基础控制参数 ====================
 
 takeoff_height: 1.1                 # 起飞高度（相对初始点，m）
+takeoff_transition_z: 0.8           # 起飞过渡高度（离地，m）：爬到此高度即切入穿越赛段，边爬升边水平穿环（参考返程边飞边降），不再等爬到 takeoff_height
 max_speed: 0.8                      # 定点控制最大单轴速度（m/s）
 err_max: 0.25                       # 定点控制到位距离（m）
 p_xy: 0.4                           # 水平位置误差 -> 速度增益
-p_z: 0.4                            # 垂直位置误差 -> 速度增益
+p_z: 0.8                            # 垂直位置误差 -> 速度增益
 
 # 主控仅使用 PCL 检测 + 本地平滑轨迹；穿越参数和地图由 traverse_map.yaml 提供。
 
@@ -13,8 +14,8 @@ p_z: 0.4                            # 垂直位置误差 -> 速度增益
 # A/B 角度均相对起飞时记录的 init_yaw：正值逆时针，负值顺时针。
 # 当前场地 A 在右、B 在左，默认 A=-90°、B=+90°；实机以激光安装方向为准微调。
 shoot:
-  yaw_a_offset_deg: -90.0           # 识别为 A 时的 yaw 偏移（deg）
-  yaw_b_offset_deg: 90.0            # 识别为 B 时的 yaw 偏移（deg）
+  yaw_a_offset_deg: 30.0           # 识别为 A 时的 yaw 偏移（deg）
+  yaw_b_offset_deg: -30.0            # 识别为 B 时的 yaw 偏移（deg）
   yaw_kp: 1.5                       # yaw 误差 -> yaw_rate 前馈增益
   yaw_rate_max: 0.8                 # 最大 yaw_rate 指令（rad/s）
   yaw_tolerance_deg: 3.0            # 允许射击的 yaw 误差（deg）
@@ -56,5 +57,5 @@ yolo_down_detector:
   confidence: 0.4
   imgsz: 320
   show_image: true
-  image_topic: "/usb_cam/image_raw"
+  image_topic: "/camera/image_raw"      # 下视 usb_cam 实际发布的话题（见 magpie360/usb_cam.sdf）
   window_name: "YOLO Down Detection"
