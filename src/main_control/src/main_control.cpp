@@ -181,7 +181,8 @@ int main(int argc, char **argv)
 
             // 【扫到即切】已检出 case 且已穿环（场地 x>2.05）：
             // 用当前位置替换 leg2 首点重规划，直接切入绕柱段，跳过悬停点
-            if (cfg.trav_early_scan == 1 && detected_case >= 0)
+            // （折线模式不走此捷径：折线首点=悬停点，先到悬停点再逐点走）
+            if (cfg.trav_use_polyline != 1 && cfg.trav_early_scan == 1 && detected_case >= 0)
             {
                 double cur_fx = origin_fx - local_odom.pose.pose.position.x;
                 double cur_fy = origin_fy - local_odom.pose.pose.position.y;
@@ -237,6 +238,8 @@ int main(int argc, char **argv)
                         current_state    = TRAVERSE_LEG2;
                         scan_sub_state   = 0;
                         leg2_sub_state   = 0;
+                        poly_cur_idx     = 0;          // 折线模式：从头跟踪
+                        poly_pt_start    = ros::Time(0);
                         leg_start_time   = ros::Time::now();
                         state_start_time = ros::Time::now();
                     }
@@ -279,6 +282,8 @@ int main(int argc, char **argv)
                         current_state    = TRAVERSE_LEG2;
                         scan_sub_state   = 0;
                         leg2_sub_state   = 0;
+                        poly_cur_idx     = 0;          // 折线模式：从头跟踪
+                        poly_pt_start    = ros::Time(0);
                         leg_start_time   = ros::Time::now();
                         state_start_time = ros::Time::now();
                     }
@@ -304,7 +309,23 @@ int main(int argc, char **argv)
         // ========== 状态: leg2 绕柱段轨迹跟踪（悬停点 -> 投放区） ==========
         case TRAVERSE_LEG2:
         {
-            if (leg2_straight)
+            // 折线模式：闭环逐点到点（2026-09-12，修掉时间开环滞后撞柱）
+            if (cfg.trav_use_polyline == 1)
+            {
+                if (trackPolyline(active_case, false, "去程穿越"))
+                {
+                    ROS_INFO("[穿越] ✓ 折线去程完成，到达投放区，进入悬停投货流程");
+                    current_state      = HOVER_RECOG_DROP;
+                    drop_sub_state     = 0;
+                    drop_hover_start   = ros::Time(0);
+                    state_start_time   = ros::Time::now();
+
+                    down_vote_a = 0;
+                    down_vote_b = 0;
+                    down_voting = true;
+                }
+            }
+            else if (leg2_straight)
             {
                 // 斜摆 case 两段平滑：段1(出发点->空柱A) -> 停顿0.3s -> 段2(空柱A->空柱B->投货区)
                 switch (leg2_sub_state)
@@ -540,7 +561,17 @@ int main(int argc, char **argv)
 
             if ((ros::Time::now() - shoot_time).toSec() > cfg.shoot_duration)
             {
-                if (leg2_straight)
+                if (cfg.trav_use_polyline == 1)
+                {
+                    // 折线模式返程：穿越折线（投货区 -> 悬停点）-> 穿环小样条 -> 降落
+                    current_state  = TRAVERSE_RETURN_HOME;
+                    leg2_sub_state = 0;
+                    poly_cur_idx   = 0;
+                    poly_pt_start  = ros::Time(0);
+                    leg_start_time = ros::Time::now();
+                    ROS_INFO("[射击] 射击完成，折线模式返程（穿越折线 -> 穿环小样条）");
+                }
+                else if (leg2_straight)
                 {
                     // case1/case2：两段平滑返程（段1->停顿->段2含穿环降高）
                     current_state  = TRAVERSE_RETURN_HOME;
@@ -569,7 +600,31 @@ int main(int argc, char **argv)
         // ========== 状态: 返程直通（当前位置 -> 倒放绕柱 -> 穿环 -> 起飞点，单条轨迹不停顿） ==========
         case TRAVERSE_RETURN_HOME:
         {
-            if (leg2_straight)
+            // 折线模式返程：段0 穿越折线（投货区 -> 悬停点）-> 段1 穿环小样条（含末段降高）
+            if (cfg.trav_use_polyline == 1)
+            {
+                if (leg2_sub_state == 0)
+                {
+                    if (trackPolyline(active_case, true, "返程穿越"))
+                    {
+                        leg2_sub_state = 1;
+                        leg_start_time = ros::Time::now();
+                        state_start_time = ros::Time::now();
+                        ROS_INFO("[穿越] ✓ 返程穿越折线完成，接穿环小样条");
+                    }
+                }
+                else
+                {
+                    if (trackPlan(planner_ring, false, init_pos_x, init_pos_y, "返程穿环",
+                                  cfg.trav_return_land_z))
+                    {
+                        ROS_INFO("[穿越] ✓ 折线模式返程完成（穿环+末段降高），已到起飞点，直接降落");
+                        current_state    = LAND;
+                        state_start_time = ros::Time::now();
+                    }
+                }
+            }
+            else if (leg2_straight)
             {
                 // 斜摆 case 两段平滑返程：段1(投货区->空柱B) -> 停顿0.3s -> 段2(空柱B->空柱A->悬停点->穿环->出发点，含降高)
                 switch (leg2_sub_state)

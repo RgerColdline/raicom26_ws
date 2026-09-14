@@ -2,9 +2,9 @@
 
 takeoff_height: 1.1                 # 起飞高度（相对初始点，m）
 takeoff_transition_z: 0.8           # 起飞过渡高度（离地，m）：爬到此高度即切入穿越赛段，边爬升边水平穿环（参考返程边飞边降），不再等爬到 takeoff_height
-max_speed: 0.8                      # 定点控制最大单轴速度（m/s）
+max_speed: 0.7                      # 定点控制最大单轴速度（m/s）
 err_max: 0.25                       # 定点控制到位距离（m）
-p_xy: 0.4                           # 水平位置误差 -> 速度增益
+p_xy: 1.0                           # 水平位置误差 -> 速度增益
 p_z: 0.8                            # 垂直位置误差 -> 速度增益
 
 # 主控仅使用 PCL 检测 + 本地平滑轨迹；穿越参数和地图由 traverse_map.yaml 提供。

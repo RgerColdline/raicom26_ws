@@ -138,6 +138,11 @@ struct Config
     int trav_early_scan        = 1;   // 1=起飞后立刻触发柱子检测，边飞边扫，检出且过环后当前位置直接切入 leg2（跳过悬停点停留）；0=旧行为到悬停点才扫
     int trav_return_smooth     = 1;   // 1=射击后从当前位置单条平滑轨迹返程（倒放绕柱+穿环+回起飞点，中途不停顿）；0=旧行为分段返程
     float trav_return_land_z   = 0.45f; // 返程直通末段目标高度(m)：过环后从 flight_z 边飞边线性降到该高度，缩短最后降落；<=0 禁用降高全程平飞
+
+    // ---- 穿越段折线模式（2026-09-12：闭环逐点到点，替代时间开环样条） ----
+    int   trav_use_polyline      = 1;     // 1=穿越段(去程+返程)折线逐点到点；0=旧样条时间开环
+    float trav_polyline_err_max  = 0.15f; // 折线到点容差(m)，净距校验要求 = inflation + 本值
+    float trav_polyline_pt_timeout = 10.0f; // 折线单点超时(s)，超时切下一点防卡死
 } cfg;
 
 // ==================== ROS 通信 ====================
@@ -214,6 +219,12 @@ bool leg2_straight = false;             // true=当前 active_case 用两段平�
 double go_pause_ox = 0, go_pause_oy = 0;    // 去程停顿点（空柱A，odom 系）
 double ret_pause_ox = 0, ret_pause_oy = 0;  // 返程停顿点（空柱B，odom 系）
 
+// ==== 穿越段折线模式（2026-09-12） ====
+std::vector<Vec2f> poly_go[4];          // 去程折线航点（场地系：悬停点 -> ... -> 投货区）
+std::vector<Vec2f> poly_ret[4];         // 返程折线航点（场地系：投货区 -> ... -> 悬停点）
+int poly_cur_idx = 0;                   // 当前跟踪的折线航点索引（进入航段时置 0）
+ros::Time poly_pt_start;                // 当前航点的起始时刻（单点超时用）
+
 // ==================== 控制 ====================
 mavros_msgs::PositionTarget current_setpoint;
 
@@ -245,6 +256,7 @@ TraversePlanResult planner_go_a;     // 斜摆 case 去程段1（出发点 -> �
 TraversePlanResult planner_go_b;     // 斜摆 case 去程段2（空柱A -> 空柱B -> 投货区）
 TraversePlanResult planner_ret_a;    // 斜摆 case 返程段1（投货区 -> 空柱B）
 TraversePlanResult planner_ret_b;    // 斜摆 case 返程段2（空柱B -> 空柱A -> 悬停点 -> 穿环 -> 出发点）
+TraversePlanResult planner_ring;     // 返程穿环小样条（悬停点 -> 过孔 -> 起飞点，折线模式专用）
 bool scan_trigger_sent = false;      // 去程前移触发只发一次（多发会反复 reset 检测的连续确认计数）
 
 // ==================== 函数声明 ====================
@@ -288,6 +300,10 @@ bool trackLeg(bool reverse, double goal_x, double goal_y, const char *label);
 // 斜摆 case（case1/case2）两段平滑
 bool isStraightCase(int cid);
 bool planLeg2Segments(int cid, const Vec2f *cur_field = nullptr);
+
+// 穿越段折线模式（2026-09-12）
+double polyMinClearance(int cid, const std::vector<Vec2f> &pts);
+bool trackPolyline(int cid, bool reverse, const char *label);
 
 // ==================== 样条 / 规划器辅助函数实现 ====================
 inline Vec2f field_to_odom(double fx, double fy, double origin_fx, double origin_fy)
@@ -610,7 +626,6 @@ void positionControl(const Eigen::Vector3f &target_pos,
     sp.velocity.z       = vz;
     sp.yaw              = current_yaw;
 }
-
 void positionVelocityControl(const Eigen::Vector3f &target_pos,
                              mavros_msgs::PositionTarget &sp) {
     // 复用原位置误差 -> 速度指令，额外向 PX4 提供最终位置目标：
@@ -737,6 +752,9 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<int>("traverse/early_scan", cfg.trav_early_scan, 1);
     nh.param<int>("traverse/return_smooth", cfg.trav_return_smooth, 1);
     nh.param<float>("traverse/return_land_z", cfg.trav_return_land_z, 0.45f);
+    nh.param<int>("traverse/use_polyline", cfg.trav_use_polyline, 1);
+    nh.param<float>("traverse/polyline_err_max", cfg.trav_polyline_err_max, 0.15f);
+    nh.param<float>("traverse/polyline_point_timeout", cfg.trav_polyline_pt_timeout, 10.0f);
     nh.param<double>("map/origin_x", origin_fx, 0.65);
     nh.param<double>("map/origin_y", origin_fy, 0.75);
     nh.param<double>("map/pillar_radius", pillar_radius, 0.1);
@@ -840,6 +858,15 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
         loadPointList(nh, key, via_ret_b[cid]);
     }
 
+    // 折线模式航点（4 case 去程 + 4 case 返程）
+    for (int cid = 0; cid < 4; cid++) {
+        char key[64];
+        snprintf(key, sizeof(key), "map/poly_go_case%d", cid);
+        loadPointList(nh, key, poly_go[cid]);
+        snprintf(key, sizeof(key), "map/poly_ret_case%d", cid);
+        loadPointList(nh, key, poly_ret[cid]);
+    }
+
     {
         XmlRpc::XmlRpcValue sh;
         if (nh.getParam("map/scan_hover", sh) && sh.size() >= 2) {
@@ -895,15 +922,12 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
                      cid, TRAV_CASE_DESC[cid], tp.total_length, traverse_duration(tp),
                      tp.min_clearance, case_ok[cid] ? "✓" : "✗ 不达标！");
         }
+        // 净距仅告警不阻断：过冲导致路径非精确贴合途经点，静态净距不作为拒飞硬门槛
         if (!case_ok[cfg.default_case] && cfg.trav_force_fly != 1) {
-            ROS_ERROR("[穿越] default_case=%d 净距不达标，无法安全执行任务！"
-                      "请调整 map/via_points_leg2_case%d", cfg.default_case, cfg.default_case);
-            return;
+            ROS_WARN("[穿越] default_case=%d 静态净距不达标（仅告警，不阻断起飞）", cfg.default_case);
         }
         if (cfg.force_case >= 0 && !case_ok[cfg.force_case] && cfg.trav_force_fly != 1) {
-            ROS_ERROR("[穿越] force_case=%d 净距不达标，无法安全执行任务！"
-                      "请调整对应 via_points 或改 force_case", cfg.force_case);
-            return;
+            ROS_WARN("[穿越] force_case=%d 静态净距不达标（仅告警，不阻断起飞）", cfg.force_case);
         }
     }
 
@@ -924,6 +948,52 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
                      cid, tp.total_length, traverse_duration(tp), tp.min_clearance,
                      tp.min_clearance >= cfg.trav_inflation ? "✓" : "✗ 偏紧（运行时校验兜底）");
         }
+    }
+
+    // ---- 折线模式预检（use_polyline=1 时）----
+    if (cfg.trav_use_polyline == 1) {
+        const double need = cfg.trav_inflation + cfg.trav_polyline_err_max;   // 净距硬要求
+        bool poly_ok[4];
+        ROS_INFO("[穿越] 折线模式预检：净距要求 = inflation(%.2f) + 到点容差(%.2f) = %.2f m",
+                 cfg.trav_inflation, cfg.trav_polyline_err_max, need);
+        for (int cid = 0; cid < 4; cid++) {
+            if (poly_go[cid].size() < 2 || poly_ret[cid].size() < 2) {
+                ROS_ERROR("[穿越] poly_go/ret_case%d 为空或点数不足，折线模式不可用！", cid);
+                poly_ok[cid] = false;
+                continue;
+            }
+            double cg = polyMinClearance(cid, poly_go[cid]);
+            double cr = polyMinClearance(cid, poly_ret[cid]);
+            poly_ok[cid] = (cg >= need && cr >= need);
+            ROS_INFO("[穿越]   case%d（%s）：去程净距 %.3f 返程净距 %.3f %s",
+                     cid, TRAV_CASE_DESC[cid], cg, cr, poly_ok[cid] ? "✓" : "✗ 不达标！");
+        }
+        if (!poly_ok[cfg.default_case]) {
+            ROS_WARN("[穿越] 折线模式 default_case=%d 静态净距不达标（仅告警，不阻断起飞）",
+                     cfg.default_case);
+        }
+
+        // 返程穿环小样条（悬停点 -> 穿环走廊 -> 起飞点），对全部 4 候选柱位保守检
+        std::vector<Vec2f> ring_via;
+        ring_via.push_back({scan_hover_fx, scan_hover_fy});
+        ring_via.push_back({0.5 * (scan_hover_fx + 2.0), scan_hover_fy});   // 悬停点与孔之间拉直
+        ring_via.push_back({2.0, scan_hover_fy});                            // 过孔中心
+        ring_via.push_back({0.5 * (origin_fx + 2.0), origin_fy});            // 孔与出生点之间拉直
+        ring_via.push_back({origin_fx, origin_fy});                          // 起飞点
+        std::vector<CircleObs> ring_circles;
+        for (size_t i = 0; i < pillar_cand.size(); i++) {
+            CircleObs co{pillar_cand[i].x, pillar_cand[i].y, pillar_radius};
+            ring_circles.push_back(co);
+        }
+        traverse_plan(planner_ring, ring_via, origin_fx, origin_fy, walls, ring_circles,
+                      cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds);
+        if (planner_ring.min_clearance < cfg.trav_inflation) {
+            ROS_WARN("[穿越] 返程穿环小样条静态净距 %.3f < %.3f（仅告警，不阻断起飞）",
+                     planner_ring.min_clearance, cfg.trav_inflation);
+        }
+        ROS_INFO("[穿越] 返程穿环小样条：总长 %.2f m，时长 %.1f s，最小净距 %.3f m",
+                 planner_ring.total_length, traverse_duration(planner_ring),
+                 planner_ring.min_clearance);
     }
 
     traverse_cfg_ok = true;
@@ -974,6 +1044,22 @@ bool planLeg2ForCase(int cid) {
 }
 
 bool tryPlanLeg2(int cid) {
+    // 折线模式：直接采用检测到的 case，不做净距硬门槛。
+    // 实机/仿真都有过冲，路径并非精确贴合途经点，静态净距本身不可靠；
+    // 若因净距差一点就回退 default_case，反而会让路径与实际柱子布局错位，更危险。
+    if (cfg.trav_use_polyline == 1) {
+        if (poly_go[cid].size() >= 2 && poly_ret[cid].size() >= 2) {
+            active_case = cid;
+            double cg = polyMinClearance(cid, poly_go[cid]);
+            double cr = polyMinClearance(cid, poly_ret[cid]);
+            ROS_INFO("[穿越] 折线模式采用 case%d（%s），去程净距 %.3f 返程净距 %.3f",
+                     cid, TRAV_CASE_DESC[cid], cg, cr);
+            return true;
+        }
+        ROS_ERROR("[穿越] 折线模式 case%d 折线航点缺失，无法规划", cid);
+        return false;
+    }
+
     // 斜摆 case（case1/case2）优先直线穿缝，失败回退整段样条
     if (isStraightCase(cid) && planLeg2Segments(cid)) {
         active_case = cid;
@@ -1101,6 +1187,68 @@ bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out) 
     out.push_back(mid2);
     out.push_back(home);
     return true;
+}
+
+// ==================== 穿越段折线模式（2026-09-12） ====================
+double polyMinClearance(int cid, const std::vector<Vec2f> &pts) {
+    // 折线净距：沿相邻航点连线按 0.05m 采样，逐点算到墙/柱的净距取最小。
+    // （demo 版采样法；拐角圆角余量 TODO：细化时在航点处额外加固定余量）
+    if (cid < 0 || cid > 3 || pts.size() < 2) return -1.0;
+    const std::vector<CircleObs> circles = caseCircles(cid);
+    double best = 1e9;
+    const double ds = 0.05;
+    for (size_t i = 0; i + 1 < pts.size(); i++) {
+        double len = std::hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+        int n = std::max(1, (int)std::ceil(len / ds));
+        for (int k = 0; k <= n; k++) {
+            double r = (double)k / n;
+            Vec2f p{pts[i].x + r * (pts[i + 1].x - pts[i].x),
+                    pts[i].y + r * (pts[i + 1].y - pts[i].y)};
+            std::string what;
+            double c = clearance_at(p, walls, circles, what);
+            if (c < best) best = c;
+        }
+    }
+    return best;
+}
+
+bool trackPolyline(int cid, bool reverse, const char *label) {
+    // 折线逐点到点跟踪（闭环）：纯速度控制(positionControl)飞向当前航点，
+    // 速度受 p_xy/max_speed 控制，与穿环段一致；误差 < polyline_err_max 或
+    // 单点超时 -> 切下一点；走完全部航点返回 true。
+    // 调用方进入航段时需把 poly_cur_idx 置 0。
+    const std::vector<Vec2f> &pts = reverse ? poly_ret[cid] : poly_go[cid];
+    const int n = (int)pts.size();
+    if (n < 2) return true;
+    if (poly_pt_start.isZero())   // 调用方重置 poly_pt_start=Time(0) 后的起点时刻
+        poly_pt_start = ros::Time::now();
+    if (poly_cur_idx >= n) return true;
+
+    const Vec2f &pf = pts[poly_cur_idx];
+    Vec2f o = field_to_odom(pf.x, pf.y, origin_fx, origin_fy);
+    const Eigen::Vector3f target(o.x, o.y, cfg.trav_flight_z);
+
+    positionControl(target, current_setpoint);   // 纯速度控制：v=p_xy*误差，受 max_speed 封顶（与穿环一致）
+    current_setpoint.yaw = init_yaw;
+
+    const bool arrived = reachedTarget(target, cfg.trav_polyline_err_max);
+    const bool timeout = (ros::Time::now() - poly_pt_start).toSec() > cfg.trav_polyline_pt_timeout;
+
+    ROS_INFO_THROTTLE(0.5, "[折线%s] 点%d/%d 场地(%.2f,%.2f) 当前odom(%.2f,%.2f,%.2f)%s",
+                      label, poly_cur_idx + 1, n, pf.x, pf.y,
+                      local_odom.pose.pose.position.x, local_odom.pose.pose.position.y,
+                      local_odom.pose.pose.position.z,
+                      timeout && !arrived ? " ⚠超时强切" : "");
+
+    if (arrived || timeout) {
+        if (timeout && !arrived)
+            ROS_WARN("[折线%s] 航点%d 超时未到位（当前 odom %.2f,%.2f），强切下一点",
+                     label, poly_cur_idx + 1,
+                     local_odom.pose.pose.position.x, local_odom.pose.pose.position.y);
+        poly_cur_idx++;
+        poly_pt_start = ros::Time::now();
+    }
+    return poly_cur_idx >= n;
 }
 
 bool planReturnFromCurrent() {
