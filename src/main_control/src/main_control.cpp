@@ -162,6 +162,9 @@ int main(int argc, char **argv)
             0.0f;
         current_setpoint.yaw = current_yaw;
 
+        // 水平速度增益每帧复位为常规值 cfg.p_xy；投货/瞄准/射击状态内再切到 cfg.p_xy_drop
+        p_xy_use = 0.0f;
+
         // 2. 执行状态逻辑
         switch (current_state)
         {
@@ -386,6 +389,7 @@ int main(int argc, char **argv)
         // ========== 状态: 悬停识别投放区标识（下视字母投票） ==========
         case HOVER_RECOG_DROP:
         {
+            p_xy_use = cfg.p_xy_drop;   // 投货区专用增益
             moveToPositionVelocity(wp_drop_area);
 
             if (drop_hover_start.isZero())
@@ -425,6 +429,7 @@ int main(int argc, char **argv)
         // ========== 状态: 投放物资箱 ==========
         case DROP_SUPPLY:
         {
+            p_xy_use = cfg.p_xy_drop;   // 投货区专用增益
             const ros::Time now = ros::Time::now();
 
             if (drop_sub_state == 1)
@@ -496,6 +501,7 @@ int main(int argc, char **argv)
         // ========== 状态: 保持投放点并原地旋转至目标 yaw ==========
         case ROTATE_TO_ATTACK_YAW:
         {
+            p_xy_use = cfg.p_xy_drop;   // 投货区专用增益（原地旋转时保持位置）
             double yaw_error = 0.0;
             if (holdPositionAndAim(wp_drop_area, shoot_target_yaw, &yaw_error))
             {
@@ -525,6 +531,7 @@ int main(int argc, char **argv)
         // ========== 状态: 激光指示攻击 ==========
         case SHOOT_TARGET:
         {
+            p_xy_use = cfg.p_xy_drop;   // 投货区专用增益（射击时保持位置）
             double yaw_error = 0.0;
             const bool aim_ok = holdPositionAndAim(wp_drop_area, shoot_target_yaw, &yaw_error);
 
@@ -605,12 +612,16 @@ int main(int argc, char **argv)
             {
                 if (leg2_sub_state == 0)
                 {
-                    if (trackPolyline(active_case, true, "返程穿越"))
+                    // 末点（悬停点）用放宽容差：接近即交给穿环样条，
+                    // 不再收敛到 0.15m（避免在悬停点蹭出一段减速再加速）
+                    if (trackPolyline(active_case, true, "返程穿越",
+                                      cfg.trav_polyline_handoff))
                     {
                         leg2_sub_state = 1;
                         leg_start_time = ros::Time::now();
                         state_start_time = ros::Time::now();
-                        ROS_INFO("[穿越] ✓ 返程穿越折线完成，接穿环小样条");
+                        ROS_INFO("[穿越] ✓ 返程穿越折线完成（末点放宽 %.2fm 交接），接穿环小样条",
+                                 cfg.trav_polyline_handoff);
                     }
                 }
                 else

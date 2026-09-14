@@ -104,6 +104,7 @@ struct Config
     float max_speed;
     float err_max;
     float p_xy, p_z;
+    float p_xy_drop = 0.5f;   // 投货区专用水平速度增益（投放/瞄准/射击阶段生效）
 
     std::string attack_real_target;
 
@@ -143,6 +144,9 @@ struct Config
     int   trav_use_polyline      = 1;     // 1=穿越段(去程+返程)折线逐点到点；0=旧样条时间开环
     float trav_polyline_err_max  = 0.15f; // 折线到点容差(m)，净距校验要求 = inflation + 本值
     float trav_polyline_pt_timeout = 10.0f; // 折线单点超时(s)，超时切下一点防卡死
+    float trav_polyline_handoff    = 0.40f; // 返程折线【末点】放宽容差(m)：末点=悬停点，
+                                            // 随后由穿环样条接管，不必收敛到 polyline_err_max；
+                                            // <=0 表示不启用（末点仍按 polyline_err_max 判定）
 } cfg;
 
 // ==================== ROS 通信 ====================
@@ -228,6 +232,10 @@ ros::Time poly_pt_start;                // 当前航点的起始时刻（单点�
 // ==================== 控制 ====================
 mavros_msgs::PositionTarget current_setpoint;
 
+// 当前生效的水平速度增益：0 = 用 cfg.p_xy（常规段，穿越/穿环）；
+// 投货/瞄准/射击状态每帧置为 cfg.p_xy_drop，主循环开头复位（见 main_control.cpp）
+float p_xy_use = 0.0f;
+
 Waypoint wp_ring_front;
 Waypoint wp_ring_back;
 Waypoint wp_drop_area;
@@ -303,7 +311,7 @@ bool planLeg2Segments(int cid, const Vec2f *cur_field = nullptr);
 
 // 穿越段折线模式（2026-09-12）
 double polyMinClearance(int cid, const std::vector<Vec2f> &pts);
-bool trackPolyline(int cid, bool reverse, const char *label);
+bool trackPolyline(int cid, bool reverse, const char *label, double last_tol = -1.0);
 
 // ==================== 样条 / 规划器辅助函数实现 ====================
 inline Vec2f field_to_odom(double fx, double fy, double origin_fx, double origin_fy)
@@ -612,8 +620,8 @@ void positionControl(const Eigen::Vector3f &target_pos,
     Eigen::Vector3f err = target_pos - Eigen::Vector3f(local_odom.pose.pose.position.x,
                                                        local_odom.pose.pose.position.y,
                                                        local_odom.pose.pose.position.z);
-    float vx            = err.x() * cfg.p_xy;
-    float vy            = err.y() * cfg.p_xy;
+    float vx            = err.x() * (p_xy_use > 0.0f ? p_xy_use : cfg.p_xy);
+    float vy            = err.y() * (p_xy_use > 0.0f ? p_xy_use : cfg.p_xy);
     float vz            = err.z() * cfg.p_z;
     vx                  = std::clamp(vx, -cfg.max_speed, cfg.max_speed);
     vy                  = std::clamp(vy, -cfg.max_speed, cfg.max_speed);
@@ -706,6 +714,7 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<float>("max_speed", cfg.max_speed, 0.8f);
     nh.param<float>("err_max", cfg.err_max, 0.25f);
     nh.param<float>("p_xy", cfg.p_xy, 0.4f);
+    nh.param<float>("p_xy_drop", cfg.p_xy_drop, 0.5f);
     nh.param<float>("p_z", cfg.p_z, 0.3f);
 
     nh.param<float>("wp_ring_front_x", wp_ring_front.x, -0.65f);
@@ -715,7 +724,7 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<float>("wp_ring_back_y", wp_ring_back.y, 0.0f);
     nh.param<float>("wp_ring_back_z", wp_ring_back.z, cfg.takeoff_height);
     nh.param<float>("wp_drop_area_x", wp_drop_area.x, -0.45f);
-    nh.param<float>("wp_drop_area_y", wp_drop_area.y, -2.0f);
+    nh.param<float>("wp_drop_area_y", wp_drop_area.y, -2.10f);
     nh.param<float>("wp_drop_area_z", wp_drop_area.z, cfg.takeoff_height);
 
     nh.param<std::string>("detection/attack_real_target", cfg.attack_real_target, "A");
@@ -755,11 +764,13 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<int>("traverse/use_polyline", cfg.trav_use_polyline, 1);
     nh.param<float>("traverse/polyline_err_max", cfg.trav_polyline_err_max, 0.15f);
     nh.param<float>("traverse/polyline_point_timeout", cfg.trav_polyline_pt_timeout, 10.0f);
+    nh.param<float>("traverse/polyline_handoff_radius", cfg.trav_polyline_handoff, 0.40f);
     nh.param<double>("map/origin_x", origin_fx, 0.65);
     nh.param<double>("map/origin_y", origin_fy, 0.75);
     nh.param<double>("map/pillar_radius", pillar_radius, 0.1);
 
-    if (cfg.max_speed <= 0.0f || cfg.err_max <= 0.0f || cfg.p_xy <= 0.0f || cfg.p_z <= 0.0f ||
+    if (cfg.max_speed <= 0.0f || cfg.err_max <= 0.0f || cfg.p_xy <= 0.0f || cfg.p_xy_drop <= 0.0f ||
+        cfg.p_z <= 0.0f ||
         cfg.land_descend_speed <= 0.0f || cfg.drop_hover_time < 0.0f || cfg.down_min_votes < 1 ||
         cfg.cargo_drop_angle < 0 || cfg.cargo_drop_angle > 255 ||
         cfg.cargo_reset_angle < 0 || cfg.cargo_reset_angle > 255 ||
@@ -1212,10 +1223,13 @@ double polyMinClearance(int cid, const std::vector<Vec2f> &pts) {
     return best;
 }
 
-bool trackPolyline(int cid, bool reverse, const char *label) {
+bool trackPolyline(int cid, bool reverse, const char *label, double last_tol) {
     // 折线逐点到点跟踪（闭环）：纯速度控制(positionControl)飞向当前航点，
-    // 速度受 p_xy/max_speed 控制，与穿环段一致；误差 < polyline_err_max 或
-    // 单点超时 -> 切下一点；走完全部航点返回 true。
+    // 速度受 p_xy/max_speed 控制，与穿环段一致；误差 < 容差 或单点超时 ->
+    // 切下一点；走完全部航点返回 true。
+    //   last_tol > 0 时，仅【末点】用该容差（放宽），其余点仍按 polyline_err_max。
+    //   用途：返程末点=悬停点，紧接着由穿环样条接管，不必收敛到 0.15m，
+    //         否则会在悬停点来回蹭出一段无意义的减速再加速。
     // 调用方进入航段时需把 poly_cur_idx 置 0。
     const std::vector<Vec2f> &pts = reverse ? poly_ret[cid] : poly_go[cid];
     const int n = (int)pts.size();
@@ -1231,7 +1245,10 @@ bool trackPolyline(int cid, bool reverse, const char *label) {
     positionControl(target, current_setpoint);   // 纯速度控制：v=p_xy*误差，受 max_speed 封顶（与穿环一致）
     current_setpoint.yaw = init_yaw;
 
-    const bool arrived = reachedTarget(target, cfg.trav_polyline_err_max);
+    // 末点容差可放宽（last_tol>0 时仅末点生效），其余点用 polyline_err_max
+    const double tol = (last_tol > 0.0 && poly_cur_idx == n - 1)
+                           ? last_tol : (double)cfg.trav_polyline_err_max;
+    const bool arrived = reachedTarget(target, tol);
     const bool timeout = (ros::Time::now() - poly_pt_start).toSec() > cfg.trav_polyline_pt_timeout;
 
     ROS_INFO_THROTTLE(0.5, "[折线%s] 点%d/%d 场地(%.2f,%.2f) 当前odom(%.2f,%.2f,%.2f)%s",
