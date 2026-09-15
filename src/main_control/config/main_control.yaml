@@ -19,8 +19,7 @@ traverse:
     lookahead_time: 0.60             # 按实速增加前视的时间系数（s）
     projection_forward_window: 1.00  # 最近点只在当前进度前方该范围搜索，防跳弯（m）
     projection_backtrack: 0.05       # 允许投影回看，但已接受的进度仍不会后退（m）
-    recovery_enter_error: 0.12       # 距轨迹超过此值：取消前视，先回到投影点（m）
-    recovery_exit_error: 0.06        # 回到此误差内：恢复前视；与进入阈值形成滞回（m）
+    feedforward_scale: 1.00          # 样条规划速度的切向前馈倍率，最终受 traverse/v_max 限制
 
 # ==================== 原地旋转射击 ====================
 # 投货结束后保持 wp_drop_area 不移动，只旋转机头瞄准目标。
