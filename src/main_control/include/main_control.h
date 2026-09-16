@@ -132,13 +132,17 @@ struct Config
     double trav_a_max          = 0.4;
     double trav_a_lat_max      = 0.6;
     double trav_inflation      = 0.33;   // 机架0.225+桨叶旋转半径（与traverse_map.yaml一致）
+    double trav_tracking_margin = 0.14;  // 在机体膨胀外额外预留的实际跟踪误差（m）
     double trav_sample_ds      = 0.01;
-    double trav_lookahead_min  = 0.15;   // 动态前视下限（m）
-    double trav_lookahead_max  = 0.40;   // 动态前视上限（m）
-    double trav_lookahead_time = 0.60;   // L=L_min+min(v_actual,v_plan)*T（s）
+    double trav_lookahead_min  = 0.15;   // 仅用于预读未来规划速度，不再作为位置目标（m）
+    double trav_lookahead_max  = 0.40;
+    double trav_lookahead_time = 0.60;
     double trav_projection_forward_window = 1.00; // 单周期只在进度前方该范围内投影（m）
     double trav_projection_backtrack      = 0.05; // 投影搜索允许回看范围（m）
     double trav_feedforward_scale = 1.00; // 样条规划速度的切向前馈倍率
+    double trav_cross_track_kp = 1.50;    // 投影法向误差 -> 回轨速度（s^-1）
+    double trav_cross_track_speed_max = 0.30; // 法向纠偏速度上限（m/s）
+    double trav_endpoint_capture_distance = 0.25; // 进入终点位置速度闭环的剩余弧长（m）
     int   trav_force_fly         = 0;
     float trav_timeout_margin  = 15.0f;
     float scan_timeout         = 4.0f;
@@ -621,6 +625,11 @@ double traverse_duration(const TraversePlanResult& plan)
     return plan.traj.empty() ? 0.0 : plan.traj.back().t;
 }
 
+double requiredTraverseClearance()
+{
+    return cfg.trav_inflation + cfg.trav_tracking_margin;
+}
+
 // ==================== 回调函数实现 ====================
 void stateCallback(const mavros_msgs::State::ConstPtr &msg) {
     current_mav_state = *msg;
@@ -819,6 +828,7 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<double>("traverse/a_max", cfg.trav_a_max, 0.4);
     nh.param<double>("traverse/a_lat_max", cfg.trav_a_lat_max, 0.6);
     nh.param<double>("traverse/inflation", cfg.trav_inflation, 0.33);
+    nh.param<double>("traverse/tracking_margin", cfg.trav_tracking_margin, 0.14);
     nh.param<double>("traverse/sample_ds", cfg.trav_sample_ds, 0.01);
     nh.param<double>("traverse/tracker/lookahead_min", cfg.trav_lookahead_min, 0.15);
     nh.param<double>("traverse/tracker/lookahead_max", cfg.trav_lookahead_max, 0.40);
@@ -829,6 +839,12 @@ void loadParameters(ros::NodeHandle &nh) {
                      cfg.trav_projection_backtrack, 0.05);
     nh.param<double>("traverse/tracker/feedforward_scale",
                      cfg.trav_feedforward_scale, 1.00);
+    nh.param<double>("traverse/tracker/cross_track_kp",
+                     cfg.trav_cross_track_kp, 1.50);
+    nh.param<double>("traverse/tracker/cross_track_speed_max",
+                     cfg.trav_cross_track_speed_max, 0.30);
+    nh.param<double>("traverse/tracker/endpoint_capture_distance",
+                     cfg.trav_endpoint_capture_distance, 0.25);
     nh.param<int>("traverse/force_fly", cfg.trav_force_fly, 0);
     nh.param<float>("traverse/traj_timeout_margin", cfg.trav_timeout_margin, 15.0f);
     nh.param<float>("traverse/scan_timeout", cfg.scan_timeout, 4.0f);
@@ -847,9 +863,14 @@ void loadParameters(ros::NodeHandle &nh) {
         std::isfinite(cfg.trav_projection_forward_window) &&
         std::isfinite(cfg.trav_projection_backtrack) &&
         std::isfinite(cfg.trav_feedforward_scale) &&
+        std::isfinite(cfg.trav_cross_track_kp) &&
+        std::isfinite(cfg.trav_cross_track_speed_max) &&
+        std::isfinite(cfg.trav_endpoint_capture_distance) &&
         cfg.trav_lookahead_min > 0.0 && cfg.trav_lookahead_max >= cfg.trav_lookahead_min &&
         cfg.trav_lookahead_time >= 0.0 && cfg.trav_projection_forward_window > 0.0 &&
-        cfg.trav_projection_backtrack >= 0.0 && cfg.trav_feedforward_scale >= 0.0;
+        cfg.trav_projection_backtrack >= 0.0 && cfg.trav_feedforward_scale >= 0.0 &&
+        cfg.trav_cross_track_kp > 0.0 && cfg.trav_cross_track_speed_max > 0.0 &&
+        cfg.trav_endpoint_capture_distance > 0.0;
 
     if (cfg.max_speed <= 0.0f || cfg.err_max <= 0.0f || cfg.p_xy <= 0.0f || cfg.p_z <= 0.0f ||
         cfg.land_descend_speed <= 0.0f || cfg.drop_hover_time < 0.0f || cfg.down_min_votes < 1 ||
@@ -861,14 +882,16 @@ void loadParameters(ros::NodeHandle &nh) {
         cfg.shoot_yaw_tolerance_deg <= 0.0f || cfg.shoot_yaw_tolerance_deg > 180.0f ||
         cfg.shoot_stable_time < 0.0f || cfg.shoot_duration <= 0.0f ||
         !std::isfinite(cfg.trav_v_max) || !std::isfinite(cfg.trav_a_max) ||
-        !std::isfinite(cfg.trav_a_lat_max) || !std::isfinite(cfg.trav_sample_ds) ||
+        !std::isfinite(cfg.trav_a_lat_max) || !std::isfinite(cfg.trav_inflation) ||
+        !std::isfinite(cfg.trav_tracking_margin) || !std::isfinite(cfg.trav_sample_ds) ||
         cfg.trav_v_max <= 0.0 || cfg.trav_a_max <= 0.0 || cfg.trav_a_lat_max <= 0.0 ||
+        cfg.trav_inflation < 0.0 || cfg.trav_tracking_margin < 0.0 ||
         cfg.trav_sample_ds <= 0.0 || cfg.trav_err_max <= 0.0f || !tracker_cfg_ok) {
         ROS_FATAL("主控参数非法：控制速度/误差/增益和降落速度须 > 0；投票数须 >= 1；"
                   "舵机角度须在 0~255；兜底目标须为 A/B；yaw 偏移须为有限值；"
                   "yaw kp/rate/duration 须 > 0，tolerance 须在 (0,180]；"
-                  "穿越速度/加速度/采样须 > 0；tracker 前视/窗口须有效，"
-                  "速度前馈倍率须 >= 0");
+                  "穿越速度/加速度/采样须 > 0，膨胀/跟踪余量须 >= 0；"
+                  "tracker 前视/窗口/横向闭环/终点捕获参数须有效");
         control_cfg_ok = false;
         return;
     }
@@ -876,11 +899,15 @@ void loadParameters(ros::NodeHandle &nh) {
     ROS_INFO("参数加载完成：A/B yaw 偏移 %.1f°/%.1f°，kp=%.2f，rate_max=%.2f rad/s，容差 %.1f°",
              cfg.shoot_yaw_a_offset_deg, cfg.shoot_yaw_b_offset_deg, cfg.shoot_yaw_kp,
              cfg.shoot_yaw_rate_max, cfg.shoot_yaw_tolerance_deg);
-    ROS_INFO("投影跟踪：前视 %.2f~%.2f m + %.2fs×受规划约束实速，搜索窗口 后%.2f/前%.2f m，"
-             "切向速度前馈倍率 %.2f",
+    ROS_INFO("矢量场跟踪：速度预读 %.2f~%.2f m + %.2fs×受规划约束实速，搜索窗口 后%.2f/前%.2f m，"
+             "切向倍率 %.2f，横向 kp=%.2f/限速=%.2f m/s，终点捕获 %.2f m",
              cfg.trav_lookahead_min, cfg.trav_lookahead_max, cfg.trav_lookahead_time,
              cfg.trav_projection_backtrack, cfg.trav_projection_forward_window,
-             cfg.trav_feedforward_scale);
+             cfg.trav_feedforward_scale, cfg.trav_cross_track_kp,
+             cfg.trav_cross_track_speed_max, cfg.trav_endpoint_capture_distance);
+    ROS_INFO("穿越净距要求：机体膨胀 %.2f + 跟踪余量 %.2f = %.2f m",
+             cfg.trav_inflation, cfg.trav_tracking_margin,
+             cfg.trav_inflation + cfg.trav_tracking_margin);
 }
 
 void initROSCommunication(ros::NodeHandle &nh) {
@@ -998,7 +1025,7 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
             TraversePlanResult tp;
             traverse_plan(tp, via_leg2[cid], origin_fx, origin_fy, walls, caseCircles(cid),
                           cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds);
-            case_ok[cid] = (tp.min_clearance >= cfg.trav_inflation);
+            case_ok[cid] = (tp.min_clearance >= requiredTraverseClearance());
             ROS_INFO("[穿越]   case%d（%s）：总长 %.2f m，单程 %.1f s，最小净距 %.3f m %s",
                      cid, TRAV_CASE_DESC[cid], tp.total_length, traverse_duration(tp),
                      tp.min_clearance, case_ok[cid] ? "✓" : "✗ 不达标！");
@@ -1030,7 +1057,7 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
                           cfg.trav_v_max, cfg.trav_a_max, cfg.trav_a_lat_max, cfg.trav_sample_ds);
             ROS_INFO("[穿越]   case%d 返程：总长 %.2f m，时长 %.1f s，最小净距 %.3f m %s",
                      cid, tp.total_length, traverse_duration(tp), tp.min_clearance,
-                     tp.min_clearance >= cfg.trav_inflation ? "✓" : "✗ 偏紧（运行时校验兜底）");
+                     tp.min_clearance >= requiredTraverseClearance() ? "✓" : "✗ 偏紧（运行时校验兜底）");
         }
     }
 
@@ -1066,8 +1093,9 @@ void printLeg2Report(int cid) {
     ROS_INFO("  碰撞检测：最小净距 %.3f m @ 场地(%.2f, %.2f)，最近障碍：%s",
              planner_leg2.min_clearance, planner_leg2.min_clear_pos.x,
              planner_leg2.min_clear_pos.y, planner_leg2.min_clear_what.c_str());
-    ROS_INFO("  膨胀要求：%.2f m -> %s", cfg.trav_inflation,
-             planner_leg2.min_clearance >= cfg.trav_inflation ? "✓ 通过" : "✗ 不通过！");
+    ROS_INFO("  净距要求：膨胀 %.2f + 跟踪余量 %.2f = %.2f m -> %s",
+             cfg.trav_inflation, cfg.trav_tracking_margin, requiredTraverseClearance(),
+             planner_leg2.min_clearance >= requiredTraverseClearance() ? "✓ 通过" : "✗ 不通过！");
 }
 
 bool planLeg2ForCase(int cid) {
@@ -1077,7 +1105,7 @@ bool planLeg2ForCase(int cid) {
         return false;
     }
     printLeg2Report(cid);
-    return planner_leg2.min_clearance >= cfg.trav_inflation;
+    return planner_leg2.min_clearance >= requiredTraverseClearance();
 }
 
 bool tryPlanLeg2(int cid) {
@@ -1085,20 +1113,17 @@ bool tryPlanLeg2(int cid) {
         active_case = cid;
         return true;
     }
-    if (cid != cfg.default_case) {
-        ROS_WARN("[穿越] case%d 净距不达标，回退 default_case=%d 重试", cid, cfg.default_case);
-        if (planLeg2ForCase(cfg.default_case)) {
-            active_case = cfg.default_case;
-            return true;
-        }
-    }
     if (cfg.trav_force_fly == 1) {
         planLeg2ForCase(cid);
         active_case = cid;
         ROS_WARN("[穿越] force_fly=1，强行按 case%d 飞行（净距 %.3f < %.3f，危险！）",
-                 cid, planner_leg2.min_clearance, cfg.trav_inflation);
+                 cid, planner_leg2.min_clearance, requiredTraverseClearance());
         return true;
     }
+    // 已知柱位后绝不能换另一套 case“兜底”：另一套轨迹基于不同障碍布局，
+    // 净距数字即使通过也不代表当前真实柱位安全。未知柱位的 default_case 由调用方选择。
+    ROS_ERROR("[穿越] case%d 净距 %.3f < 要求 %.3f，拒绝飞行；请调整该 case 的途经点",
+              cid, planner_leg2.min_clearance, requiredTraverseClearance());
     return false;
 }
 
@@ -1118,8 +1143,8 @@ bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field) {
     ROS_INFO("[穿越] 当前位置(场地 %.2f,%.2f)切入 case%d：总长 %.2f m，时长 %.1f s，最小净距 %.3f m %s",
              cur_field.x, cur_field.y, cid, planner_leg2.total_length,
              traverse_duration(planner_leg2), planner_leg2.min_clearance,
-             planner_leg2.min_clearance >= cfg.trav_inflation ? "✓" : "✗");
-    if (planner_leg2.min_clearance >= cfg.trav_inflation) {
+              planner_leg2.min_clearance >= requiredTraverseClearance() ? "✓" : "✗");
+    if (planner_leg2.min_clearance >= requiredTraverseClearance()) {
         active_case = cid;
         return true;
     }
@@ -1169,8 +1194,8 @@ bool planReturnFromCurrent() {
     ROS_INFO("[返程] 直通轨迹：起点场地(%.2f,%.2f)，总长 %.2f m，时长 %.1f s，最小净距 %.3f m %s",
              cur_field.x, cur_field.y, planner_return.total_length,
              traverse_duration(planner_return), planner_return.min_clearance,
-             planner_return.min_clearance >= cfg.trav_inflation ? "✓" : "✗ 回退分段返程");
-    return planner_return.min_clearance >= cfg.trav_inflation || cfg.trav_force_fly == 1;
+              planner_return.min_clearance >= requiredTraverseClearance() ? "✓" : "✗ 回退分段返程");
+    return planner_return.min_clearance >= requiredTraverseClearance() || cfg.trav_force_fly == 1;
 }
 
 void resetTraverseTracker()
@@ -1228,10 +1253,11 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                                              std::min(plan.total_length, projected_motion_s));
     }
 
-    const double reference_original_s = reverse ? plan.total_length - traverse_tracker.motion_s
-                                                : traverse_tracker.motion_s;
+    // 几何投影用于闭环，不能用“只增不减”的任务进度替代：否则实际稍微落后时，
+    // 控制器仍会追一个虚假的前方位置。motion_s 只保留给完成判定和投影防跳窗。
+    const double reference_original_s = projection.s;
     const PlanSample reference = samplePlanByArcLength(plan, reference_original_s);
-    const double tracking_error = std::hypot(cx - reference.x, cy - reference.y);
+    const double tracking_error = projection.distance;
 
     const double measured_speed = std::hypot(local_odom.twist.twist.linear.x,
                                              local_odom.twist.twist.linear.y);
@@ -1242,14 +1268,53 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                                       std::min(cfg.trav_lookahead_max,
                                                cfg.trav_lookahead_min +
                                                cfg.trav_lookahead_time * lookahead_speed));
-    const double target_motion_s = std::min(plan.total_length,
-                                            traverse_tracker.motion_s + lookahead);
-    const double target_original_s = reverse ? plan.total_length - target_motion_s
-                                             : target_motion_s;
-    const PlanSample target = samplePlanByArcLength(plan, target_original_s);
+    // 前视点只预读未来的规划速度；绝不再把前视坐标作为位置设定点，避免切弦。
+    const double preview_motion_s = std::min(plan.total_length,
+                                              projected_motion_s + lookahead);
+    const double preview_original_s = reverse ? plan.total_length - preview_motion_s
+                                               : preview_motion_s;
+    const PlanSample preview = samplePlanByArcLength(plan, preview_original_s);
     const double travel_direction = reverse ? -1.0 : 1.0;
-    const double feedforward_speed = std::min(
-        cfg.trav_v_max, std::max(0.0, target.v * cfg.trav_feedforward_scale));
+
+    // 连续 Frenet/矢量场控制：切向负责推进，投影点的法向误差负责回到中心线。
+    // 两部分正交合成并限制总水平速度，不设置离散“偏离就停车”的恢复状态。
+    const double tangent_x = travel_direction * reference.tx;
+    const double tangent_y = travel_direction * reference.ty;
+    const double error_x = reference.x - cx;
+    const double error_y = reference.y - cy;
+    const double along_error = error_x * tangent_x + error_y * tangent_y;
+    double correction_x = cfg.trav_cross_track_kp * (error_x - along_error * tangent_x);
+    double correction_y = cfg.trav_cross_track_kp * (error_y - along_error * tangent_y);
+    double correction_speed = std::hypot(correction_x, correction_y);
+    if (correction_speed > cfg.trav_cross_track_speed_max) {
+        const double scale = cfg.trav_cross_track_speed_max / correction_speed;
+        correction_x *= scale;
+        correction_y *= scale;
+        correction_speed = cfg.trav_cross_track_speed_max;
+    }
+
+    const double tangent_budget = std::sqrt(std::max(
+        0.0, cfg.trav_v_max * cfg.trav_v_max - correction_speed * correction_speed));
+    double tangent_speed = std::min(
+        tangent_budget, std::max(0.0, preview.v * cfg.trav_feedforward_scale));
+    double command_vx = tangent_x * tangent_speed + correction_x;
+    double command_vy = tangent_y * tangent_speed + correction_y;
+
+    const double remaining_motion_s = std::max(0.0, plan.total_length - projected_motion_s);
+    const bool endpoint_capture = remaining_motion_s <= cfg.trav_endpoint_capture_distance;
+    if (endpoint_capture) {
+        // 规划速度在端点会降为 0；末段直接对最终目标做连续速度闭环，确保真正到点。
+        command_vx = cfg.trav_cross_track_kp * (goal_x - cx);
+        command_vy = cfg.trav_cross_track_kp * (goal_y - cy);
+        tangent_speed = 0.0;
+        correction_speed = std::hypot(command_vx, command_vy);
+    }
+    const double command_xy_speed = std::hypot(command_vx, command_vy);
+    if (command_xy_speed > cfg.trav_v_max) {
+        const double scale = cfg.trav_v_max / command_xy_speed;
+        command_vx *= scale;
+        command_vy *= scale;
+    }
 
     // z_end 有效（返程直通）时：过环前（场地 x>=2.05）保持 flight_z，
     // 过环后随水平进度从 flight_z 线性降到 z_end —— 边飞边降，缩短最后降落时间
@@ -1267,22 +1332,26 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
             double fxk = origin_fx - tr[k].x;           // odom -> 场地 x
             if (fxk >= 2.05) { s_ring = tr[k].s; break; }
         }
-        if (target_original_s > s_ring && s_ring < plan.total_length) {
-            double fx = origin_fx - target.x;           // 前视点场地 x
+        if (reference_original_s > s_ring && s_ring < plan.total_length) {
+            double fx = origin_fx - reference.x;        // 实际投影点场地 x
             double r  = (2.05 - fx) / (2.05 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
             r = std::max(0.0, std::min(1.0, r));
             z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
         }
     }
 
-    current_setpoint.type_mask        = TYPE_MASK_POSITION_VELOCITY;
+    // 穿越只给速度和 yaw。位置字段仅用于日志/抓包识别，掩码明确忽略它们，
+    // 防止 PX4 位置环与切向前馈重复加速。
+    current_setpoint.type_mask        = TYPE_MASK_VELOCITY_ONLY;
     current_setpoint.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint.position.x       = target.x;
-    current_setpoint.position.y       = target.y;
+    current_setpoint.position.x       = reference.x;
+    current_setpoint.position.y       = reference.y;
     current_setpoint.position.z       = z_cmd;
-    current_setpoint.velocity.x       = travel_direction * target.tx * feedforward_speed;
-    current_setpoint.velocity.y       = travel_direction * target.ty * feedforward_speed;
-    current_setpoint.velocity.z       = 0.0;
+    current_setpoint.velocity.x       = command_vx;
+    current_setpoint.velocity.y       = command_vy;
+    current_setpoint.velocity.z       = std::max(-static_cast<double>(cfg.max_speed),
+                                                 std::min(static_cast<double>(cfg.max_speed),
+                                                          cfg.p_z * (z_cmd - cz)));
     current_setpoint.acceleration_or_force.x = 0.0;
     current_setpoint.acceleration_or_force.y = 0.0;
     current_setpoint.acceleration_or_force.z = 0.0;
@@ -1292,14 +1361,16 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     bool arrived = (fabs(cx - goal_x) < cfg.trav_err_max &&
                     fabs(cy - goal_y) < cfg.trav_err_max &&
                     fabs(cz - z_cmd) < cfg.trav_err_max);
-    const bool endpoint_commanded = target_motion_s >= plan.total_length - 1e-6;
+    const bool endpoint_commanded = endpoint_capture;
 
-    ROS_INFO_THROTTLE(0.5, "[投影跟踪%s] s=%.2f/%.2fm 前视=%.2fm 误差=%.3fm "
-                          "实速/规划/前馈=%.2f/%.2f/%.2fm/s 设定(%.2f,%.2f,%.2f) "
+    ROS_INFO_THROTTLE(0.5, "[矢量场%s] s=%.2f/%.2fm 速度预读=%.2fm 横向误差=%.3fm "
+                          "实速/预读规划/切向/纠偏/指令=%.2f/%.2f/%.2f/%.2f/%.2fm/s "
+                          "投影(%.2f,%.2f) 目标(%.2f,%.2f,%.2f) "
                           "当前(%.2f,%.2f,%.2f)",
                       label, traverse_tracker.motion_s, plan.total_length, lookahead,
-                      tracking_error, actual_speed, reference.v, feedforward_speed,
-                      target.x, target.y, z_cmd, cx, cy, cz);
+                      tracking_error, actual_speed, preview.v, tangent_speed,
+                      correction_speed, std::hypot(command_vx, command_vy),
+                      reference.x, reference.y, goal_x, goal_y, z_cmd, cx, cy, cz);
 
     if (endpoint_commanded && arrived) return true;
 
