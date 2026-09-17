@@ -213,6 +213,41 @@ std::vector<Vec2f> via_return[4];  // 返程绕柱段（场地系，独立配置
                                    // 空/点数<2 时 buildReturnVia 回退"leg2 倒放"旧行为
 std::vector<SegObs> walls;
 
+// ==================== 最近柱距诊断（任务结束时打印） ====================
+// 逐帧对 4 个候选柱位累计"最近净距（到柱面 = 距离 - 柱半径）"及其发生位置，
+// 任务结束时只报当前 active_case 那两根柱子（用于评估实际飞行贴柱程度）。
+// 注意：这是【实测】值，含跟踪偏差；traverse_check 报的是【计划】值。
+double pillar_min_clear[4] = {1e9, 1e9, 1e9, 1e9};
+double pillar_min_fx[4]    = {0, 0, 0, 0};
+double pillar_min_fy[4]    = {0, 0, 0, 0};
+const char* CAND_NAME_CN[4] = {"A左", "A右", "B左", "B右"};   // 与 pillar_candidates 同序
+
+void resetPillarMinDiag()
+{
+    for (int i = 0; i < 4; i++)
+    {
+        pillar_min_clear[i] = 1e9;
+        pillar_min_fx[i] = pillar_min_fy[i] = 0.0;
+    }
+}
+
+void updatePillarMinDiag()
+{
+    if (!init_pos_received) return;                  // 首个 odom 还没到，位置是零值
+    double fx = origin_fx - local_odom.pose.pose.position.x;   // odom -> 场地（逆变换）
+    double fy = origin_fy - local_odom.pose.pose.position.y;
+    for (size_t i = 0; i < pillar_cand.size() && i < 4; i++)
+    {
+        double d = std::hypot(fx - pillar_cand[i].x, fy - pillar_cand[i].y) - pillar_radius;
+        if (d < pillar_min_clear[i])
+        {
+            pillar_min_clear[i] = d;
+            pillar_min_fx[i] = fx;
+            pillar_min_fy[i] = fy;
+        }
+    }
+}
+
 // ==================== 控制 ====================
 mavros_msgs::PositionTarget current_setpoint;
 

@@ -27,6 +27,8 @@ int main(int argc, char **argv)
     current_setpoint.velocity.z       = 0.0f;
     current_setpoint.yaw              = 0.0f;
 
+    resetPillarMinDiag();          // 最近柱距诊断清零
+
     // ========== 订阅/发布话题 ==========
     initROSCommunication(nh);
 
@@ -640,6 +642,27 @@ int main(int argc, char **argv)
             ROS_INFO("╔══════════════════════════════════════╗");
             ROS_INFO("║          ★ 任务计时 ★");
             ROS_INFO("║  任务时长（arm→降落完成）: %.1f s", t_mission);
+            // ---- 最近柱距诊断（实测，到柱面；计划值见 tools/traverse_check.py）----
+            if (active_case >= 0 && active_case <= 3)
+            {
+                double best = 1e9;
+                int bi = 0;
+                for (int k = 0; k < 2; k++)
+                {
+                    int idx = TRAV_CASE_PILLARS[active_case][k];
+                    ROS_INFO("║  ★最近柱距★ 柱%s(%.1f,%.1f): %.3f m @场地(%.2f,%.2f)",
+                             CAND_NAME_CN[idx], pillar_cand[idx].x, pillar_cand[idx].y,
+                             pillar_min_clear[idx], pillar_min_fx[idx], pillar_min_fy[idx]);
+                    if (pillar_min_clear[idx] < best) { best = pillar_min_clear[idx]; bi = idx; }
+                }
+                ROS_INFO("║  全场最紧 %.3f m（柱%s），膨胀 %.2f -> %s",
+                         best, CAND_NAME_CN[bi], cfg.trav_inflation,
+                         best >= cfg.trav_inflation ? "未侵入 ✓" : "侵入膨胀圈 ✗");
+            }
+            else
+            {
+                ROS_WARN("║  最近柱距: 未识别到 case，跳过统计");
+            }
             ROS_INFO("║  50s 目标: %s", (t_mission <= 50.0) ? "✓ 达标" : "✗ 未达标");
             ROS_INFO("╚══════════════════════════════════════╝");
             ROS_INFO("任务完成，节点退出");
@@ -651,6 +674,7 @@ int main(int argc, char **argv)
         }
 
         // 3. 持续发布 OFFBOARD 设定点
+        updatePillarMinDiag();     // 最近柱距诊断累计（任务结束时打印）
         sendSetpoint(current_setpoint);
 
         ros::spinOnce();
