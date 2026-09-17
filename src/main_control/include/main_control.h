@@ -140,9 +140,9 @@ struct Config
     double trav_projection_forward_window = 1.00; // 单周期只在进度前方该范围内投影（m）
     double trav_projection_backtrack      = 0.05; // 投影搜索允许回看范围（m）
     double trav_feedforward_scale = 1.00; // 样条规划速度的切向前馈倍率
-    double trav_cross_track_kp = 1.50;    // 投影法向误差 -> 回轨速度（s^-1）
-    double trav_cross_track_speed_max = 0.30; // 法向纠偏速度上限（m/s）
-    double trav_endpoint_capture_distance = 0.25; // 进入终点位置速度闭环的剩余弧长（m）
+    double trav_position_p_estimate = 0.95; // 实机 MPC_XY_P 的镜像值，仅用于给位置修正预留速度
+    double trav_position_correction_speed_max = 0.30; // 预计位置环修正速度上限（m/s）
+    double trav_endpoint_capture_distance = 0.25; // 进入最终位置点捕获的剩余弧长（m）
     int   trav_force_fly         = 0;
     float trav_timeout_margin  = 15.0f;
     float scan_timeout         = 4.0f;
@@ -839,10 +839,10 @@ void loadParameters(ros::NodeHandle &nh) {
                      cfg.trav_projection_backtrack, 0.05);
     nh.param<double>("traverse/tracker/feedforward_scale",
                      cfg.trav_feedforward_scale, 1.00);
-    nh.param<double>("traverse/tracker/cross_track_kp",
-                     cfg.trav_cross_track_kp, 1.50);
-    nh.param<double>("traverse/tracker/cross_track_speed_max",
-                     cfg.trav_cross_track_speed_max, 0.30);
+    nh.param<double>("traverse/tracker/position_p_estimate",
+                     cfg.trav_position_p_estimate, 0.95);
+    nh.param<double>("traverse/tracker/position_correction_speed_max",
+                     cfg.trav_position_correction_speed_max, 0.30);
     nh.param<double>("traverse/tracker/endpoint_capture_distance",
                      cfg.trav_endpoint_capture_distance, 0.25);
     nh.param<int>("traverse/force_fly", cfg.trav_force_fly, 0);
@@ -863,13 +863,14 @@ void loadParameters(ros::NodeHandle &nh) {
         std::isfinite(cfg.trav_projection_forward_window) &&
         std::isfinite(cfg.trav_projection_backtrack) &&
         std::isfinite(cfg.trav_feedforward_scale) &&
-        std::isfinite(cfg.trav_cross_track_kp) &&
-        std::isfinite(cfg.trav_cross_track_speed_max) &&
+        std::isfinite(cfg.trav_position_p_estimate) &&
+        std::isfinite(cfg.trav_position_correction_speed_max) &&
         std::isfinite(cfg.trav_endpoint_capture_distance) &&
         cfg.trav_lookahead_min > 0.0 && cfg.trav_lookahead_max >= cfg.trav_lookahead_min &&
         cfg.trav_lookahead_time >= 0.0 && cfg.trav_projection_forward_window > 0.0 &&
         cfg.trav_projection_backtrack >= 0.0 && cfg.trav_feedforward_scale >= 0.0 &&
-        cfg.trav_cross_track_kp > 0.0 && cfg.trav_cross_track_speed_max > 0.0 &&
+        cfg.trav_position_p_estimate > 0.0 &&
+        cfg.trav_position_correction_speed_max > 0.0 &&
         cfg.trav_endpoint_capture_distance > 0.0;
 
     if (cfg.max_speed <= 0.0f || cfg.err_max <= 0.0f || cfg.p_xy <= 0.0f || cfg.p_z <= 0.0f ||
@@ -886,12 +887,13 @@ void loadParameters(ros::NodeHandle &nh) {
         !std::isfinite(cfg.trav_tracking_margin) || !std::isfinite(cfg.trav_sample_ds) ||
         cfg.trav_v_max <= 0.0 || cfg.trav_a_max <= 0.0 || cfg.trav_a_lat_max <= 0.0 ||
         cfg.trav_inflation < 0.0 || cfg.trav_tracking_margin < 0.0 ||
+        cfg.trav_position_correction_speed_max > cfg.trav_v_max ||
         cfg.trav_sample_ds <= 0.0 || cfg.trav_err_max <= 0.0f || !tracker_cfg_ok) {
         ROS_FATAL("主控参数非法：控制速度/误差/增益和降落速度须 > 0；投票数须 >= 1；"
                   "舵机角度须在 0~255；兜底目标须为 A/B；yaw 偏移须为有限值；"
                   "yaw kp/rate/duration 须 > 0，tolerance 须在 (0,180]；"
                   "穿越速度/加速度/采样须 > 0，膨胀/跟踪余量须 >= 0；"
-                  "tracker 前视/窗口/横向闭环/终点捕获参数须有效");
+                  "tracker 前视/窗口/位置P估计/终点捕获参数须有效，位置修正预留不得超过 v_max");
         control_cfg_ok = false;
         return;
     }
@@ -899,12 +901,13 @@ void loadParameters(ros::NodeHandle &nh) {
     ROS_INFO("参数加载完成：A/B yaw 偏移 %.1f°/%.1f°，kp=%.2f，rate_max=%.2f rad/s，容差 %.1f°",
              cfg.shoot_yaw_a_offset_deg, cfg.shoot_yaw_b_offset_deg, cfg.shoot_yaw_kp,
              cfg.shoot_yaw_rate_max, cfg.shoot_yaw_tolerance_deg);
-    ROS_INFO("矢量场跟踪：速度预读 %.2f~%.2f m + %.2fs×受规划约束实速，搜索窗口 后%.2f/前%.2f m，"
-             "切向倍率 %.2f，横向 kp=%.2f/限速=%.2f m/s，终点捕获 %.2f m",
+    ROS_INFO("投影位置+速度跟踪：速度预读 %.2f~%.2f m + %.2fs×受规划约束实速，"
+             "搜索窗口 后%.2f/前%.2f m，切向倍率 %.2f，位置P估计=%.2f/修正预留上限=%.2f m/s，"
+             "终点捕获 %.2f m",
              cfg.trav_lookahead_min, cfg.trav_lookahead_max, cfg.trav_lookahead_time,
              cfg.trav_projection_backtrack, cfg.trav_projection_forward_window,
-             cfg.trav_feedforward_scale, cfg.trav_cross_track_kp,
-             cfg.trav_cross_track_speed_max, cfg.trav_endpoint_capture_distance);
+             cfg.trav_feedforward_scale, cfg.trav_position_p_estimate,
+             cfg.trav_position_correction_speed_max, cfg.trav_endpoint_capture_distance);
     ROS_INFO("穿越净距要求：机体膨胀 %.2f + 跟踪余量 %.2f = %.2f m",
              cfg.trav_inflation, cfg.trav_tracking_margin,
              cfg.trav_inflation + cfg.trav_tracking_margin);
@@ -1276,45 +1279,35 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     const PlanSample preview = samplePlanByArcLength(plan, preview_original_s);
     const double travel_direction = reverse ? -1.0 : 1.0;
 
-    // 连续 Frenet/矢量场控制：切向负责推进，投影点的法向误差负责回到中心线。
-    // 两部分正交合成并限制总水平速度，不设置离散“偏离就停车”的恢复状态。
+    // 投影位置 + 切向速度前馈：PX4 位置环只追当前投影点，负责消除横向误差；
+    // 速度前馈负责沿曲线前进。绝不把前视点坐标发给 PX4，因此不会主动追弦切弯。
     const double tangent_x = travel_direction * reference.tx;
     const double tangent_y = travel_direction * reference.ty;
-    const double error_x = reference.x - cx;
-    const double error_y = reference.y - cy;
-    const double along_error = error_x * tangent_x + error_y * tangent_y;
-    double correction_x = cfg.trav_cross_track_kp * (error_x - along_error * tangent_x);
-    double correction_y = cfg.trav_cross_track_kp * (error_y - along_error * tangent_y);
-    double correction_speed = std::hypot(correction_x, correction_y);
-    if (correction_speed > cfg.trav_cross_track_speed_max) {
-        const double scale = cfg.trav_cross_track_speed_max / correction_speed;
-        correction_x *= scale;
-        correction_y *= scale;
-        correction_speed = cfg.trav_cross_track_speed_max;
-    }
-
-    const double tangent_budget = std::sqrt(std::max(
-        0.0, cfg.trav_v_max * cfg.trav_v_max - correction_speed * correction_speed));
-    double tangent_speed = std::min(
-        tangent_budget, std::max(0.0, preview.v * cfg.trav_feedforward_scale));
-    double command_vx = tangent_x * tangent_speed + correction_x;
-    double command_vy = tangent_y * tangent_speed + correction_y;
-
     const double remaining_motion_s = std::max(0.0, plan.total_length - projected_motion_s);
     const bool endpoint_capture = remaining_motion_s <= cfg.trav_endpoint_capture_distance;
+
+    double position_target_x = reference.x;
+    double position_target_y = reference.y;
+    double position_error = tracking_error;
     if (endpoint_capture) {
-        // 规划速度在端点会降为 0；末段直接对最终目标做连续速度闭环，确保真正到点。
-        command_vx = cfg.trav_cross_track_kp * (goal_x - cx);
-        command_vy = cfg.trav_cross_track_kp * (goal_y - cy);
-        tangent_speed = 0.0;
-        correction_speed = std::hypot(command_vx, command_vy);
+        // 末段把 position 切到真正终点并撤掉速度前馈，交给 PX4 位置环稳定捕获。
+        position_target_x = goal_x;
+        position_target_y = goal_y;
+        position_error = std::hypot(goal_x - cx, goal_y - cy);
     }
-    const double command_xy_speed = std::hypot(command_vx, command_vy);
-    if (command_xy_speed > cfg.trav_v_max) {
-        const double scale = cfg.trav_v_max / command_xy_speed;
-        command_vx *= scale;
-        command_vy *= scale;
-    }
+
+    // PX4 会把 position P 产生的速度修正与 velocity 前馈相加。按实机 MPC_XY_P
+    // 估算修正量并预留速度预算，避免两个通道叠加后明显超过 trav_v_max。
+    const double estimated_position_correction = std::min(
+        cfg.trav_position_correction_speed_max,
+        cfg.trav_position_p_estimate * position_error);
+    const double tangent_budget = std::sqrt(std::max(
+        0.0, cfg.trav_v_max * cfg.trav_v_max -
+                 estimated_position_correction * estimated_position_correction));
+    const double tangent_speed = endpoint_capture ? 0.0 : std::min(
+        tangent_budget, std::max(0.0, preview.v * cfg.trav_feedforward_scale));
+    const double command_vx = tangent_x * tangent_speed;
+    const double command_vy = tangent_y * tangent_speed;
 
     // z_end 有效（返程直通）时：过环前（场地 x>=2.05）保持 flight_z，
     // 过环后随水平进度从 flight_z 线性降到 z_end —— 边飞边降，缩短最后降落时间
@@ -1340,18 +1333,16 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
         }
     }
 
-    // 穿越只给速度和 yaw。位置字段仅用于日志/抓包识别，掩码明确忽略它们，
-    // 防止 PX4 位置环与切向前馈重复加速。
-    current_setpoint.type_mask        = TYPE_MASK_VELOCITY_ONLY;
+    // position 是当前投影点（末段为最终点），velocity 只是同一点的切向前馈。
+    // PX4 的 position P 负责横向闭环；前视坐标从不进入 position 字段。
+    current_setpoint.type_mask        = TYPE_MASK_POSITION_VELOCITY;
     current_setpoint.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
-    current_setpoint.position.x       = reference.x;
-    current_setpoint.position.y       = reference.y;
+    current_setpoint.position.x       = position_target_x;
+    current_setpoint.position.y       = position_target_y;
     current_setpoint.position.z       = z_cmd;
     current_setpoint.velocity.x       = command_vx;
     current_setpoint.velocity.y       = command_vy;
-    current_setpoint.velocity.z       = std::max(-static_cast<double>(cfg.max_speed),
-                                                 std::min(static_cast<double>(cfg.max_speed),
-                                                          cfg.p_z * (z_cmd - cz)));
+    current_setpoint.velocity.z       = 0.0;
     current_setpoint.acceleration_or_force.x = 0.0;
     current_setpoint.acceleration_or_force.y = 0.0;
     current_setpoint.acceleration_or_force.z = 0.0;
@@ -1363,14 +1354,14 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                     fabs(cz - z_cmd) < cfg.trav_err_max);
     const bool endpoint_commanded = endpoint_capture;
 
-    ROS_INFO_THROTTLE(0.5, "[矢量场%s] s=%.2f/%.2fm 速度预读=%.2fm 横向误差=%.3fm "
-                          "实速/预读规划/切向/纠偏/指令=%.2f/%.2f/%.2f/%.2f/%.2fm/s "
-                          "投影(%.2f,%.2f) 目标(%.2f,%.2f,%.2f) "
+    ROS_INFO_THROTTLE(0.5, "[投影位置+速度%s] s=%.2f/%.2fm 速度预读=%.2fm 横向误差=%.3fm "
+                          "实速/预读规划/切向前馈/位置修正预留=%.2f/%.2f/%.2f/%.2fm/s "
+                          "投影(%.2f,%.2f) 位置设定(%.2f,%.2f,%.2f) "
                           "当前(%.2f,%.2f,%.2f)",
                       label, traverse_tracker.motion_s, plan.total_length, lookahead,
                       tracking_error, actual_speed, preview.v, tangent_speed,
-                      correction_speed, std::hypot(command_vx, command_vy),
-                      reference.x, reference.y, goal_x, goal_y, z_cmd, cx, cy, cz);
+                      estimated_position_correction, reference.x, reference.y,
+                      position_target_x, position_target_y, z_cmd, cx, cy, cz);
 
     if (endpoint_commanded && arrived) return true;
 
