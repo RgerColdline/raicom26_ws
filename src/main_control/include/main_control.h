@@ -138,6 +138,10 @@ struct Config
     int trav_early_scan        = 1;   // 1=起飞后立刻触发柱子检测，边飞边扫，检出且过环后当前位置直接切入 leg2（跳过悬停点停留）；0=旧行为到悬停点才扫
     int trav_return_smooth     = 1;   // 1=射击后从当前位置单条平滑轨迹返程（倒放绕柱+穿环+回起飞点，中途不停顿）；0=旧行为分段返程
     float trav_return_land_z   = 0.45f; // 返程直通末段目标高度(m)：过环后从 flight_z 边飞边线性降到该高度，缩短最后降落；<=0 禁用降高全程平飞
+
+    // ---- 穿越段速度前馈（2026-09-17）----
+    double trav_ff_scale       = 0.7;   // 切向前馈倍率：0=纯位置(旧行为)，1.0=完全消滞后
+    double trav_ff_horizon     = 0.10;  // 前馈预读时间(s)：轨迹时间差分求切向速度的步长
 } cfg;
 
 // ==================== ROS 通信 ====================
@@ -717,6 +721,8 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<int>("traverse/early_scan", cfg.trav_early_scan, 1);
     nh.param<int>("traverse/return_smooth", cfg.trav_return_smooth, 1);
     nh.param<float>("traverse/return_land_z", cfg.trav_return_land_z, 0.45f);
+    nh.param<double>("traverse/ff_scale", cfg.trav_ff_scale, 0.7);
+    nh.param<double>("traverse/ff_horizon", cfg.trav_ff_horizon, 0.10);
     nh.param<double>("map/origin_x", origin_fx, 0.65);
     nh.param<double>("map/origin_y", origin_fy, 0.75);
     nh.param<double>("map/pillar_radius", pillar_radius, 0.1);
@@ -1042,15 +1048,33 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     double sx, sy;
     traverse_sample(plan, qt, sx, sy);
 
-    // z_end 有效（返程直通）时：过环前（场地 x>=2.05）保持 flight_z，
-    // 过环后随水平进度从 flight_z 线性降到 z_end —— 边飞边降，缩短最后降落时间
+    // ---- 速度前馈（2026-09-17）----
+    // 纯位置设定点追移动目标有稳态滞后 err≈v/Kp（实测0.4~0.75m），弯道切内角吃净距。
+    // 叠加轨迹切向前馈：段首/段尾规划速度≈0 -> 前馈≈0，位置环主导起步/收尾；
+    // 段中前馈≈ff_scale×规划速度，消除大部分滞后，整体速度平稳。
+    // 返程(reverse)时间倒放：实际速度方向 = 轨迹参数反方向，预读取 qt-h。
+    double vfx = 0.0, vfy = 0.0;
+    const bool use_ff = cfg.trav_ff_scale > 0.0 && cfg.trav_ff_horizon > 1e-3;
+    if (use_ff) {
+        double qt2 = reverse ? (qt - cfg.trav_ff_horizon) : (qt + cfg.trav_ff_horizon);
+        double sx2, sy2;
+        traverse_sample(plan, qt2, sx2, sy2);   // 越界自动夹到首/尾点，段首尾前馈自然归零
+        vfx = cfg.trav_ff_scale * (sx2 - sx) / cfg.trav_ff_horizon;
+        vfy = cfg.trav_ff_scale * (sy2 - sy) / cfg.trav_ff_horizon;
+    }
+
+    // ---- z 指令 + z 前馈（返程直通末段降高，共用同一道过环门）----
+    // 过环前（场地 x>=2.05）保持 flight_z，过环后随水平进度线性降到 z_end。
     //
-    // ⚠️ 2026-09-09 修复挂网：原来直接按“当前轨迹点的场地 x<2.05 就降”，但返程
-    // 起点在射击区（场地 x≈1.1，本来就 <2.05），导致刚射击完还没往环走就被拉到
-    // 低高度（~0.66m）撞到靶区侧网。现在必须先确认轨迹已真正越过环进入末段
-    // 回家走廊（从轨迹末端倒扫到“最后一个场地 x>=2.05 的点”即过环时刻），
-    // 时刻未到一律保持 flight_z，全程不会再提前降高。
+    // ⚠️ 2026-09-09 修复挂网：返程起点在射击区（场地 x≈1.1，本来就 <2.05），
+    // 直接按“当前点 x<2.05 就降”会刚射击完就被拉到低高度撞靶区侧网。必须先从
+    // 轨迹末端倒扫出“最后一个场地 x>=2.05 的点”（真正过环时刻 t_ring），
+    // qt 未过 t_ring 一律保持 flight_z。
+    // ⚠️ 2026-09-17 修复砸地弹跳：z 前馈曾漏掉这道门——返程起点同样让降高公式
+    // r>0（起点场地 x≈1.22 -> r≈0.59），前馈差分出约 -2.7m/s 的垂直指令，飞机
+    // 先砸到 -0.4m 再被位置环拉回、过冲到 2.05m。前馈必须与 z_cmd 同门。
     double z_cmd = cfg.trav_flight_z;
+    double vfz   = 0.0;
     if (!std::isnan(z_end) && z_end > 0.0) {
         double t_ring = T;                              // 默认整段不降（安全兜底）
         const std::vector<TrajPoint> &tr = plan.traj;
@@ -1063,14 +1087,30 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
             double r  = (2.05 - fx) / (2.05 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
             r = std::max(0.0, std::min(1.0, r));
             z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
+
+            // z 前馈：同一道 t_ring 门内，按预读点差分（qt2 与 qt 仅差 horizon）
+            if (use_ff) {
+                double qt2 = reverse ? (qt - cfg.trav_ff_horizon) : (qt + cfg.trav_ff_horizon);
+                double sx2, sy2;
+                traverse_sample(plan, qt2, sx2, sy2);
+                double fx2 = origin_fx - sx2;
+                double r2  = (2.05 - fx2) / (2.05 - origin_fx);
+                r2 = std::max(0.0, std::min(1.0, r2));
+                double z2 = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r2;
+                vfz = cfg.trav_ff_scale * (z2 - z_cmd) / cfg.trav_ff_horizon;
+            }
         }
     }
 
-    current_setpoint.type_mask        = TRAV_TYPE_MASK_POSITION_ONLY;
+    current_setpoint.type_mask        = use_ff ? TYPE_MASK_POSITION_VELOCITY
+                                               : TRAV_TYPE_MASK_POSITION_ONLY;
     current_setpoint.coordinate_frame = mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
     current_setpoint.position.x       = sx;
     current_setpoint.position.y       = sy;
     current_setpoint.position.z       = z_cmd;
+    current_setpoint.velocity.x       = vfx;
+    current_setpoint.velocity.y       = vfy;
+    current_setpoint.velocity.z       = vfz;
     current_setpoint.yaw              = init_yaw;
 
     double cx = local_odom.pose.pose.position.x;
@@ -1081,8 +1121,8 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                     fabs(cy - goal_y) < cfg.trav_err_max &&
                     fabs(cz - z_cmd) < cfg.trav_err_max);
 
-    ROS_INFO_THROTTLE(0.5, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f,%.2f) 当前(%.2f,%.2f,%.2f)",
-                      label, t, T, sx, sy, z_cmd, cx, cy, cz);
+    ROS_INFO_THROTTLE(0.5, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f,%.2f) 当前(%.2f,%.2f,%.2f) 前馈v(%.2f,%.2f)",
+                      label, t, T, sx, sy, z_cmd, cx, cy, cz, vfx, vfy);
 
     if (t >= T && arrived) return true;
 
