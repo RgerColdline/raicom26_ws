@@ -88,7 +88,10 @@ enum MissionState {
 struct Vec2f { double x, y; };                 // 二维点
 struct CircleObs { double x, y, r; };          // 圆形障碍（圆柱，r=实际半径，未膨胀）
 struct SegObs { double x1, y1, x2, y2; };      // 线段障碍（墙 / 场地边界）
-struct TrajPoint { double t, x, y; };          // 时间参数化轨迹点（odom 系）
+// 时间参数化轨迹点（odom 系）
+//   w_ff: 前馈权重 [0,1]，由规划器按该点向心加速度需求算出：
+//         1 = 直线（可给足前馈消滞后）；0 = 全场最紧弯道（前馈降下来保贴合）
+struct TrajPoint { double t, x, y, w_ff; };
 
 struct Waypoint
 {
@@ -139,8 +142,10 @@ struct Config
     int trav_return_smooth     = 1;   // 1=射击后从当前位置单条平滑轨迹返程（倒放绕柱+穿环+回起飞点，中途不停顿）；0=旧行为分段返程
     float trav_return_land_z   = 0.45f; // 返程直通末段目标高度(m)：过环后从 flight_z 边飞边线性降到该高度，缩短最后降落；<=0 禁用降高全程平飞
 
-    // ---- 穿越段速度前馈（2026-09-17）----
-    double trav_ff_scale       = 0.7;   // 切向前馈倍率：0=纯位置(旧行为)，1.0=完全消滞后
+    // ---- 穿越段速度前馈（曲率自适应）----
+    double trav_ff_straight    = 1.0;   // 直线段前馈倍率：给足，消除滞后（直线无横偏风险）
+    double trav_ff_curve       = 0.6;   // 弯道段前馈倍率：降下来，靠位置环保贴合
+                                        //   （弯道前馈给太足会切外圈吃净距，实测 ff=1.0 净距掉 0.1）
     double trav_ff_horizon     = 0.10;  // 前馈预读时间(s)：轨迹时间差分求切向速度的步长
 } cfg;
 
@@ -204,6 +209,8 @@ double scan_hover_fx = 3.00, scan_hover_fy = 0.75;
 double pillar_radius = 0.1;
 std::vector<Vec2f> pillar_cand;
 std::vector<Vec2f> via_leg2[4];
+std::vector<Vec2f> via_return[4];  // 返程绕柱段（场地系，独立配置；末点=悬停点）
+                                   // 空/点数<2 时 buildReturnVia 回退"leg2 倒放"旧行为
 std::vector<SegObs> walls;
 
 // ==================== 控制 ====================
@@ -474,7 +481,7 @@ bool traverse_plan(TraversePlanResult& out,
     for (int k = N - 1; k >= 0; k--)
         v[k] = std::min(v[k], std::sqrt(v[k + 1] * v[k + 1] + 2.0 * a_max * (s[k + 1] - s[k])));
 
-    out.traj.assign(N + 1, TrajPoint{0.0, 0.0, 0.0});
+    out.traj.assign(N + 1, TrajPoint{0.0, 0.0, 0.0, 1.0});
     for (int k = 1; k <= N; k++)
     {
         double ds_k = s[k] - s[k - 1];
@@ -488,15 +495,46 @@ bool traverse_plan(TraversePlanResult& out,
         Vec2f o = field_to_odom(p[k].x, p[k].y, origin_fx, origin_fy);
         out.traj[k].x = o.x;
         out.traj[k].y = o.y;
+
+        // 曲率自适应前馈权重 w_ff = 曲率因子 × 速度因子，两者都在 [0,1]：
+        //  曲率因子 1 - v²κ/a_lat_max：1=直线(可给足前馈)，0=最紧弯(前馈降下来保贴合)
+        //    —— 弯道前馈给太足，速度矢量受横加速度限制转不过来会切外圈吃净距
+        //  速度因子 min(1, v/v_max)：段首/段尾规划速度≈0 时权重归零
+        //    —— 段首位置环主导起步；段尾目标是静止的，纯位置收敛才不过冲
+        //       （实测 ff=1.0 匀速段末端会冲过终点约 0.2m，多花 1s 回头）
+        // 规划器已保证 v²κ <= a_lat_max，故曲率因子天然落在 [0,1]。
+        double alat_norm = (a_lat_max > 1e-9)
+                               ? (v[k] * v[k] * kap[k]) / a_lat_max : 0.0;
+        double w_curv = 1.0 - std::min(1.0, std::max(0.0, alat_norm));
+        double w_spd  = (v_max > 1e-9) ? std::min(1.0, v[k] / v_max) : 0.0;
+        out.traj[k].w_ff = w_curv * w_spd;
     }
     return true;
 }
 
-void traverse_sample(const TraversePlanResult& plan, double t, double& x, double& y)
+// 时间参数化轨迹采样（按时间线性插值）
+//   w: 可选输出，带回该点的曲率自适应前馈权重 w_ff（越界时取首/尾点）
+void traverse_sample(const TraversePlanResult& plan, double t, double& x, double& y,
+                     double* w = nullptr)
 {
-    if (plan.traj.empty()) { x = 0.0; y = 0.0; return; }
-    if (t <= 0.0) { x = plan.traj.front().x; y = plan.traj.front().y; return; }
-    if (t >= plan.traj.back().t) { x = plan.traj.back().x; y = plan.traj.back().y; return; }
+    if (plan.traj.empty())
+    {
+        x = 0.0; y = 0.0;
+        if (w) *w = 1.0;
+        return;
+    }
+    if (t <= 0.0)
+    {
+        x = plan.traj.front().x; y = plan.traj.front().y;
+        if (w) *w = plan.traj.front().w_ff;
+        return;
+    }
+    if (t >= plan.traj.back().t)
+    {
+        x = plan.traj.back().x; y = plan.traj.back().y;
+        if (w) *w = plan.traj.back().w_ff;
+        return;
+    }
     int lo = 0, hi = (int)plan.traj.size() - 1;
     while (lo + 1 < hi)
     {
@@ -507,6 +545,8 @@ void traverse_sample(const TraversePlanResult& plan, double t, double& x, double
     double r = (span > 1e-9) ? (t - plan.traj[lo].t) / span : 0.0;
     x = plan.traj[lo].x + r * (plan.traj[hi].x - plan.traj[lo].x);
     y = plan.traj[lo].y + r * (plan.traj[hi].y - plan.traj[lo].y);
+    if (w)
+        *w = plan.traj[lo].w_ff + r * (plan.traj[hi].w_ff - plan.traj[lo].w_ff);
 }
 
 double traverse_duration(const TraversePlanResult& plan)
@@ -721,7 +761,8 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<int>("traverse/early_scan", cfg.trav_early_scan, 1);
     nh.param<int>("traverse/return_smooth", cfg.trav_return_smooth, 1);
     nh.param<float>("traverse/return_land_z", cfg.trav_return_land_z, 0.45f);
-    nh.param<double>("traverse/ff_scale", cfg.trav_ff_scale, 0.7);
+    nh.param<double>("traverse/ff_straight", cfg.trav_ff_straight, 1.0);
+    nh.param<double>("traverse/ff_curve", cfg.trav_ff_curve, 0.6);
     nh.param<double>("traverse/ff_horizon", cfg.trav_ff_horizon, 0.10);
     nh.param<double>("map/origin_x", origin_fx, 0.65);
     nh.param<double>("map/origin_y", origin_fy, 0.75);
@@ -810,6 +851,8 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
         char key[64];
         snprintf(key, sizeof(key), "map/via_points_leg2_case%d", cid);
         loadPointList(nh, key, via_leg2[cid]);
+        snprintf(key, sizeof(key), "map/via_return_case%d", cid);
+        loadPointList(nh, key, via_return[cid]);
     }
     loadPointList(nh, "map/pillar_candidates", pillar_cand);
 
@@ -992,17 +1035,31 @@ bool tryPlanLeg2FromCurrent(int cid, const Vec2f &cur_field) {
 }
 
 bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out) {
-    // 返程直通途经点（场地系）：起点 -> 倒放 leg2（绕柱区入口 -> 悬停点）-> 穿环走廊 -> 起飞点
-    // 倒放跳过 leg2 末点（投放区），第一个途经点 = leg2 倒数第二点（投放/射击区与绕柱区之间），
-    // 从投放/射击点直连该点。穿环走廊：悬停点与孔之间拉直 -> 过孔中心 -> 孔与出生点之间拉直 -> 起飞点
-    if (cid < 0 || cid > 3 || via_leg2[cid].size() < 3) return false;
+    // 返程直通途经点（场地系）：起点 -> 返程绕柱段 -> 穿环走廊 -> 起飞点
+    //
+    // 返程绕柱段两种来源（2026-09-17 起支持独立配置）：
+    //   1) map/via_return_caseX 有 >=2 点 -> 用它（可独立编辑，不影响去程）
+    //   2) 否则回退旧行为：倒放 leg2（跳过投放区末点），首点=leg2 倒数第二点
+    // 穿环走廊固定内置：悬停点与孔之间拉直 -> 过孔中心 -> 孔与出生点之间拉直 -> 起飞点
+    if (cid < 0 || cid > 3) return false;
     out.clear();
-    // 防重复点（重复点会让样条弦长参数 h=0 导致除零）：起点离倒放首点太近就不单独加起点
-    const Vec2f &entry = via_leg2[cid][via_leg2[cid].size() - 2];   // 绕柱区入口（leg2 倒数第二点）
-    if (std::hypot(start_field.x - entry.x, start_field.y - entry.y) > 0.1)
-        out.push_back(start_field);                            // 起点（投放/射击点或当前位置）
-    for (int i = (int)via_leg2[cid].size() - 2; i >= 0; --i)   // 倒放绕柱：绕柱区入口 -> ... -> 悬停点（跳过投放区）
-        out.push_back(via_leg2[cid][i]);
+
+    const std::vector<Vec2f> &seg = via_return[cid];
+    if (seg.size() >= 2) {
+        // 防重复点（重复点会让样条弦长参数 h=0 导致除零）：起点离首点太近就不单独加起点
+        if (std::hypot(start_field.x - seg.front().x,
+                       start_field.y - seg.front().y) > 0.1)
+            out.push_back(start_field);                        // 起点（投放/射击点或当前位置）
+        for (size_t i = 0; i < seg.size(); i++) out.push_back(seg[i]);
+    } else {
+        if (via_leg2[cid].size() < 3) return false;            // 无独立返程点且 leg2 不足
+        const Vec2f &entry = via_leg2[cid][via_leg2[cid].size() - 2];   // 绕柱区入口（leg2 倒数第二点）
+        if (std::hypot(start_field.x - entry.x, start_field.y - entry.y) > 0.1)
+            out.push_back(start_field);
+        for (int i = (int)via_leg2[cid].size() - 2; i >= 0; --i)        // 倒放：入口 -> ... -> 悬停点
+            out.push_back(via_leg2[cid][i]);
+    }
+
     Vec2f mid1{0.5 * (scan_hover_fx + 2.0), scan_hover_fy};    // 悬停点与孔之间拉直（抑制拐弯外凸）
     Vec2f hole{2.0, scan_hover_fy};                            // 过孔中心（x=2，孔 y 中心=出生点 y）
     Vec2f mid2{0.5 * (origin_fx + 2.0), origin_fy};            // 孔与出生点之间拉直
@@ -1045,22 +1102,30 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     double qt = reverse ? (T - t) : t;
     if (qt < 0.0) qt = 0.0;
 
-    double sx, sy;
-    traverse_sample(plan, qt, sx, sy);
+    double sx, sy, w_ff = 1.0;
+    traverse_sample(plan, qt, sx, sy, &w_ff);
 
-    // ---- 速度前馈（2026-09-17）----
-    // 纯位置设定点追移动目标有稳态滞后 err≈v/Kp（实测0.4~0.75m），弯道切内角吃净距。
-    // 叠加轨迹切向前馈：段首/段尾规划速度≈0 -> 前馈≈0，位置环主导起步/收尾；
-    // 段中前馈≈ff_scale×规划速度，消除大部分滞后，整体速度平稳。
+    // ---- 速度前馈（曲率自适应）----
+    // 纯位置设定点追移动目标有稳态滞后 err≈(1-ff)×v/Kp（纯位置实测 0.4~0.75m），
+    // 弯道上滞后的位置会横向偏离路径（实测 cross-track 0.35m）吃净距。
+    // 但 ff 并非越大越好：
+    //   ff 太小 -> 滞后大，弯道横向偏离大（如上）
+    //   ff 太大 -> 速度矢量受横加速度限制转不过来，弯道切外圈（实测 ff=1.0 cross-track 0.13m）
+    // 实测 ff≈0.7 弯道 cross-track 最小(0.02m)；而直线段 cross-track 与 ff 无关，
+    // ff 越大滞后越小。故按曲率自适应：直线给足(ff_straight)、弯道降下来(ff_curve)。
+    //   w_ff=1 直线(向心加速度≈0)；w_ff=0 全场最紧弯道(向心加速度=a_lat_max)
+    // 段首/段尾规划速度≈0 -> 前馈≈0，位置环主导起步/收尾。
     // 返程(reverse)时间倒放：实际速度方向 = 轨迹参数反方向，预读取 qt-h。
-    double vfx = 0.0, vfy = 0.0;
-    const bool use_ff = cfg.trav_ff_scale > 0.0 && cfg.trav_ff_horizon > 1e-3;
+    double vfx = 0.0, vfy = 0.0, ff_local = 0.0;
+    const bool use_ff = (cfg.trav_ff_straight > 0.0 || cfg.trav_ff_curve > 0.0) &&
+                        cfg.trav_ff_horizon > 1e-3;
     if (use_ff) {
+        ff_local = cfg.trav_ff_curve + (cfg.trav_ff_straight - cfg.trav_ff_curve) * w_ff;
         double qt2 = reverse ? (qt - cfg.trav_ff_horizon) : (qt + cfg.trav_ff_horizon);
         double sx2, sy2;
         traverse_sample(plan, qt2, sx2, sy2);   // 越界自动夹到首/尾点，段首尾前馈自然归零
-        vfx = cfg.trav_ff_scale * (sx2 - sx) / cfg.trav_ff_horizon;
-        vfy = cfg.trav_ff_scale * (sy2 - sy) / cfg.trav_ff_horizon;
+        vfx = ff_local * (sx2 - sx) / cfg.trav_ff_horizon;
+        vfy = ff_local * (sy2 - sy) / cfg.trav_ff_horizon;
     }
 
     // ---- z 指令 + z 前馈（返程直通末段降高，共用同一道过环门）----
@@ -1097,7 +1162,7 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                 double r2  = (2.05 - fx2) / (2.05 - origin_fx);
                 r2 = std::max(0.0, std::min(1.0, r2));
                 double z2 = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r2;
-                vfz = cfg.trav_ff_scale * (z2 - z_cmd) / cfg.trav_ff_horizon;
+                vfz = ff_local * (z2 - z_cmd) / cfg.trav_ff_horizon;
             }
         }
     }
@@ -1121,8 +1186,9 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                     fabs(cy - goal_y) < cfg.trav_err_max &&
                     fabs(cz - z_cmd) < cfg.trav_err_max);
 
-    ROS_INFO_THROTTLE(0.5, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f,%.2f) 当前(%.2f,%.2f,%.2f) 前馈v(%.2f,%.2f)",
-                      label, t, T, sx, sy, z_cmd, cx, cy, cz, vfx, vfy);
+    ROS_INFO_THROTTLE(0.2, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f,%.2f) 当前(%.2f,%.2f,%.2f) "
+                      "前馈v(%.2f,%.2f) w=%.2f ff=%.2f",
+                      label, t, T, sx, sy, z_cmd, cx, cy, cz, vfx, vfy, w_ff, ff_local);
 
     if (t >= T && arrived) return true;
 
