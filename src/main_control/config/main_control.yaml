@@ -67,11 +67,19 @@ cargo:
   drop_hover_time: 2.0              # 投货前悬停投票时间（s）
 
 land:
-  # 降落 B 方案（2026-09-22）：返程末段已把 z 压到 return_land_z(0.45)，
-  # 这里手动快降到离地 auto_land_z 再切 AUTO.LAND——AUTO.LAND 只飞最后 10cm，
-  # land detect 立即触发，省掉模式内下降 + 空中等 land detect 的时间。
-  descend_speed: 0.35               # 手动快降速度（m/s）；实机稳可加到 0.4~0.5，怕砸地就退回 0.3
-  auto_land_z: 0.1                  # 离地多少米切 AUTO.LAND（必须 > 0 且 < takeoff_height）
+  # 2026-09-22 提速方案 A+C（以速度为目标，接受落点偏移）：
+  #  A 侧：返程直通的到位判据只留高度、不再等 xy 收敛（main_control.h trackPlan 内），
+  #        省掉过冲后"原地悬停等位置环把 xy 拉回 0.15m"的 ~0.5s；
+  #  C 侧：返程直通路径进 LAND 后【跳过手动下降段】直接 AUTO.LAND（main_control.cpp 的
+  #        land_direct 分支），再省 ~0.9s。之所以纯靠下面的 auto_land_z 不行：本段判据是
+  #        "相对出生点 z"，与轨迹用的绝对 odom z 参考不一致——出生点 z 估计偏低时，入口
+  #        高度会显示成 0.6+ 而白降一段（实飞实测 init_pos_z=-0.16 -> 入口 0.62m）。
+  #  代价：不再用下降段修正 xy，落点会沿飞行方向前移一个过冲量；已用 traverse/return_end_back
+  #        把轨迹末端后移来抵消。分段返程的旧路径仍走手动下降兜底，仍用下面的阈值。
+  #  历史：曾把 auto_land_z 压到 0.1（让 AUTO.LAND 只飞最后 10cm），实飞手感不好已弃用。
+  descend_speed: 0.2                # 手动下降速度（m/s）：仅"分段返程旧路径"会用到
+  auto_land_z: 0.45                 # 离地多少米切 AUTO.LAND（须 > 0 且 < takeoff_height）；
+                                    # 只对"分段返程旧路径"生效，返程直通路径直接跳过
 
 # ==================== 下视 YOLO 节点参数 ====================
 # weights_path 由 main_control.launch 设置。

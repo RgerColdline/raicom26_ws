@@ -522,6 +522,7 @@ int main(int argc, char **argv)
                           cfg.trav_return_land_z))
             {
                 ROS_INFO("[穿越] ✓ 返程直通完成（穿环不停顿+末段降高），已到起飞点，直接降落");
+                land_direct      = true;   // 轨迹末端已降高到 return_land_z：进 LAND 直接 AUTO.LAND
                 current_state    = LAND;   // 轨迹终点即起飞点（无需 RETURN 精修），直接进降落
                 state_start_time = ros::Time::now();
             }
@@ -592,8 +593,11 @@ int main(int argc, char **argv)
             const float current_z = local_odom.pose.pose.position.z;
             const float ground_z  = init_pos_z;
 
-            // 手动快降段：降到离地 auto_land_z（B 方案），再让 AUTO.LAND 只做最后 10cm 收尾
-            if (current_z > ground_z + cfg.land_auto_land_z)
+            // 返程直通路径（land_direct）跳过手动下降段：轨迹末端已经降到 return_land_z，直接交
+            // AUTO.LAND。原因是 LAND 段的高度判据是"相对出生点 z"，与轨迹用的绝对 odom z 参考
+            // 不一致（出生点 z 估计偏低时，入口高度会显示成 0.6+ 而白降一段，实测 ~0.9s）。
+            // 分段返程的旧路径仍走手动下降兜底。
+            if (!land_direct && current_z > ground_z + cfg.land_auto_land_z)
             {
                 positionControl(Eigen::Vector3f(init_pos_x, init_pos_y, current_z), current_setpoint);
                 current_setpoint.velocity.z = -cfg.land_descend_speed;
@@ -609,7 +613,9 @@ int main(int argc, char **argv)
                 srv.request.custom_mode = "AUTO.LAND";
                 if (set_mode_client.call(srv) && srv.response.mode_sent)
                 {
-                    ROS_INFO("[降落] 离地 < %.2fm，AUTO.LAND 请求成功", cfg.land_auto_land_z);
+                    ROS_INFO("[降落] AUTO.LAND 请求成功（%s），离地 %.2f m",
+                             land_direct ? "返程直通直接降落" : "手动下降到位后降落",
+                             current_z - ground_z);
                     auto_land_sent    = true;
                     state_start_time  = ros::Time::now();
                 }

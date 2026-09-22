@@ -110,9 +110,11 @@ struct Config
 
     std::string attack_real_target;
 
-    float land_descend_speed         = 0.3f;
-    float land_auto_land_z           = 0.1f;  // 离地高度低于此值才切 AUTO.LAND（B 方案：手动快降到贴地，
-                                               // AUTO.LAND 只做最后 10cm + 触地检测 + disarm，缩短模式内下降与 land detect）
+    float land_descend_speed         = 0.2f;
+    float land_auto_land_z           = 0.45f; // 离地低于此值切 AUTO.LAND。2026-09-22 A+C 提速：
+                                               // 取 0.45（= 轨迹末端高度），进 LAND 立刻满足阈值、
+                                               // 跳过手动下降段；代价是落点不再被该段纠 xy，
+                                               // 会沿飞行方向前移一个过冲量
 
     float shoot_yaw_a_offset_deg = -90.0f;
     float shoot_yaw_b_offset_deg = 90.0f;
@@ -143,6 +145,9 @@ struct Config
     int trav_early_scan        = 1;   // 1=起飞后立刻触发柱子检测，边飞边扫，检出且过环后当前位置直接切入 leg2（跳过悬停点停留）；0=旧行为到悬停点才扫
     int trav_return_smooth     = 1;   // 1=射击后从当前位置单条平滑轨迹返程（倒放绕柱+穿环+回起飞点，中途不停顿）；0=旧行为分段返程
     float trav_return_land_z   = 0.45f; // 返程直通末段目标高度(m)：过环后从 flight_z 边飞边线性降到该高度，缩短最后降落；<=0 禁用降高全程平飞
+    double trav_return_end_back = 0.1;  // 返程直通末端点往机身后方回退(m)：末端过冲会让飞机冲过起飞点
+                                        //   （仿真实测 0.1~0.26m），把轨迹终点后移这么多来抵消，
+                                        //   实际停点就落在起飞点附近。0=不补偿。仅对走廊最后一点生效
 
     // ---- 穿越段速度前馈（曲率自适应）----
     double trav_ff_straight    = 1.0;   // 直线段前馈倍率：给足，消除滞后（直线无横偏风险）
@@ -171,6 +176,9 @@ bool init_pos_received = false;
 bool mission_finished  = false;
 bool control_cfg_ok    = true;
 ros::Time mission_start_time;  // 任务计时起点：无人机 arm 解锁成功那一刻
+bool land_direct = false;      // true=走的是返程直通路径（轨迹末端已带降高到 return_land_z）：
+                               //   进 LAND 后跳过手动下降段、直接切 AUTO.LAND。
+                               //   分段返程的旧路径（RETURN）保持 false，仍走手动下降兜底
 
 // ==================== 无人机状态 ====================
 mavros_msgs::State current_mav_state;
@@ -766,8 +774,8 @@ void loadParameters(ros::NodeHandle &nh) {
 
     nh.param<std::string>("detection/attack_real_target", cfg.attack_real_target, "A");
 
-    nh.param<float>("land/descend_speed", cfg.land_descend_speed, 0.3f);
-    nh.param<float>("land/auto_land_z", cfg.land_auto_land_z, 0.1f);
+    nh.param<float>("land/descend_speed", cfg.land_descend_speed, 0.2f);
+    nh.param<float>("land/auto_land_z", cfg.land_auto_land_z, 0.45f);
 
     nh.param<float>("shoot/yaw_a_offset_deg", cfg.shoot_yaw_a_offset_deg, -90.0f);
     nh.param<float>("shoot/yaw_b_offset_deg", cfg.shoot_yaw_b_offset_deg, 90.0f);
@@ -799,6 +807,7 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<int>("traverse/early_scan", cfg.trav_early_scan, 1);
     nh.param<int>("traverse/return_smooth", cfg.trav_return_smooth, 1);
     nh.param<float>("traverse/return_land_z", cfg.trav_return_land_z, 0.45f);
+    nh.param<double>("traverse/return_end_back", cfg.trav_return_end_back, 0.1);
     nh.param<double>("traverse/ff_straight", cfg.trav_ff_straight, 1.0);
     nh.param<double>("traverse/ff_curve", cfg.trav_ff_curve, 0.6);
     nh.param<double>("traverse/ff_horizon", cfg.trav_ff_horizon, 0.10);
@@ -824,7 +833,7 @@ void loadParameters(ros::NodeHandle &nh) {
         return;
     }
 
-    ROS_INFO("降落参数：手动快降 %.2f m/s，离地 < %.2f m 切 AUTO.LAND",
+    ROS_INFO("降落参数：手动下降 %.2f m/s，离地 < %.2f m 切 AUTO.LAND",
              cfg.land_descend_speed, cfg.land_auto_land_z);
 
     ROS_INFO("参数加载完成：A/B yaw 偏移 %.1f°/%.1f°，kp=%.2f，rate_max=%.2f rad/s，容差 %.1f°",
@@ -874,6 +883,11 @@ void loadTraverseConfig(ros::NodeHandle &nh) {
     }
     if (cfg.force_case < -1 || cfg.force_case > 3) {
         ROS_ERROR("[穿越] traverse/force_case=%d 非法（必须 -1 或 0~3）", cfg.force_case);
+        return;
+    }
+    if (cfg.trav_return_end_back < 0.0 || cfg.trav_return_end_back > 0.5) {
+        ROS_ERROR("[穿越] traverse/return_end_back=%.2f 非法（须在 0~0.5m，够用即可，别把末端点推到墙边）",
+                  cfg.trav_return_end_back);
         return;
     }
 
@@ -1106,7 +1120,9 @@ bool buildReturnVia(int cid, const Vec2f &start_field, std::vector<Vec2f> &out) 
     Vec2f mid1{0.5 * (scan_hover_fx + 2.0), scan_hover_fy};    // 悬停点与孔之间拉直（抑制拐弯外凸）
     Vec2f hole{2.0, scan_hover_fy};                            // 过孔中心（x=2，孔 y 中心=出生点 y）
     Vec2f mid2{0.5 * (origin_fx + 2.0), origin_fy};            // 孔与出生点之间拉直
-    Vec2f home{origin_fx, origin_fy};                          // 起飞点
+    // 末端点：往机身后方回退 return_end_back，用来抵消末端过冲（否则飞机会冲过起飞点，
+    // 还得原地悬停等位置环把它拉回来）。回退方向 = 返程最后一段的来向 = 场地 +x。
+    Vec2f home{origin_fx + cfg.trav_return_end_back, origin_fy};
     out.push_back(mid1);
     out.push_back(hole);
     out.push_back(mid2);
@@ -1197,7 +1213,9 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
         }
         if (qt > t_ring && t_ring < T) {
             double fx = origin_fx - sx;                 // 采样点场地 x
-            double r  = (2.00 - fx) / (2.00 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
+            // 分母用"过环点到轨迹末端点"的实际距离（末端点 = 起飞点后移 return_end_back），
+            // 这样 r 在末端点正好到 1，z_end 按设计落在轨迹末端
+            double r  = (2.00 - fx) / (2.00 - origin_fx - cfg.trav_return_end_back);
             r = std::max(0.0, std::min(1.0, r));
             z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
 
@@ -1207,7 +1225,7 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                 double sx2, sy2;
                 traverse_sample(plan, qt2, sx2, sy2);
                 double fx2 = origin_fx - sx2;
-                double r2  = (2.00 - fx2) / (2.00 - origin_fx);
+                double r2  = (2.00 - fx2) / (2.00 - origin_fx - cfg.trav_return_end_back);
                 r2 = std::max(0.0, std::min(1.0, r2));
                 double z2 = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r2;
                 vfz = ff_local * (z2 - z_cmd) / cfg.trav_ff_horizon;
@@ -1230,9 +1248,18 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     double cy = local_odom.pose.pose.position.y;
     double cz = local_odom.pose.pose.position.z;
 
-    bool arrived = (fabs(cx - goal_x) < cfg.trav_err_max &&
-                    fabs(cy - goal_y) < cfg.trav_err_max &&
-                    fabs(cz - z_cmd) < cfg.trav_err_max);
+    // ---- 到位判据 ----
+    // 返程直通（带末端降高，z_end 有效）单独放宽：只要求高度到位，不再等 xy 收敛。
+    // 原因：末端过冲会让 |cx| 超过 trav_err_max，飞机必须先原地悬停、等位置环把 xy
+    // 拉回 0.15m 内才肯进 LAND（实测要 ~0.5s），而这段等待没有任何产出。
+    // xy 过冲改由 LAND 段的 xy 保持兜（该段已抬阈值、基本不执行），因此落点会
+    // 沿飞行方向前移一点——2026-09-22 提速方案，已知取舍。
+    const bool return_direct = !std::isnan(z_end) && z_end > 0.0;
+    bool arrived = return_direct
+                       ? (fabs(cz - z_cmd) < cfg.trav_err_max)
+                       : (fabs(cx - goal_x) < cfg.trav_err_max &&
+                          fabs(cy - goal_y) < cfg.trav_err_max &&
+                          fabs(cz - z_cmd) < cfg.trav_err_max);
 
     ROS_INFO_THROTTLE(0.2, "[跟踪%s] t=%.1f/%.1fs 设定(%.2f,%.2f,%.2f) 当前(%.2f,%.2f,%.2f) "
                       "前馈v(%.2f,%.2f) w=%.2f ff=%.2f",
