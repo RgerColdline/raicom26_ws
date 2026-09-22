@@ -1172,15 +1172,16 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     }
 
     // ---- z 指令 + z 前馈（返程直通末段降高，共用同一道过环门）----
-    // 过环前（场地 x>=1.95）保持 flight_z，过环后随水平进度线性降到 z_end。
+    // 过环前（场地 x>=2.00）保持 flight_z，过环后随水平进度线性降到 z_end。
     //
-    // ⚠️ 2026-09-22 阈值 2.05 -> 1.95（实机跟踪滞后补偿）：z_cmd 跟的是轨迹采样点
-    //   而非实际位置，实机滞后 0.1~0.2m 会让飞机本体还在环口时采样点已越过阈值、
-    //   提前开始降高。阈值西移到孔后 0.05m：计划轨迹过孔点(2.00) z_cmd 恒 1.1，
-    //   滞后下实机过孔只压低约 5cm（原 2.05 版约 9cm）。
-    // ⚠️ 2026-09-09 修复挂网：返程起点在射击区（场地 x≈1.1，本来就 <1.95），
-    // 直接按“当前点 x<1.95 就降”会刚射击完就被拉到低高度撞靶区侧网。必须先从
-    // 轨迹末端倒扫出“最后一个场地 x>=1.95 的点”（真正过环时刻 t_ring），
+    // ⚠️ 2026-09-22 阈值最终取 2.00（孔中心）：z_cmd 跟的是轨迹采样点而非实际位置，
+    //   实机滞后会让飞机本体还在环口时采样点已越过阈值、提前开始降高，所以阈值
+    //   往西挪有补偿作用；但实飞反馈挪到 1.95（孔后 0.05m）效果不佳，故取孔中心
+    //   2.00 折中：计划轨迹过孔点 z_cmd 刚好起坡，滞后下实机过孔压低量介于
+    //   2.05 版(~9cm) 与 1.95 版(~5cm) 之间。
+    // ⚠️ 2026-09-09 修复挂网：返程起点在射击区（场地 x≈1.1，本来就 <2.00），
+    // 直接按“当前点 x<2.00 就降”会刚射击完就被拉到低高度撞靶区侧网。必须先从
+    // 轨迹末端倒扫出“最后一个场地 x>=2.00 的点”（真正过环时刻 t_ring），
     //   qt 未过 t_ring 一律保持 flight_z。
     // ⚠️ 2026-09-17 修复砸地弹跳：z 前馈曾漏掉这道门——返程起点同样让降高公式
     //   r>0（起点场地 x≈1.22 -> r≈0.59），前馈差分出约 -2.7m/s 的垂直指令，飞机
@@ -1192,11 +1193,11 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
         const std::vector<TrajPoint> &tr = plan.traj;
         for (int k = (int)tr.size() - 1; k >= 0; --k) {
             double fxk = origin_fx - tr[k].x;           // odom -> 场地 x
-            if (fxk >= 1.95) { t_ring = tr[k].t; break; }
+            if (fxk >= 2.00) { t_ring = tr[k].t; break; }
         }
         if (qt > t_ring && t_ring < T) {
             double fx = origin_fx - sx;                 // 采样点场地 x
-            double r  = (1.95 - fx) / (1.95 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
+            double r  = (2.00 - fx) / (2.00 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
             r = std::max(0.0, std::min(1.0, r));
             z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
 
@@ -1206,7 +1207,7 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                 double sx2, sy2;
                 traverse_sample(plan, qt2, sx2, sy2);
                 double fx2 = origin_fx - sx2;
-                double r2  = (1.95 - fx2) / (1.95 - origin_fx);
+                double r2  = (2.00 - fx2) / (2.00 - origin_fx);
                 r2 = std::max(0.0, std::min(1.0, r2));
                 double z2 = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r2;
                 vfz = ff_local * (z2 - z_cmd) / cfg.trav_ff_horizon;
