@@ -70,6 +70,9 @@ tmux send-keys -t "$SESSION:0" "sleep 4; roslaunch foxglove_bridge foxglove_brid
 tmux split-window -v -t "$SESSION:0"
 tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch usb_cam usb_cam-test.launch" C-m
 
+tmux split-window -v -t "$SESSION:0"
+tmux send-keys -t "$SESSION:0" "sleep 3; roslaunch astra_camera gemini.launch" C-m
+
 # ---------------------------------------------------------
 # 窗口 1：主控、监控与下视视觉 (四等分 2x2)
 # ---------------------------------------------------------
