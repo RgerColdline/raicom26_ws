@@ -56,7 +56,8 @@ wp_ring_back_y: 0.0
 wp_ring_back_z: 1.1
 
 wp_drop_area_x: -0.45
-wp_drop_area_y: -2.0
+wp_drop_area_y: -2.1            # 2026-09-22 统一为 -2.1：与轨迹终点一致（投放区场系 (1.10,2.85) -> odom (-0.45,-2.10)），
+                                # 消除悬停/瞄准点与轨迹终点 10cm 横移修正；射击几何也按 -2.1 调，勿改回 -2.0
 wp_drop_area_z: 1.1
 
 # ==================== 投货与降落 ====================
@@ -66,7 +67,11 @@ cargo:
   drop_hover_time: 2.0              # 投货前悬停投票时间（s）
 
 land:
-  descend_speed: 0.2                # 定点下降速度（m/s）
+  # 降落 B 方案（2026-09-22）：返程末段已把 z 压到 return_land_z(0.45)，
+  # 这里手动快降到离地 auto_land_z 再切 AUTO.LAND——AUTO.LAND 只飞最后 10cm，
+  # land detect 立即触发，省掉模式内下降 + 空中等 land detect 的时间。
+  descend_speed: 0.35               # 手动快降速度（m/s）；实机稳可加到 0.4~0.5，怕砸地就退回 0.3
+  auto_land_z: 0.1                  # 离地多少米切 AUTO.LAND（必须 > 0 且 < takeoff_height）
 
 # ==================== 下视 YOLO 节点参数 ====================
 # weights_path 由 main_control.launch 设置。
@@ -77,3 +82,16 @@ yolo_down_detector:
   show_image: true
   image_topic: "/camera/image_raw"      # 下视 usb_cam 实际发布的话题（见 magpie360/usb_cam.sdf）
   window_name: "YOLO Down Detection"
+
+# ==================== 前视 YOLO 节点参数（空转可视化，主控不订阅其结果） ====================
+# 节点挂在 /main_control/yolo_front_detector（见 main_control.launch），本段即其私有参数。
+# weights_path / device 由 launch 用 yolo_weights / yolo_device 统一注入（与下视同引擎）；
+# 此处 device 仅作 rosrun 单独调试时的默认值。
+yolo_front_detector:
+  device: "cuda:0"
+  confidence: 0.4
+  imgsz: 320
+  show_image: true
+  image_topic: "/camera/color/image_raw" # 前视相机话题
+  window_name: "YOLO Front Detection"
+  annotated_rate: 10.0                   # /yolo_front_annotated/compressed 限频(Hz)，Foxglove 监控画面用

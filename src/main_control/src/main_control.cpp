@@ -592,7 +592,8 @@ int main(int argc, char **argv)
             const float current_z = local_odom.pose.pose.position.z;
             const float ground_z  = init_pos_z;
 
-            if (current_z > ground_z + 0.3f)
+            // 手动快降段：降到离地 auto_land_z（B 方案），再让 AUTO.LAND 只做最后 10cm 收尾
+            if (current_z > ground_z + cfg.land_auto_land_z)
             {
                 positionControl(Eigen::Vector3f(init_pos_x, init_pos_y, current_z), current_setpoint);
                 current_setpoint.velocity.z = -cfg.land_descend_speed;
@@ -608,7 +609,7 @@ int main(int argc, char **argv)
                 srv.request.custom_mode = "AUTO.LAND";
                 if (set_mode_client.call(srv) && srv.response.mode_sent)
                 {
-                    ROS_INFO("[降落] 高度 < 0.3m，AUTO.LAND 请求成功");
+                    ROS_INFO("[降落] 离地 < %.2fm，AUTO.LAND 请求成功", cfg.land_auto_land_z);
                     auto_land_sent    = true;
                     state_start_time  = ros::Time::now();
                 }

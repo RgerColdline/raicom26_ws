@@ -111,6 +111,8 @@ struct Config
     std::string attack_real_target;
 
     float land_descend_speed         = 0.3f;
+    float land_auto_land_z           = 0.1f;  // 离地高度低于此值才切 AUTO.LAND（B 方案：手动快降到贴地，
+                                               // AUTO.LAND 只做最后 10cm + 触地检测 + disarm，缩短模式内下降与 land detect）
 
     float shoot_yaw_a_offset_deg = -90.0f;
     float shoot_yaw_b_offset_deg = 90.0f;
@@ -765,6 +767,7 @@ void loadParameters(ros::NodeHandle &nh) {
     nh.param<std::string>("detection/attack_real_target", cfg.attack_real_target, "A");
 
     nh.param<float>("land/descend_speed", cfg.land_descend_speed, 0.3f);
+    nh.param<float>("land/auto_land_z", cfg.land_auto_land_z, 0.1f);
 
     nh.param<float>("shoot/yaw_a_offset_deg", cfg.shoot_yaw_a_offset_deg, -90.0f);
     nh.param<float>("shoot/yaw_b_offset_deg", cfg.shoot_yaw_b_offset_deg, 90.0f);
@@ -805,6 +808,7 @@ void loadParameters(ros::NodeHandle &nh) {
 
     if (cfg.max_speed <= 0.0f || cfg.err_max <= 0.0f || cfg.p_xy <= 0.0f || cfg.p_z <= 0.0f ||
         cfg.land_descend_speed <= 0.0f || cfg.drop_hover_time < 0.0f || cfg.down_min_votes < 1 ||
+        cfg.land_auto_land_z <= 0.0f || cfg.land_auto_land_z >= cfg.takeoff_height ||
         cfg.cargo_drop_angle < 0 || cfg.cargo_drop_angle > 255 ||
         cfg.cargo_reset_angle < 0 || cfg.cargo_reset_angle > 255 ||
         (cfg.attack_real_target != "A" && cfg.attack_real_target != "B") ||
@@ -813,11 +817,15 @@ void loadParameters(ros::NodeHandle &nh) {
         cfg.shoot_yaw_tolerance_deg <= 0.0f || cfg.shoot_yaw_tolerance_deg > 180.0f ||
         cfg.shoot_stable_time < 0.0f || cfg.shoot_duration <= 0.0f) {
         ROS_FATAL("主控参数非法：控制速度/误差/增益和降落速度须 > 0；投票数须 >= 1；"
+                  "auto_land_z 须在 (0, takeoff_height) 内；"
                   "舵机角度须在 0~255；兜底目标须为 A/B；yaw 偏移须为有限值；"
                   "yaw kp/rate/duration 须 > 0，tolerance 须在 (0,180]，等待时间须 >= 0");
         control_cfg_ok = false;
         return;
     }
+
+    ROS_INFO("降落参数：手动快降 %.2f m/s，离地 < %.2f m 切 AUTO.LAND",
+             cfg.land_descend_speed, cfg.land_auto_land_z);
 
     ROS_INFO("参数加载完成：A/B yaw 偏移 %.1f°/%.1f°，kp=%.2f，rate_max=%.2f rad/s，容差 %.1f°",
              cfg.shoot_yaw_a_offset_deg, cfg.shoot_yaw_b_offset_deg, cfg.shoot_yaw_kp,
@@ -1164,15 +1172,19 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
     }
 
     // ---- z 指令 + z 前馈（返程直通末段降高，共用同一道过环门）----
-    // 过环前（场地 x>=2.05）保持 flight_z，过环后随水平进度线性降到 z_end。
+    // 过环前（场地 x>=1.95）保持 flight_z，过环后随水平进度线性降到 z_end。
     //
-    // ⚠️ 2026-09-09 修复挂网：返程起点在射击区（场地 x≈1.1，本来就 <2.05），
-    // 直接按“当前点 x<2.05 就降”会刚射击完就被拉到低高度撞靶区侧网。必须先从
-    // 轨迹末端倒扫出“最后一个场地 x>=2.05 的点”（真正过环时刻 t_ring），
-    // qt 未过 t_ring 一律保持 flight_z。
+    // ⚠️ 2026-09-22 阈值 2.05 -> 1.95（实机跟踪滞后补偿）：z_cmd 跟的是轨迹采样点
+    //   而非实际位置，实机滞后 0.1~0.2m 会让飞机本体还在环口时采样点已越过阈值、
+    //   提前开始降高。阈值西移到孔后 0.05m：计划轨迹过孔点(2.00) z_cmd 恒 1.1，
+    //   滞后下实机过孔只压低约 5cm（原 2.05 版约 9cm）。
+    // ⚠️ 2026-09-09 修复挂网：返程起点在射击区（场地 x≈1.1，本来就 <1.95），
+    // 直接按“当前点 x<1.95 就降”会刚射击完就被拉到低高度撞靶区侧网。必须先从
+    // 轨迹末端倒扫出“最后一个场地 x>=1.95 的点”（真正过环时刻 t_ring），
+    //   qt 未过 t_ring 一律保持 flight_z。
     // ⚠️ 2026-09-17 修复砸地弹跳：z 前馈曾漏掉这道门——返程起点同样让降高公式
-    // r>0（起点场地 x≈1.22 -> r≈0.59），前馈差分出约 -2.7m/s 的垂直指令，飞机
-    // 先砸到 -0.4m 再被位置环拉回、过冲到 2.05m。前馈必须与 z_cmd 同门。
+    //   r>0（起点场地 x≈1.22 -> r≈0.59），前馈差分出约 -2.7m/s 的垂直指令，飞机
+    //   先砸到 -0.4m 再被位置环拉回、过冲到 2.05m。前馈必须与 z_cmd 同门。
     double z_cmd = cfg.trav_flight_z;
     double vfz   = 0.0;
     if (!std::isnan(z_end) && z_end > 0.0) {
@@ -1180,11 +1192,11 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
         const std::vector<TrajPoint> &tr = plan.traj;
         for (int k = (int)tr.size() - 1; k >= 0; --k) {
             double fxk = origin_fx - tr[k].x;           // odom -> 场地 x
-            if (fxk >= 2.05) { t_ring = tr[k].t; break; }
+            if (fxk >= 1.95) { t_ring = tr[k].t; break; }
         }
         if (qt > t_ring && t_ring < T) {
             double fx = origin_fx - sx;                 // 采样点场地 x
-            double r  = (2.05 - fx) / (2.05 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
+            double r  = (1.95 - fx) / (1.95 - origin_fx);   // 过环点 -> 起飞点 的进度 [0,1]
             r = std::max(0.0, std::min(1.0, r));
             z_cmd = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r;
 
@@ -1194,7 +1206,7 @@ bool trackPlan(const TraversePlanResult &plan, bool reverse, double goal_x, doub
                 double sx2, sy2;
                 traverse_sample(plan, qt2, sx2, sy2);
                 double fx2 = origin_fx - sx2;
-                double r2  = (2.05 - fx2) / (2.05 - origin_fx);
+                double r2  = (1.95 - fx2) / (1.95 - origin_fx);
                 r2 = std::max(0.0, std::min(1.0, r2));
                 double z2 = cfg.trav_flight_z + (z_end - cfg.trav_flight_z) * r2;
                 vfz = ff_local * (z2 - z_cmd) / cfg.trav_ff_horizon;
